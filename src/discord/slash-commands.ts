@@ -26,6 +26,7 @@ import { logger } from '../logger.js';
 import {
   autocompleteModels,
   hasCachedModelCatalog,
+  isModelCatalogStale,
   isThinkingLevel,
   listAvailableModels,
   listSelectableModels,
@@ -99,6 +100,23 @@ export async function registerGlobalCommands(client: Client<true>): Promise<void
   logger.info('Registered global slash commands');
 }
 
+const catalogRefreshesInFlight = new Set<string>();
+
+/** Refresh a cwd's model catalog off the interaction path, at most once at a time. */
+function scheduleCatalogRefresh(cwd: string): void {
+  if (catalogRefreshesInFlight.has(cwd)) return;
+  catalogRefreshesInFlight.add(cwd);
+  setImmediate(() => {
+    try {
+      listAvailableModels({ forceRefresh: true, cwd });
+    } catch (err: any) {
+      logger.warn({ cwd, err: err.message }, 'Failed to warm model catalog');
+    } finally {
+      catalogRefreshesInFlight.delete(cwd);
+    }
+  });
+}
+
 export async function handleAutocomplete(interaction: AutocompleteInteraction): Promise<void> {
   if (interaction.commandName !== 'pi') return;
   if (interaction.options.getSubcommand() !== 'model') return;
@@ -113,13 +131,7 @@ export async function handleAutocomplete(interaction: AutocompleteInteraction): 
   const cwd = channel.cwdOverride || config.piCwd;
   if (!hasCachedModelCatalog(cwd)) {
     await interaction.respond([]);
-    setImmediate(() => {
-      try {
-        listAvailableModels({ forceRefresh: true, cwd });
-      } catch (err: any) {
-        logger.warn({ cwd, err: err.message }, 'Failed to warm model catalog');
-      }
-    });
+    scheduleCatalogRefresh(cwd);
     return;
   }
 
@@ -131,6 +143,13 @@ export async function handleAutocomplete(interaction: AutocompleteInteraction): 
   }));
 
   await interaction.respond(matches);
+
+  // Serve stale results within Discord's deadline, but refresh expired
+  // catalogs in the background so autocomplete-only users still pick up
+  // pi upgrades and provider changes.
+  if (isModelCatalogStale(cwd)) {
+    scheduleCatalogRefresh(cwd);
+  }
 }
 
 export async function handleChatCommand(interaction: ChatInputCommandInteraction): Promise<void> {

@@ -8,6 +8,9 @@ import { supportsModelXhigh } from './pi-ai-compat.js';
 import { resolvePiSpawn } from './pi-spawn.js';
 
 const CACHE_TTL_MS = 30_000;
+// A hung `pi --list-models` (broken wrapper, stuck provider lookup) must not
+// block gateway startup or the event loop indefinitely.
+const LIST_MODELS_TIMEOUT_MS = 15_000;
 
 export interface AvailableModelInfo {
   ref: string;
@@ -42,6 +45,11 @@ export function listAvailableModels(options?: ModelListOptions): AvailableModelI
 
 export function hasCachedModelCatalog(cwd: string): boolean {
   return cacheByCwd.has(cwd);
+}
+
+export function isModelCatalogStale(cwd: string): boolean {
+  const cached = cacheByCwd.get(cwd);
+  return !cached || Date.now() - cached.loadedAt >= CACHE_TTL_MS;
 }
 
 /**
@@ -300,13 +308,22 @@ function loadModelCatalog(forceRefresh: boolean, cwd: string, allowStale: boolea
 }
 
 function listModelsFromPiCli(piBin: string, cwd: string): AvailableModelInfo[] | undefined {
-  const { bin, args } = resolvePiSpawn(piBin, ['--list-models']);
+  const cliArgs = ['--list-models'];
+
+  // Match the agent invocation so models registered by PI_EXTRA_FLAGS
+  // extensions are discovered too.
+  if (config.piExtraFlags) {
+    cliArgs.push(...config.piExtraFlags.split(/\s+/).filter(Boolean));
+  }
+
+  const { bin, args } = resolvePiSpawn(piBin, cliArgs);
   const result = spawnSync(bin, args, {
     cwd,
     env: process.env,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     maxBuffer: 10 * 1024 * 1024,
+    timeout: LIST_MODELS_TIMEOUT_MS,
   });
 
   if (result.error || result.status !== 0 || !result.stdout) {
@@ -316,26 +333,45 @@ function listModelsFromPiCli(piBin: string, cwd: string): AvailableModelInfo[] |
   return parsePiModelList(result.stdout);
 }
 
+interface ModelTableHeader {
+  providerIndex: number;
+  modelIndex: number;
+  thinkingIndex: number;
+  rowsStart: number;
+}
+
+// Extensions or hooks loaded by --list-models can write banners to stdout
+// before the table, so scan for the header row instead of assuming it is the
+// first line.
+function findModelTableHeader(lines: string[]): ModelTableHeader | undefined {
+  for (const [index, line] of lines.entries()) {
+    const headers = line.split(/\s+/);
+    const providerIndex = headers.indexOf('provider');
+    const modelIndex = headers.indexOf('model');
+    const thinkingIndex = headers.indexOf('thinking');
+    if (providerIndex !== -1 && modelIndex !== -1 && thinkingIndex !== -1) {
+      return { providerIndex, modelIndex, thinkingIndex, rowsStart: index + 1 };
+    }
+  }
+  return undefined;
+}
+
 export function parsePiModelList(output: string): AvailableModelInfo[] {
   const lines = output
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
-  if (lines.length < 2) return [];
 
-  const headers = lines[0].split(/\s+/);
-  const providerIndex = headers.indexOf('provider');
-  const modelIndex = headers.indexOf('model');
-  const thinkingIndex = headers.indexOf('thinking');
-  if (providerIndex === -1 || modelIndex === -1 || thinkingIndex === -1) return [];
+  const header = findModelTableHeader(lines);
+  if (!header) return [];
 
-  return lines.slice(1).flatMap((line) => {
+  return lines.slice(header.rowsStart).flatMap((line) => {
     const columns = line.split(/\s+/);
-    const provider = columns[providerIndex];
-    const id = columns[modelIndex];
+    const provider = columns[header.providerIndex];
+    const id = columns[header.modelIndex];
     if (!provider || !id) return [];
 
-    const reasoning = columns[thinkingIndex]?.toLowerCase() === 'yes';
+    const reasoning = columns[header.thinkingIndex]?.toLowerCase() === 'yes';
     return [
       {
         ref: `${provider}/${id}`,

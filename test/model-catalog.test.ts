@@ -1,7 +1,12 @@
 import { AuthStorage, ModelRegistry, SettingsManager } from '@earendil-works/pi-coding-agent';
 import type { Model } from '@earendil-works/pi-ai';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { listSelectableModels, parsePiModelList } from '../src/agent/model-catalog.js';
+import {
+  isModelCatalogStale,
+  listSelectableModels,
+  parsePiModelList,
+} from '../src/agent/model-catalog.js';
+import { config } from '../src/config.js';
 
 const { spawnSyncMock } = vi.hoisted(() => ({ spawnSyncMock: vi.fn() }));
 
@@ -108,6 +113,72 @@ describe('listSelectableModels', () => {
 
     expect(result).toEqual([]);
   });
+
+  it('falls back to the SDK catalog when pi --list-models errors out', async () => {
+    mockPiCatalog(['test/beta']);
+    spawnSyncMock.mockReturnValue({
+      error: new Error('spawnSync pi ETIMEDOUT'),
+      status: null,
+      stdout: '',
+      stderr: '',
+    });
+
+    const result = await listSelectableModels({ forceRefresh: true });
+
+    expect(result.map((model) => model.ref)).toEqual(['test/beta']);
+  });
+
+  it('bounds the pi --list-models subprocess with a timeout', async () => {
+    mockPiCatalog();
+
+    await listSelectableModels({ forceRefresh: true });
+
+    expect(spawnSyncMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ timeout: expect.any(Number) }),
+    );
+  });
+
+  it('passes PI_EXTRA_FLAGS to model discovery like the agent invocation', async () => {
+    mockPiCatalog();
+    const mutableConfig = config as { piExtraFlags: string };
+    const previousFlags = mutableConfig.piExtraFlags;
+    mutableConfig.piExtraFlags = '-e ./provider.ts --approve';
+
+    try {
+      await listSelectableModels({ forceRefresh: true });
+    } finally {
+      mutableConfig.piExtraFlags = previousFlags;
+    }
+
+    expect(spawnSyncMock).toHaveBeenCalledWith(
+      expect.anything(),
+      ['--list-models', '-e', './provider.ts', '--approve'],
+      expect.anything(),
+    );
+  });
+});
+
+describe('isModelCatalogStale', () => {
+  it('treats never-loaded catalogs as stale', () => {
+    expect(isModelCatalogStale('/tmp/never-loaded')).toBe(true);
+  });
+
+  it('reports stale once the cache TTL elapses', async () => {
+    vi.useFakeTimers();
+    try {
+      mockPiCatalog();
+      await listSelectableModels({ forceRefresh: true, cwd: '/tmp/stale-check' });
+
+      expect(isModelCatalogStale('/tmp/stale-check')).toBe(false);
+
+      vi.advanceTimersByTime(31_000);
+      expect(isModelCatalogStale('/tmp/stale-check')).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('parsePiModelList', () => {
@@ -117,5 +188,19 @@ describe('parsePiModelList', () => {
       expect.objectContaining({ ref: 'test/alpha', reasoning: false }),
       expect.objectContaining({ ref: 'test/beta', reasoning: true }),
     ]);
+  });
+
+  it('skips banner output written before the table header', () => {
+    const output = `Loaded extension ./provider.ts\nwarning: model cache rebuilt\n${defaultCliOutput}`;
+
+    expect(parsePiModelList(output)).toEqual([
+      expect.objectContaining({ ref: 'other/gamma', reasoning: true }),
+      expect.objectContaining({ ref: 'test/alpha', reasoning: false }),
+      expect.objectContaining({ ref: 'test/beta', reasoning: true }),
+    ]);
+  });
+
+  it('returns an empty catalog when no table header is present', () => {
+    expect(parsePiModelList('no models available\n')).toEqual([]);
   });
 });
