@@ -2,11 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## [1.7.0] - 2026-07-17
 
 ### Changed
 
-- Discord `/pi model` autocomplete now reads models from the configured pi binary and honors pi's configured `enabledModels` scope.
+- Discord `/pi model` now reads the model catalog from the configured pi binary (`PI_BIN --list-models`) and honors pi's configured `enabledModels` scope, including glob patterns and configured order. The bundled SDK catalog is used only as a fallback when the command fails.
+- Model catalogs are prewarmed at startup for all registered channel working directories. `/pi model` autocomplete responds from the cache to stay inside Discord's response deadline and refreshes expired catalogs in the background.
+- `PI_EXTRA_FLAGS` is now passed to model discovery as well, so models registered by pi extensions appear in the catalog.
+
+### Fixed
+
+- Model discovery via `pi --list-models` is bounded by a 15s timeout, so a hung pi install can no longer block gateway startup or slash commands.
+- The model list parser now locates the table header instead of assuming it is the first output line, so banners printed by pi extensions no longer result in an empty catalog.
+- `/pi model` autocomplete in unregistered channels returns no choices without spawning pi.
 
 ## [1.6.1] - 2026-06-15
 

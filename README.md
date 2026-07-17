@@ -345,6 +345,7 @@ MIT
 
 | Version | Date       | Changes                                                     |
 | ------- | ---------- | ----------------------------------------------------------- |
+| 1.7.0   | 2026-07-17 | `/pi model` syncs with pi's catalog and `enabledModels`     |
 | 1.6.1   | 2026-06-15 | Fixed README version metadata                               |
 | 1.6.0   | 2026-06-15 | Path-based attachment relay and clearer empty-output errors |
 | 1.5.3   | 2026-05-19 | Fix ESM peer-dep check, cross-platform test fixes           |
