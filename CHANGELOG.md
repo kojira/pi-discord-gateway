@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Changed
+
+- Discord `/pi model` autocomplete now reads models from the configured pi binary and honors pi's configured `enabledModels` scope.
+
 ## [1.6.1] - 2026-06-15
 
 ### Fixed

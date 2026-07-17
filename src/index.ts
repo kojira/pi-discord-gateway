@@ -1,9 +1,10 @@
 import { config } from './config.js';
 import { logger } from './logger.js';
-import { initDb, closeDb } from './db.js';
+import { initDb, closeDb, getAllChannels } from './db.js';
 import { startDiscord, stopDiscord, getBotTag } from './discord/client.js';
 import { startArchiveCleanup } from './session/archive-cleanup.js';
 import { startMediaCleanup } from './session/media.js';
+import { listAvailableModels } from './agent/model-catalog.js';
 import { startProcessingLoop, stopProcessingLoop } from './agent/queue.js';
 import { startScheduler } from './agent/scheduler.js';
 
@@ -72,6 +73,7 @@ export async function startGateway(): Promise<void> {
 
   try {
     logger.info('Starting pi-discord-gateway...');
+    warmModelCatalogs();
 
     await startDiscord();
     if (shutdownPromise) {
@@ -100,5 +102,23 @@ export async function startGateway(): Promise<void> {
   } catch (err) {
     await shutdown('startup failure');
     throw err;
+  }
+}
+
+function warmModelCatalogs(): void {
+  const workingDirectories = new Set([
+    config.piCwd,
+    ...getAllChannels()
+      .map((channel) => channel.cwdOverride)
+      .filter(Boolean),
+  ]);
+
+  for (const cwd of workingDirectories) {
+    try {
+      const models = listAvailableModels({ forceRefresh: true, cwd });
+      logger.info({ cwd, models: models.length }, 'Model catalog warmed');
+    } catch (err: any) {
+      logger.warn({ cwd, err: err.message }, 'Failed to warm model catalog');
+    }
   }
 }

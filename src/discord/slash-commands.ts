@@ -25,8 +25,11 @@ import {
 import { logger } from '../logger.js';
 import {
   autocompleteModels,
+  hasCachedModelCatalog,
+  isModelCatalogStale,
   isThinkingLevel,
   listAvailableModels,
+  listSelectableModels,
   resolveModelReference,
   resolveThinkingForModel,
   toModelChoiceName,
@@ -97,18 +100,56 @@ export async function registerGlobalCommands(client: Client<true>): Promise<void
   logger.info('Registered global slash commands');
 }
 
+const catalogRefreshesInFlight = new Set<string>();
+
+/** Refresh a cwd's model catalog off the interaction path, at most once at a time. */
+function scheduleCatalogRefresh(cwd: string): void {
+  if (catalogRefreshesInFlight.has(cwd)) return;
+  catalogRefreshesInFlight.add(cwd);
+  setImmediate(() => {
+    try {
+      listAvailableModels({ forceRefresh: true, cwd });
+    } catch (err: any) {
+      logger.warn({ cwd, err: err.message }, 'Failed to warm model catalog');
+    } finally {
+      catalogRefreshesInFlight.delete(cwd);
+    }
+  });
+}
+
 export async function handleAutocomplete(interaction: AutocompleteInteraction): Promise<void> {
   if (interaction.commandName !== 'pi') return;
   if (interaction.options.getSubcommand() !== 'model') return;
   if (interaction.options.getFocused(true).name !== 'model') return;
 
+  const channel = getChannel(`dc:${interaction.channelId}`);
+  if (!channel) {
+    await interaction.respond([]);
+    return;
+  }
+
+  const cwd = channel.cwdOverride || config.piCwd;
+  if (!hasCachedModelCatalog(cwd)) {
+    await interaction.respond([]);
+    scheduleCatalogRefresh(cwd);
+    return;
+  }
+
   const focused = interaction.options.getFocused();
-  const matches = autocompleteModels(focused, 25).map((model) => ({
+  const models = await autocompleteModels(focused, 25, { allowStale: true, cwd });
+  const matches = models.map((model) => ({
     name: toModelChoiceName(model),
     value: model.ref,
   }));
 
   await interaction.respond(matches);
+
+  // Serve stale results within Discord's deadline, but refresh expired
+  // catalogs in the background so autocomplete-only users still pick up
+  // pi upgrades and provider changes.
+  if (isModelCatalogStale(cwd)) {
+    scheduleCatalogRefresh(cwd);
+  }
 }
 
 export async function handleChatCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -238,11 +279,16 @@ async function handleModelSet(interaction: ChatInputCommandInteraction): Promise
     return;
   }
 
+  await interaction.deferReply(
+    interaction.inGuild() ? { flags: MessageFlags.Ephemeral } : undefined,
+  );
+
   const selectedRef = interaction.options.getString('model', true);
-  const models = listAvailableModels({ forceRefresh: true });
+  const cwd = channel.cwdOverride || config.piCwd;
+  const models = await listSelectableModels({ forceRefresh: true, cwd });
   const selectedModel = resolveModelReference(selectedRef, models);
   if (!selectedModel) {
-    await interaction.reply(reply(`Model is no longer available: ${selectedRef}`, interaction));
+    await interaction.editReply({ content: `Model is no longer available: ${selectedRef}` });
     return;
   }
 
@@ -269,7 +315,7 @@ async function handleModelSet(interaction: ChatInputCommandInteraction): Promise
     );
   }
 
-  await interaction.reply(reply(notes.join('\n'), interaction));
+  await interaction.editReply({ content: notes.join('\n') });
 }
 
 async function handleModelReset(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -278,6 +324,10 @@ async function handleModelReset(interaction: ChatInputCommandInteraction): Promi
     await interaction.reply(reply(notRegisteredMessage(), interaction));
     return;
   }
+
+  await interaction.deferReply(
+    interaction.inGuild() ? { flags: MessageFlags.Ephemeral } : undefined,
+  );
 
   clearChannelModelOverride(channel.jid);
 
@@ -298,7 +348,7 @@ async function handleModelReset(interaction: ChatInputCommandInteraction): Promi
     );
   }
 
-  await interaction.reply(reply(notes.join('\n'), interaction));
+  await interaction.editReply({ content: notes.join('\n') });
 }
 
 async function handleThinkingSet(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -313,6 +363,10 @@ async function handleThinkingSet(interaction: ChatInputCommandInteraction): Prom
     await interaction.reply(reply(`Invalid thinking level: ${rawLevel}`, interaction));
     return;
   }
+
+  await interaction.deferReply(
+    interaction.inGuild() ? { flags: MessageFlags.Ephemeral } : undefined,
+  );
 
   const effective = computeEffectiveChannelSettings(channel, { forceRefresh: true });
   const resolution = resolveThinkingForModel(effective.modelInfo, rawLevel);
@@ -330,7 +384,7 @@ async function handleThinkingSet(interaction: ChatInputCommandInteraction): Prom
     );
   }
 
-  await interaction.reply(reply(notes.join('\n'), interaction));
+  await interaction.editReply({ content: notes.join('\n') });
 }
 
 function ensureManagedChannel(

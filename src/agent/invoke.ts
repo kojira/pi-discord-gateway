@@ -1,6 +1,5 @@
-import { execSync, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
-import { dirname, resolve as pathResolve } from 'node:path';
 import { type AttachmentMeta } from '../discord/attachments.js';
 import { config } from '../config.js';
 import { logger } from '../logger.js';
@@ -11,6 +10,7 @@ import {
   resolveLatestChannelSessionFile,
 } from '../session/path.js';
 import type { AgentResult } from '../types.js';
+import { resolvePiSpawn } from './pi-spawn.js';
 
 export interface SessionTokenUsage {
   input: number;
@@ -484,36 +484,6 @@ function readSessionTokensFromJsonl(sessionFile: string): SessionTokenUsage {
   }
 
   return totals;
-}
-
-function resolvePiSpawn(piBin: string, args: string[]): { bin: string; args: string[] } {
-  if (process.platform !== 'win32') {
-    return { bin: piBin, args };
-  }
-
-  try {
-    const shimPath = execSync(`where ${piBin}`, {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
-      .split(/\r?\n/)
-      .find((line) => line.trim().endsWith('.cmd'));
-
-    if (shimPath) {
-      const content = readFileSync(shimPath.trim(), 'utf8');
-      const jsMatch = content.match(/"([^"]+\.js)"/);
-      if (jsMatch) {
-        const jsPath = pathResolve(dirname(shimPath.trim()), jsMatch[1]);
-        if (existsSync(jsPath)) {
-          return { bin: process.execPath, args: [jsPath, ...args] };
-        }
-      }
-    }
-  } catch {
-    // Fall through to original.
-  }
-
-  return { bin: piBin, args };
 }
 
 function toNumber(value: number | undefined): number {

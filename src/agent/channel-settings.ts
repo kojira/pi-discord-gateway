@@ -37,7 +37,11 @@ export function computeEffectiveChannelSettings(
   channel: RegisteredChannel,
   options?: { forceRefresh?: boolean },
 ): EffectiveChannelSettings {
-  const models = listAvailableModels({ forceRefresh: options?.forceRefresh ?? false });
+  const effectiveCwd = channel.cwdOverride || config.piCwd;
+  const models = listAvailableModels({
+    forceRefresh: options?.forceRefresh ?? false,
+    cwd: effectiveCwd,
+  });
 
   const rawModelRef = channel.modelOverride || config.piModel || '';
   const modelInfo = rawModelRef ? resolveModelReference(rawModelRef, models) : undefined;
@@ -46,7 +50,6 @@ export function computeEffectiveChannelSettings(
     Boolean(config.piThinking && isThinkingLevel(config.piThinking));
   const desiredThinking = getDesiredThinkingLevel(channel);
   const thinkingResolution = resolveThinkingForModel(modelInfo, desiredThinking);
-  const effectiveCwd = channel.cwdOverride || config.piCwd;
   const cwdSource: EffectiveChannelSettings['cwdSource'] = channel.cwdOverride
     ? 'override'
     : 'default';

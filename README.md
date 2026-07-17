@@ -103,6 +103,8 @@ The gateway registers a global `/pi` command on Discord:
 | `/pi new`         | Start a fresh session for this channel                             |
 | `/pi stop`        | Abort the current task and clear queued messages                   |
 
+`/pi model` reads the catalog from the configured `PI_BIN`, so it stays in sync when pi adds or removes models. It also honors pi's `enabledModels` setting (configured through `/scoped-models`), including model order and glob patterns. If no scope is configured, it shows all available models.
+
 ## Tools for Pi
 
 The gateway exposes two capabilities through its CLI that **pi itself can invoke**. You don't type these commands in your terminal — you just tell pi in Discord, and it handles the rest.
