@@ -11,6 +11,7 @@ import {
 } from '../session/path.js';
 import type { AgentResult } from '../types.js';
 import { resolvePiSpawn } from './pi-spawn.js';
+import { startSupervisorWatcher, type SupervisorRequest } from './supervisor-channel.js';
 
 export interface SessionTokenUsage {
   input: number;
@@ -49,6 +50,7 @@ export async function invokeAgent(
     cwd?: string;
     signal?: AbortSignal;
     attachments?: string | null;
+    onSupervisorRequest?: (request: SupervisorRequest) => void | Promise<void>;
   },
 ): Promise<AgentResult> {
   const sessionDir = resolveChannelSessionDir(channelFolder);
@@ -122,6 +124,9 @@ export async function invokeAgent(
 
     const chunks: Buffer[] = [];
     const errChunks: Buffer[] = [];
+    const supervisorWatcher = opts?.onSupervisorRequest
+      ? startSupervisorWatcher({ signal: opts.signal, onRequest: opts.onSupervisorRequest })
+      : undefined;
 
     proc.stdout.on('data', (c: Buffer) => chunks.push(c));
     proc.stderr.on('data', (c: Buffer) => errChunks.push(c));
@@ -141,6 +146,7 @@ export async function invokeAgent(
     }
 
     proc.on('close', (code) => {
+      supervisorWatcher?.stop();
       const stdout = Buffer.concat(chunks).toString('utf-8').trim();
       const stderr = Buffer.concat(errChunks).toString('utf-8').trim();
 
