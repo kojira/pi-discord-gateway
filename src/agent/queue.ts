@@ -19,7 +19,7 @@ import {
   getChannel,
 } from '../db.js';
 import { invokeAgent } from './invoke.js';
-import { sendResponse, setTyping } from '../discord/client.js';
+import { promptSupervisorRequest, sendResponse, setTyping } from '../discord/client.js';
 import { computeEffectiveChannelSettings } from './channel-settings.js';
 
 /** Channels currently being processed (per-channel serial lock) */
@@ -218,6 +218,7 @@ async function processMessage(
       cwd: effective.effectiveCwd,
       signal,
       attachments,
+      onSupervisorRequest: (request) => promptSupervisorRequest(jid, request),
     });
 
     if (signal.aborted) {

@@ -292,6 +292,7 @@ node dist/cli/index.js setup
 - Check `pi --version` works in the same shell
 - Set `PI_BIN=/full/path/to/pi` in config.env
 - Restart: `piscord daemon stop && piscord daemon start`
+
 </details>
 
 <details>
@@ -301,6 +302,7 @@ node dist/cli/index.js setup
 
 - Run `pi` and complete the login flow
 - Confirm `~/.pi/agent/auth.json` exists for the same user running the gateway
+
 </details>
 
 <details>
@@ -310,6 +312,7 @@ node dist/cli/index.js setup
 - `piscord daemon logs` — see log output
 - **Linux**: for headless servers, run `sudo loginctl enable-linger $USER`
 - **macOS**: check `~/Library/Logs/piscord-gateway/` for launchd output
+
 </details>
 
 <details>
@@ -319,6 +322,7 @@ node dist/cli/index.js setup
 - `allowlist` policy: run `piscord channels` — at least one channel must be registered
 - For trigger-only channels: mention the bot by name or use `@TriggerName`
 - DMs auto-register when `AUTO_REGISTER_DMS=true`
+
 </details>
 
 ## Development

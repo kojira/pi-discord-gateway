@@ -11,8 +11,16 @@ import {
   Events,
   GatewayIntentBits,
   Partials,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  type ButtonInteraction,
   type Interaction,
   type Message,
+  type ModalSubmitInteraction,
   type TextChannel,
   type DMChannel,
 } from 'discord.js';
@@ -31,6 +39,7 @@ import {
   type AttachmentMeta,
 } from './attachments.js';
 import { handleAutocomplete, handleChatCommand, registerGlobalCommands } from './slash-commands.js';
+import { writeSupervisorReply, type SupervisorRequest } from '../agent/supervisor-channel.js';
 
 let client: Client | null = null;
 let triggerPattern: RegExp;
@@ -86,6 +95,16 @@ export async function startDiscord(): Promise<void> {
 
 async function handleInteraction(interaction: Interaction): Promise<void> {
   try {
+    if (interaction.isButton() && interaction.customId.startsWith(SUPERVISOR_BUTTON_PREFIX)) {
+      await handleSupervisorButton(interaction);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith(SUPERVISOR_MODAL_PREFIX)) {
+      await handleSupervisorModal(interaction);
+      return;
+    }
+
     if (interaction.isAutocomplete()) {
       await handleAutocomplete(interaction);
       return;
@@ -240,6 +259,174 @@ async function handleMessage(message: Message): Promise<void> {
     attachments: attachmentsJson,
   });
   logger.info({ jid, sender: senderName, len: content.length }, 'Message enqueued');
+}
+
+// ── Supervisor UI ──
+
+const SUPERVISOR_BUTTON_PREFIX = 'supervisor:';
+const SUPERVISOR_MODAL_PREFIX = 'supervisor-modal:';
+const SUPERVISOR_DEFAULT_BEST_EFFORT =
+  'Proceed best-effort. Do not wait for supervisor again in this run. If evidence is missing, report it explicitly as residual risk in your final output.';
+const SUPERVISOR_CANCEL_REPLY =
+  'Cancel this child task. Return a final blocked/cancelled result to the parent and do not continue this child task.';
+
+const pendingSupervisorRequests = new Map<string, SupervisorRequest>();
+const alwaysSupervisorReplies = new Map<string, string>();
+
+export async function promptSupervisorRequest(
+  jid: string,
+  request: SupervisorRequest,
+): Promise<void> {
+  const alwaysReply = alwaysSupervisorReplies.get(supervisorAlwaysKey(request));
+  if (alwaysReply) {
+    await replyToSupervisorRequest(request.id, alwaysReply);
+    logger.info(
+      { jid, requestId: request.id, runId: request.runId },
+      'Applied supervisor always reply',
+    );
+    return;
+  }
+
+  pendingSupervisorRequests.set(request.id, request);
+  if (!client) return;
+
+  const channelId = jid.replace(/^dc:/, '');
+  const channel = await client.channels.fetch(channelId);
+  if (!channel || !('send' in channel)) {
+    logger.warn({ jid, requestId: request.id }, 'Cannot send supervisor prompt to Discord channel');
+    return;
+  }
+
+  const expires = request.expiresAt
+    ? `\nExpires: <t:${Math.floor(request.expiresAt / 1000)}:R>`
+    : '';
+  const body = [
+    '⚠️ **Subagent needs supervisor input**',
+    '',
+    `Agent: \`${request.agent}\`  Child: \`${request.childIndex}\``,
+    `Reason: \`${request.reason}\``,
+    `Run: \`${request.runId}\`${expires}`,
+    '',
+    truncateForDiscordBlock(request.message, 1400),
+    '',
+    'Choose an action below. **Always** applies only to this run/agent/reason while the gateway process is alive.',
+  ].join('\n');
+
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(supervisorButtonId('once', request.id))
+      .setLabel('Once')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(supervisorButtonId('always', request.id))
+      .setLabel('Always this run')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(supervisorButtonId('best', request.id))
+      .setLabel('Best effort')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(supervisorButtonId('cancel', request.id))
+      .setLabel('Cancel')
+      .setStyle(ButtonStyle.Danger),
+  );
+
+  await (channel as TextChannel | DMChannel).send({ content: body, components: [row] });
+  logger.info({ jid, requestId: request.id, runId: request.runId }, 'Supervisor prompt sent');
+}
+
+async function handleSupervisorButton(interaction: ButtonInteraction): Promise<void> {
+  const parsed = parseSupervisorCustomId(interaction.customId, SUPERVISOR_BUTTON_PREFIX);
+  if (!parsed) return;
+  const request = pendingSupervisorRequests.get(parsed.requestId);
+  if (!request) {
+    await interaction.reply({
+      content: 'This supervisor request is no longer pending.',
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (parsed.action === 'once' || parsed.action === 'always') {
+    const modal = new ModalBuilder()
+      .setCustomId(`${SUPERVISOR_MODAL_PREFIX}${parsed.action}:${request.id}`)
+      .setTitle(parsed.action === 'always' ? 'Always reply for this run' : 'Reply once');
+    const input = new TextInputBuilder()
+      .setCustomId('reply')
+      .setLabel('Supervisor reply')
+      .setStyle(TextInputStyle.Paragraph)
+      .setRequired(true)
+      .setMaxLength(3500)
+      .setValue(parsed.action === 'always' ? SUPERVISOR_DEFAULT_BEST_EFFORT : '');
+    modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+    await interaction.showModal(modal);
+    return;
+  }
+
+  const message =
+    parsed.action === 'cancel' ? SUPERVISOR_CANCEL_REPLY : SUPERVISOR_DEFAULT_BEST_EFFORT;
+  await replyToSupervisorRequest(request.id, message);
+  await interaction.reply({
+    content: `Supervisor ${parsed.action === 'cancel' ? 'cancel' : 'best-effort'} reply sent.`,
+    ephemeral: true,
+  });
+}
+
+async function handleSupervisorModal(interaction: ModalSubmitInteraction): Promise<void> {
+  const parsed = parseSupervisorCustomId(interaction.customId, SUPERVISOR_MODAL_PREFIX);
+  if (!parsed || (parsed.action !== 'once' && parsed.action !== 'always')) return;
+  const request = pendingSupervisorRequests.get(parsed.requestId);
+  if (!request) {
+    await interaction.reply({
+      content: 'This supervisor request is no longer pending.',
+      ephemeral: true,
+    });
+    return;
+  }
+  const message = interaction.fields.getTextInputValue('reply').trim();
+  if (!message) {
+    await interaction.reply({ content: 'Reply cannot be empty.', ephemeral: true });
+    return;
+  }
+  if (parsed.action === 'always') {
+    alwaysSupervisorReplies.set(supervisorAlwaysKey(request), message);
+  }
+  await replyToSupervisorRequest(request.id, message);
+  await interaction.reply({
+    content: `Supervisor reply sent${parsed.action === 'always' ? ' and saved for this run.' : '.'}`,
+    ephemeral: true,
+  });
+}
+
+async function replyToSupervisorRequest(requestId: string, message: string): Promise<void> {
+  const request = pendingSupervisorRequests.get(requestId);
+  if (!request) throw new Error('Supervisor request is no longer pending');
+  await writeSupervisorReply(request, message);
+  pendingSupervisorRequests.delete(requestId);
+}
+
+function supervisorAlwaysKey(request: SupervisorRequest): string {
+  return `${request.runId}:${request.agent}:${request.reason}`;
+}
+
+function supervisorButtonId(action: string, requestId: string): string {
+  return `${SUPERVISOR_BUTTON_PREFIX}${action}:${requestId}`;
+}
+
+function parseSupervisorCustomId(
+  customId: string,
+  prefix: string,
+): { action: string; requestId: string } | undefined {
+  if (!customId.startsWith(prefix)) return undefined;
+  const rest = customId.slice(prefix.length);
+  const separator = rest.indexOf(':');
+  if (separator === -1) return undefined;
+  return { action: rest.slice(0, separator), requestId: rest.slice(separator + 1) };
+}
+
+function truncateForDiscordBlock(text: string, max: number): string {
+  const truncated = text.length > max ? `${text.slice(0, max - 20)}\n…[truncated]` : text;
+  return `>>> ${truncated.replace(/\n/g, '\n> ')}`;
 }
 
 // ── Outbound ──
