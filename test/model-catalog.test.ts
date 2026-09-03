@@ -1,5 +1,4 @@
-import { AuthStorage, ModelRegistry, SettingsManager } from '@earendil-works/pi-coding-agent';
-import type { Model } from '@earendil-works/pi-ai';
+import { SettingsManager } from '@earendil-works/pi-coding-agent';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   isModelCatalogStale,
@@ -15,27 +14,6 @@ vi.mock('node:child_process', async (importOriginal) => ({
   spawnSync: spawnSyncMock,
 }));
 
-const models = [
-  {
-    provider: 'test',
-    id: 'alpha',
-    name: 'Alpha',
-    reasoning: false,
-  },
-  {
-    provider: 'test',
-    id: 'beta',
-    name: 'Beta',
-    reasoning: true,
-  },
-  {
-    provider: 'other',
-    id: 'gamma',
-    name: 'Gamma',
-    reasoning: true,
-  },
-] as Model<any>[];
-
 const defaultCliOutput = `provider  model  context  max-out  thinking  images
 other    gamma  128K     16K      yes       no
 test     alpha  128K     16K      no        no
@@ -43,15 +21,7 @@ test     beta   128K     16K      yes       no
 `;
 
 function mockPiCatalog(enabledModels?: string[], cliOutput = defaultCliOutput): void {
-  const authStorage = { reload: vi.fn() } as unknown as AuthStorage;
-  const registry = {
-    refresh: vi.fn(),
-    getAvailable: vi.fn(() => models),
-  } as unknown as ModelRegistry;
-
   spawnSyncMock.mockReturnValue({ status: 0, stdout: cliOutput, stderr: '' });
-  vi.spyOn(AuthStorage, 'create').mockReturnValue(authStorage);
-  vi.spyOn(ModelRegistry, 'create').mockReturnValue(registry);
   vi.spyOn(SettingsManager, 'create').mockReturnValue(SettingsManager.inMemory({ enabledModels }));
 }
 
@@ -97,13 +67,13 @@ describe('listSelectableModels', () => {
     expect(result.map((model) => model.ref)).toEqual(['test/delta']);
   });
 
-  it('falls back to the SDK catalog when pi --list-models fails', async () => {
+  it('returns an empty catalog when pi --list-models fails', async () => {
     mockPiCatalog(['test/beta']);
     spawnSyncMock.mockReturnValue({ status: 1, stdout: '', stderr: 'failed' });
 
     const result = await listSelectableModels({ forceRefresh: true });
 
-    expect(result.map((model) => model.ref)).toEqual(['test/beta']);
+    expect(result).toEqual([]);
   });
 
   it('keeps a successful empty pi catalog empty instead of falling back', async () => {
@@ -114,7 +84,7 @@ describe('listSelectableModels', () => {
     expect(result).toEqual([]);
   });
 
-  it('falls back to the SDK catalog when pi --list-models errors out', async () => {
+  it('returns an empty catalog when pi --list-models errors out', async () => {
     mockPiCatalog(['test/beta']);
     spawnSyncMock.mockReturnValue({
       error: new Error('spawnSync pi ETIMEDOUT'),
@@ -125,7 +95,7 @@ describe('listSelectableModels', () => {
 
     const result = await listSelectableModels({ forceRefresh: true });
 
-    expect(result.map((model) => model.ref)).toEqual(['test/beta']);
+    expect(result).toEqual([]);
   });
 
   it('bounds the pi --list-models subprocess with a timeout', async () => {

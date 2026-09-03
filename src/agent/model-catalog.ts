@@ -1,10 +1,8 @@
 import { spawnSync } from 'node:child_process';
-import { AuthStorage, ModelRegistry, SettingsManager } from '@earendil-works/pi-coding-agent';
-import type { Model } from '@earendil-works/pi-ai';
+import { SettingsManager } from '@earendil-works/pi-coding-agent';
 import { minimatch } from 'minimatch';
 import { config } from '../config.js';
 import { THINKING_LEVELS, type ThinkingLevel } from '../types.js';
-import { supportsModelXhigh } from './pi-ai-compat.js';
 import { resolvePiSpawn } from './pi-spawn.js';
 
 const CACHE_TTL_MS = 30_000;
@@ -290,13 +288,11 @@ function loadModelCatalog(forceRefresh: boolean, cwd: string, allowStale: boolea
     return cached;
   }
 
-  const authStorage = AuthStorage.create();
-  authStorage.reload();
-
-  const registry = createModelRegistry(authStorage);
-  registry.refresh();
-
-  const sdkModels = registry.getAvailable().map(toAvailableModelInfo);
+  // pi-coding-agent 0.84.x no longer exposes the old synchronous AuthStorage ->
+  // ModelRegistry construction path from the package root. piscord's CLI
+  // model-list parser is synchronous and already mirrors the actual pi
+  // invocation, so use it as the startup-safe source of selectable models.
+  const sdkModels: AvailableModelInfo[] = [];
   const cliModels = listModelsFromPiCli(config.piBin, cwd);
   const models = mergeModelMetadata(cliModels ?? sdkModels, sdkModels).sort((a, b) =>
     a.ref.localeCompare(b.ref),
@@ -402,30 +398,6 @@ function mergeModelMetadata(
         }
       : model;
   });
-}
-
-function createModelRegistry(authStorage: AuthStorage): ModelRegistry {
-  const registryClass = ModelRegistry as unknown as {
-    create?: (authStorage: AuthStorage) => ModelRegistry;
-    new (authStorage: AuthStorage): ModelRegistry;
-  };
-
-  if (typeof registryClass.create === 'function') {
-    return registryClass.create(authStorage);
-  }
-
-  return new registryClass(authStorage);
-}
-
-function toAvailableModelInfo(model: Model<any>): AvailableModelInfo {
-  return {
-    ref: `${model.provider}/${model.id}`,
-    provider: model.provider,
-    id: model.id,
-    name: model.name || model.id,
-    reasoning: Boolean(model.reasoning),
-    supportsXhigh: supportsModelXhigh(model),
-  };
 }
 
 function normalize(text: string): string {
