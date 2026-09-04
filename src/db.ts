@@ -292,6 +292,15 @@ export function recoverStuckMessages(): number {
   return result.changes;
 }
 
+export function countPendingMessages(channelJid: string): number {
+  const row = db
+    .prepare(
+      "select count(*) as count from message_queue where status = 'pending' and channel_jid = ?",
+    )
+    .get(channelJid) as { count: number };
+  return row.count;
+}
+
 /** Get channels that have pending messages */
 export function channelsWithPending(): string[] {
   const rows = db

@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Debounce consecutive same-channel messages during an active run and send the queued messages to Pi as one steering batch.
 - Replace one-shot print-mode agent invocations with the official JSONL RPC protocol.
 
 ### Fixed

@@ -32,6 +32,7 @@ const CONFIG_ENV_KEYS = [
   'PI_CWD',
   'POLL_INTERVAL_MS',
   'SESSIONS_DIR',
+  'STEER_DEBOUNCE_MS',
 ];
 
 afterEach(() => {
@@ -55,6 +56,7 @@ describe('active-run steering', () => {
     process.env.POLL_INTERVAL_MS = '1';
     process.env.MAX_CONCURRENCY = '1';
     process.env.PI_CWD = '/global/project';
+    process.env.STEER_DEBOUNCE_MS = '1';
 
     let finishInvocation!: (value: { ok: boolean; text: string; error?: string }) => void;
     invokeAgentMock.mockImplementation(
@@ -137,6 +139,113 @@ describe('active-run steering', () => {
           .status,
       ).toBe('done');
       completedDb.close();
+    } finally {
+      finishInvocation?.({ ok: true, text: 'done' });
+      await queue.stopProcessingLoop({ timeoutMs: 1000 });
+      db.closeDb();
+    }
+  });
+
+  it('debounces queued messages and steers them as one durable batch', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'piscord-queue-steer-batch-'));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, 'gateway.db');
+    process.env.DB_PATH = dbPath;
+    process.env.SESSIONS_DIR = resolve(tempDir, 'sessions');
+    process.env.POLL_INTERVAL_MS = '1';
+    process.env.MAX_CONCURRENCY = '1';
+    process.env.STEER_DEBOUNCE_MS = '20';
+
+    let finishInvocation!: (value: { ok: boolean; text: string; error?: string }) => void;
+    invokeAgentMock.mockImplementation(
+      () =>
+        new Promise((resolveInvocation) => {
+          finishInvocation = resolveInvocation;
+        }),
+    );
+    let consumeBatch!: () => void | Promise<void>;
+    steerActiveAgentMock.mockImplementation(async (_folder, _prompt, opts) => {
+      consumeBatch = opts.onConsumed;
+      return true;
+    });
+    sendResponseMock.mockResolvedValue(true);
+    setTypingMock.mockResolvedValue(undefined);
+
+    vi.resetModules();
+    const db = await import('../src/db.js');
+    const queue = await import('../src/agent/queue.js');
+    db.initDb();
+    db.registerChannel({
+      jid: 'dc:batch',
+      name: 'batch test',
+      folder: 'ch_batch',
+      requiresTrigger: false,
+      isMain: false,
+      modelOverride: '',
+      thinkingOverride: '',
+      cwdOverride: '',
+    });
+    db.enqueueMessage({
+      channelJid: 'dc:batch',
+      sender: 'u_1',
+      senderName: 'Alice',
+      content: 'initial request',
+      timestamp: new Date().toISOString(),
+    });
+
+    queue.startProcessingLoop();
+    try {
+      await vi.waitFor(() => expect(invokeAgentMock).toHaveBeenCalledTimes(1));
+      db.enqueueMessage({
+        channelJid: 'dc:batch',
+        sender: 'u_1',
+        senderName: 'Alice',
+        content: 'first correction',
+        timestamp: new Date().toISOString(),
+        attachments: JSON.stringify([{ id: 'a1', name: 'first.png' }]),
+      });
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+      db.enqueueMessage({
+        channelJid: 'dc:batch',
+        sender: 'u_2',
+        senderName: 'Bob',
+        content: 'second correction',
+        timestamp: new Date().toISOString(),
+        attachments: JSON.stringify([{ id: 'a2', name: 'second.png' }]),
+      });
+
+      await vi.waitFor(() => expect(steerActiveAgentMock).toHaveBeenCalledTimes(1));
+      expect(steerActiveAgentMock).toHaveBeenCalledWith(
+        'ch_batch',
+        '[Discord user: Alice]\nfirst correction\n\n---\n\n[Discord user: Bob]\nsecond correction',
+        expect.objectContaining({
+          attachments: JSON.stringify([
+            { id: 'a1', name: 'first.png' },
+            { id: 'a2', name: 'second.png' },
+          ]),
+        }),
+      );
+
+      const processingDb = new Database(dbPath, { readonly: true });
+      const processingRows = processingDb
+        .prepare('select rowid, status from message_queue where rowid in (2, 3) order by rowid')
+        .all() as Array<{ rowid: number; status: string }>;
+      expect(processingRows).toEqual([
+        { rowid: 2, status: 'processing' },
+        { rowid: 3, status: 'processing' },
+      ]);
+      processingDb.close();
+
+      await consumeBatch();
+      const consumedDb = new Database(dbPath, { readonly: true });
+      const consumedRows = consumedDb
+        .prepare('select rowid, status from message_queue where rowid in (2, 3) order by rowid')
+        .all() as Array<{ rowid: number; status: string }>;
+      expect(consumedRows).toEqual([
+        { rowid: 2, status: 'done' },
+        { rowid: 3, status: 'done' },
+      ]);
+      consumedDb.close();
     } finally {
       finishInvocation?.({ ok: true, text: 'done' });
       await queue.stopProcessingLoop({ timeoutMs: 1000 });

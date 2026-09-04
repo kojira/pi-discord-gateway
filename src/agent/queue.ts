@@ -12,6 +12,7 @@ import {
   channelsWithPending,
   claimNextMessage,
   clearPendingMessages,
+  countPendingMessages,
   markMessageDone,
   markMessageFailed,
   recoverStuckMessages,
@@ -22,6 +23,7 @@ import {
 import { invokeAgent, steerActiveAgent } from './invoke.js';
 import { promptSupervisorRequest, sendResponse, setTyping } from '../discord/client.js';
 import { computeEffectiveChannelSettings } from './channel-settings.js';
+import type { QueuedMessage } from '../types.js';
 
 /** Channels currently being processed (per-channel serial lock) */
 const activeChannels = new Set<string>();
@@ -145,8 +147,7 @@ function dispatchSteeringMessage(jid: string): void {
   if (steeringChannels.has(jid)) return;
 
   const channel = getChannel(jid);
-  const msg = claimNextMessage(jid);
-  if (!channel || !msg) return;
+  if (!channel) return;
 
   const controller = new AbortController();
   const parentSignal = activeChannelControllers.get(jid)?.signal;
@@ -156,34 +157,36 @@ function dispatchSteeringMessage(jid: string): void {
 
   steeringChannels.add(jid);
   steeringTaskControllers.add(controller);
-  const taskPromise = processSteeringMessage(
-    jid,
-    channel.folder,
-    msg.rowid,
-    msg.sender_name,
-    msg.content,
-    msg.attachments,
-    controller.signal,
-  ).finally(() => {
-    parentSignal?.removeEventListener('abort', abortFromParent);
-    steeringChannels.delete(jid);
-    steeringTaskControllers.delete(controller);
-    steeringTaskPromises.delete(taskPromise);
-    if (running) schedulePoll(0);
-  });
+  const taskPromise = processSteeringMessages(jid, channel.folder, controller.signal).finally(
+    () => {
+      parentSignal?.removeEventListener('abort', abortFromParent);
+      steeringChannels.delete(jid);
+      steeringTaskControllers.delete(controller);
+      steeringTaskPromises.delete(taskPromise);
+      if (running) schedulePoll(0);
+    },
+  );
   steeringTaskPromises.add(taskPromise);
 }
 
-async function processSteeringMessage(
+async function processSteeringMessages(
   jid: string,
   channelFolder: string,
-  rowid: number,
-  senderName: string,
-  content: string,
-  attachments: string | null,
   signal?: AbortSignal,
 ): Promise<void> {
-  const prompt = `[Discord user: ${senderName}]\n${content}`;
+  const ready = await waitForSteeringDebounce(jid, signal);
+  if (!ready) return;
+
+  const messages: QueuedMessage[] = [];
+  let next: QueuedMessage | undefined;
+  while ((next = claimNextMessage(jid))) messages.push(next);
+  if (messages.length === 0) return;
+
+  const rowids = messages.map((message) => message.rowid);
+  const prompt = messages
+    .map((message) => `[Discord user: ${message.sender_name}]\n${message.content}`)
+    .join('\n\n---\n\n');
+  const attachments = combineAttachments(messages);
 
   try {
     let consumed = false;
@@ -192,37 +195,92 @@ async function processSteeringMessage(
       signal,
       onConsumed: () => {
         consumed = true;
-        markMessageDone(rowid);
-        acceptedSteeringRows.get(jid)?.delete(rowid);
-        logger.info({ jid, rowid }, 'Steering message consumed by Pi');
+        for (const rowid of rowids) {
+          markMessageDone(rowid);
+          acceptedSteeringRows.get(jid)?.delete(rowid);
+        }
+        logger.info({ jid, rowids, count: rowids.length }, 'Steering batch consumed by Pi');
       },
     });
     if (!accepted) {
       // The active run may still be starting or may have just settled. Let the
-      // normal queue path process this message on the next poll unless the user
-      // or gateway explicitly aborted the owning channel task.
-      if (signal?.aborted) markMessageFailed(rowid);
-      else requeueMessage(rowid);
+      // normal queue path process these messages on the next poll unless the
+      // user or gateway explicitly aborted the owning channel task.
+      for (const rowid of rowids) {
+        if (signal?.aborted) markMessageFailed(rowid);
+        else requeueMessage(rowid);
+      }
       return;
     }
 
-    logMessage(jid, 'user', content);
+    for (const message of messages) logMessage(jid, 'user', message.content);
     if (!consumed) {
       const rows = acceptedSteeringRows.get(jid) || new Set<number>();
-      rows.add(rowid);
+      for (const rowid of rowids) rows.add(rowid);
       acceptedSteeringRows.set(jid, rows);
     }
-    logger.info({ jid, rowid, senderName, len: content.length }, 'Message steered into active run');
+    logger.info(
+      { jid, rowids, count: messages.length, len: prompt.length },
+      'Messages steered into active run as one batch',
+    );
   } catch (err: any) {
     if (!activeChannels.has(jid)) {
-      if (signal?.aborted) markMessageFailed(rowid);
-      else requeueMessage(rowid);
+      for (const rowid of rowids) {
+        if (signal?.aborted) markMessageFailed(rowid);
+        else requeueMessage(rowid);
+      }
       return;
     }
-    markMessageFailed(rowid);
-    logger.warn({ jid, rowid, err: err.message }, 'Failed to steer message into active run');
+    for (const rowid of rowids) markMessageFailed(rowid);
+    logger.warn({ jid, rowids, err: err.message }, 'Failed to steer message batch into active run');
     await sendResponse(jid, `⚠️ Steer failed: ${err.message?.slice(0, 250)}`);
   }
+}
+
+async function waitForSteeringDebounce(jid: string, signal?: AbortSignal): Promise<boolean> {
+  let observedCount = countPendingMessages(jid);
+  if (observedCount === 0) return false;
+
+  while (config.steerDebounceMs > 0) {
+    if (!(await waitForDelay(config.steerDebounceMs, signal))) return false;
+    const currentCount = countPendingMessages(jid);
+    if (currentCount === 0) return false;
+    if (currentCount === observedCount) break;
+    observedCount = currentCount;
+  }
+
+  return !signal?.aborted;
+}
+
+function waitForDelay(ms: number, signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const finish = (completed: boolean) => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      resolve(completed);
+    };
+    const onAbort = () => finish(false);
+    const timer = setTimeout(() => finish(true), ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function combineAttachments(messages: QueuedMessage[]): string | null {
+  const combined: unknown[] = [];
+  for (const message of messages) {
+    if (!message.attachments) continue;
+    try {
+      const attachments: unknown = JSON.parse(message.attachments);
+      if (Array.isArray(attachments)) combined.push(...attachments);
+    } catch (err: any) {
+      logger.warn(
+        { rowid: message.rowid, err: err.message },
+        'Ignoring malformed steer attachments',
+      );
+    }
+  }
+  return combined.length > 0 ? JSON.stringify(combined) : null;
 }
 
 async function drainActiveTasks(timeoutMs: number): Promise<void> {

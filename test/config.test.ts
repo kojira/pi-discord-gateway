@@ -25,6 +25,7 @@ const CONFIG_ENV_KEYS = [
   'POLL_INTERVAL_MS',
   'SESSIONS_DIR',
   'SHUTDOWN_TIMEOUT_MS',
+  'STEER_DEBOUNCE_MS',
   'TRIGGER_NAME',
 ];
 
@@ -121,6 +122,17 @@ describe('config loading', () => {
     expect(resolveConfigPath()).toBe(defaultConfigPath);
     expect(config.dbPath).toBe('/default/gateway.db');
     expect(config.sessionsDir).toBe('/default/sessions');
+  });
+
+  it('loads the steering debounce window and accepts zero to disable it', async () => {
+    const workDir = createTempDir();
+    process.chdir(workDir);
+    process.env.PIDG_CONFIG = resolve(workDir, 'missing.env');
+    process.env.STEER_DEBOUNCE_MS = '0';
+
+    const { config } = await loadConfigModule();
+
+    expect(config.steerDebounceMs).toBe(0);
   });
 
   it('uses the piscord platform data directory defaults when storage paths are unset', async () => {

@@ -213,6 +213,7 @@ Most users won't need to edit this file directly — `piscord setup` generates i
 | `MAX_CONCURRENCY`            | `3`                             | Max parallel pi invocations                                                |
 | `MAX_SCHEDULED_CONCURRENCY`  | `1`                             | Max scheduled tasks enqueued per tick                                      |
 | `POLL_INTERVAL_MS`           | `1000`                          | Queue poll interval (ms)                                                   |
+| `STEER_DEBOUNCE_MS`          | `750`                           | Quiet window before queued active-run messages are combined into one steer |
 | `SHUTDOWN_TIMEOUT_MS`        | `15000`                         | Graceful shutdown timeout (ms)                                             |
 | `AUTO_REGISTER_DMS`          | `true`                          | Auto-register DM channels                                                  |
 | `ARCHIVE_RETENTION_DAYS`     | `30`                            | Days to keep archived sessions (0 = never clean)                           |

@@ -169,6 +169,9 @@ export const config = {
   /** Poll interval for message queue (ms) */
   pollInterval: envInt('POLL_INTERVAL_MS', 1000, { min: 1 }),
 
+  /** Quiet window used to combine queued messages before steering an active run */
+  steerDebounceMs: envInt('STEER_DEBOUNCE_MS', 750, { min: 0 }),
+
   /** Graceful shutdown timeout before aborting in-flight tasks (ms) */
   shutdownTimeoutMs: envInt('SHUTDOWN_TIMEOUT_MS', 15_000, { min: 0 }),
 
