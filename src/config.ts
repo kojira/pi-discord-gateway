@@ -169,6 +169,19 @@ export const config = {
   /** Poll interval for message queue (ms) */
   pollInterval: envInt('POLL_INTERVAL_MS', 1000, { min: 1 }),
 
+  /** Quiet window used to combine queued messages before steering an active run */
+  steerDebounceMs: envInt('STEER_DEBOUNCE_MS', 750, { min: 0 }),
+
+  /** Maximum time to defer a steer while more messages keep arriving */
+  steerDebounceMaxMs: envInt('STEER_DEBOUNCE_MAX_MS', 3000, { min: 1 }),
+
+  /** Hard bounds for one combined steering request */
+  steerBatchMaxMessages: envInt('STEER_BATCH_MAX_MESSAGES', 10, { min: 1 }),
+  steerBatchMaxPromptChars: envInt('STEER_BATCH_MAX_PROMPT_CHARS', 16_000, { min: 1 }),
+  steerBatchMaxAttachmentBytes: envInt('STEER_BATCH_MAX_ATTACHMENT_BYTES', 50 * 1024 * 1024, {
+    min: 1,
+  }),
+
   /** Graceful shutdown timeout before aborting in-flight tasks (ms) */
   shutdownTimeoutMs: envInt('SHUTDOWN_TIMEOUT_MS', 15_000, { min: 0 }),
 
