@@ -32,6 +32,9 @@ export interface ChannelWebhookProvisioning {
   destination_channel_name: string;
   webhook_name: string;
   state: ChannelWebhookProvisioningState;
+  /** Durable tombstone: creator paths may persist credentials but cannot activate. */
+  reconciling: number;
+  reconciliation_webhook_ids: string;
   webhook_id: string | null;
   webhook_token: string | null;
   updated_at_ms: number;
@@ -125,6 +128,8 @@ export function initDb(): void {
       destination_channel_name text not null,
       webhook_name             text not null,
       state                    text not null check(state in ('creating', 'created')),
+      reconciling              integer not null default 0 check(reconciling in (0, 1)),
+      reconciliation_webhook_ids text not null default '[]',
       webhook_id               text,
       webhook_token            text,
       updated_at_ms            integer not null,
@@ -163,6 +168,12 @@ export function initDb(): void {
   ensureTableColumn('channels', 'thinking_override', "text not null default ''");
   ensureTableColumn('channels', 'cwd_override', "text not null default ''");
   ensureTableColumn('message_queue', 'attachments', 'text');
+  ensureTableColumn('channel_webhook_provisioning', 'reconciling', 'integer not null default 0');
+  ensureTableColumn(
+    'channel_webhook_provisioning',
+    'reconciliation_webhook_ids',
+    "text not null default '[]'",
+  );
   hardenDatabaseFiles();
 
   logger.info({ path: config.dbPath }, 'Database initialized');
@@ -290,7 +301,8 @@ export function getChannelWebhookProvisioning(
   return db
     .prepare(
       `select channel_jid, lease_id, destination_channel_id, destination_channel_name,
-              webhook_name, state, webhook_id, webhook_token, updated_at_ms
+              webhook_name, state, reconciling, reconciliation_webhook_ids,
+              webhook_id, webhook_token, updated_at_ms
        from channel_webhook_provisioning where channel_jid = ?`,
     )
     .get(channelJid) as ChannelWebhookProvisioning | undefined;
@@ -323,8 +335,9 @@ export function beginChannelWebhookProvisioning(
     db.prepare(
       `insert into channel_webhook_provisioning (
          channel_jid, lease_id, destination_channel_id, destination_channel_name,
-         webhook_name, state, webhook_id, webhook_token, updated_at_ms
-       ) values (?, ?, ?, ?, ?, 'creating', null, null, ?)`,
+         webhook_name, state, reconciling, reconciliation_webhook_ids,
+         webhook_id, webhook_token, updated_at_ms
+       ) values (?, ?, ?, ?, ?, 'creating', 0, '[]', null, null, ?)`,
     ).run(
       input.channel_jid,
       leaseId,
@@ -350,13 +363,26 @@ export function recordChannelWebhookCreated(
       .prepare(
         `update channel_webhook_provisioning
          set state = 'created', webhook_id = ?, webhook_token = ?, updated_at_ms = ?
-         where lease_id = ? and channel_jid = ? and state = 'creating'`,
+         where lease_id = ? and channel_jid = ? and state = 'creating' and reconciling = 0`,
       )
       .run(webhook.webhook_id, webhook.webhook_token, now, leaseId, webhook.channel_jid);
     if (result.changes > 0) return true;
 
-    // A stale owner may return after its lease was reconciled or replaced.
-    // Retain its credentials independently of source-channel existence.
+    // Reconciliation may have claimed this lease while Discord creation was
+    // in flight. Persist the credentials on the tombstone, but report false so
+    // the creator cannot validate or activate it. A retry can then delete by
+    // credential even if the name-based remote deletion already completed.
+    const retained = db
+      .prepare(
+        `update channel_webhook_provisioning
+         set state = 'created', webhook_id = ?, webhook_token = ?, updated_at_ms = ?
+         where lease_id = ? and channel_jid = ? and state = 'creating' and reconciling = 1`,
+      )
+      .run(webhook.webhook_id, webhook.webhook_token, now, leaseId, webhook.channel_jid);
+    if (retained.changes > 0) return false;
+
+    // The reconciliation transaction already completed or the lease was
+    // otherwise removed. Retain returned credentials independently.
     insertPendingWebhookCleanup(webhook);
     return false;
   })();
@@ -370,11 +396,12 @@ export function activateChannelWebhookProvisioning(leaseId: string): ChannelWebh
     const provisioning = db
       .prepare(
         `select channel_jid, lease_id, destination_channel_id, destination_channel_name,
-                webhook_name, state, webhook_id, webhook_token, updated_at_ms
+                webhook_name, state, reconciling, reconciliation_webhook_ids,
+                webhook_id, webhook_token, updated_at_ms
          from channel_webhook_provisioning where lease_id = ?`,
       )
       .get(leaseId) as ChannelWebhookProvisioning | undefined;
-    if (!provisioning || provisioning.state !== 'created') {
+    if (!provisioning || provisioning.state !== 'created' || provisioning.reconciling !== 0) {
       throw new Error('Monitoring webhook setup lease is no longer active.');
     }
     const webhook = provisioningWebhookConfig(provisioning);
@@ -408,7 +435,8 @@ export function queueChannelWebhookProvisioningCleanup(
     const provisioning = db
       .prepare(
         `select channel_jid, lease_id, destination_channel_id, destination_channel_name,
-                webhook_name, state, webhook_id, webhook_token, updated_at_ms
+                webhook_name, state, reconciling, reconciliation_webhook_ids,
+                webhook_id, webhook_token, updated_at_ms
          from channel_webhook_provisioning where lease_id = ?`,
       )
       .get(leaseId) as ChannelWebhookProvisioning | undefined;
@@ -452,8 +480,92 @@ export function isChannelWebhookProvisioningStale(
 ): boolean {
   return (
     provisioning.state === 'creating' &&
-    provisioning.updated_at_ms <= now - WEBHOOK_PROVISIONING_LEASE_MS
+    (provisioning.reconciling === 1 ||
+      provisioning.updated_at_ms <= now - WEBHOOK_PROVISIONING_LEASE_MS)
   );
+}
+
+/**
+ * Turn a stale creating lease into a durable reconciliation tombstone before
+ * any remote inspection. Once claimed, a late creator can only queue cleanup.
+ */
+export function claimChannelWebhookProvisioningReconciliation(
+  leaseId: string,
+  now = Date.now(),
+): ChannelWebhookProvisioning | undefined {
+  return db.transaction(() => {
+    const current = selectWebhookProvisioningByLease(leaseId);
+    if (!current) return undefined;
+    if (current.state === 'created') return current;
+    if (!isChannelWebhookProvisioningStale(current, now)) return current;
+
+    db.prepare(
+      `update channel_webhook_provisioning
+       set reconciling = 1
+       where lease_id = ? and state = 'creating'`,
+    ).run(leaseId);
+    return selectWebhookProvisioningByLease(leaseId);
+  })();
+}
+
+/** Record positively observed remote IDs before attempting their deletion. */
+export function recordChannelWebhookReconciliationTargets(
+  leaseId: string,
+  webhookIds: readonly string[],
+): string[] {
+  const recorded = db.transaction(() => {
+    const provisioning = selectWebhookProvisioningByLease(leaseId);
+    if (!provisioning || provisioning.reconciling !== 1) return [];
+    const ids = [
+      ...new Set([...parseReconciliationWebhookIds(provisioning), ...webhookIds.filter(Boolean)]),
+    ];
+    db.prepare(
+      `update channel_webhook_provisioning
+       set reconciliation_webhook_ids = ?
+       where lease_id = ? and reconciling = 1`,
+    ).run(JSON.stringify(ids), leaseId);
+    return ids;
+  })();
+  hardenDatabaseFiles();
+  return recorded;
+}
+
+export function getChannelWebhookReconciliationTargets(leaseId: string): string[] {
+  const provisioning = selectWebhookProvisioningByLease(leaseId);
+  return provisioning ? parseReconciliationWebhookIds(provisioning) : [];
+}
+
+/**
+ * Finish a positive remote reconciliation in one transaction. This also
+ * removes credentials concurrently queued by a late creator and defensively
+ * removes a matching active mapping, so deleted webhooks can never stay active.
+ */
+export function completeChannelWebhookProvisioningReconciliation(
+  leaseId: string,
+  webhookIds: readonly string[],
+): boolean {
+  if (webhookIds.length === 0) return false;
+  const ids = [...new Set(webhookIds)];
+  const placeholders = ids.map(() => '?').join(', ');
+  const completed = db.transaction(() => {
+    const provisioning = selectWebhookProvisioningByLease(leaseId);
+    if (!provisioning || provisioning.reconciling !== 1) return false;
+
+    db.prepare(
+      `delete from channel_webhook_cleanup
+       where channel_jid = ? and webhook_id in (${placeholders})`,
+    ).run(provisioning.channel_jid, ...ids);
+    db.prepare(
+      `delete from channel_webhooks
+       where channel_jid = ? and webhook_id in (${placeholders})`,
+    ).run(provisioning.channel_jid, ...ids);
+    db.prepare(
+      'delete from channel_webhook_provisioning where lease_id = ? and reconciling = 1',
+    ).run(leaseId);
+    return true;
+  })();
+  hardenDatabaseFiles();
+  return completed;
 }
 
 export function getChannelWebhook(channelJid: string): ChannelWebhookConfig | undefined {
@@ -513,6 +625,28 @@ export function completeWebhookCleanup(webhookId: string): boolean {
     db.prepare('delete from channel_webhook_cleanup where webhook_id = ?').run(webhookId).changes >
     0
   );
+}
+
+function selectWebhookProvisioningByLease(leaseId: string): ChannelWebhookProvisioning | undefined {
+  return db
+    .prepare(
+      `select channel_jid, lease_id, destination_channel_id, destination_channel_name,
+              webhook_name, state, reconciling, reconciliation_webhook_ids,
+              webhook_id, webhook_token, updated_at_ms
+       from channel_webhook_provisioning where lease_id = ?`,
+    )
+    .get(leaseId) as ChannelWebhookProvisioning | undefined;
+}
+
+function parseReconciliationWebhookIds(provisioning: ChannelWebhookProvisioning): string[] {
+  try {
+    const parsed = JSON.parse(provisioning.reconciliation_webhook_ids) as unknown;
+    return Array.isArray(parsed)
+      ? parsed.filter((value): value is string => typeof value === 'string' && value.length > 0)
+      : [];
+  } catch {
+    return [];
+  }
 }
 
 function provisioningWebhookConfig(provisioning: ChannelWebhookProvisioning): ChannelWebhookConfig {

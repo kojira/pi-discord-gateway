@@ -173,7 +173,7 @@ export async function deleteDiscordWebhook(
   }
 }
 
-function safeDiscordErrorMetadata(error: unknown): {
+export function safeDiscordErrorMetadata(error: unknown): {
   errorName: string;
   discordCode?: number;
   httpStatus?: number;
@@ -242,12 +242,12 @@ async function deliver(state: WebhookDeliveryState, chunks: readonly string[]): 
       if (state.retired) return;
       await state.client.send({ content, allowedMentions: { parse: [] } });
     }
-  } catch (err: any) {
+  } catch (error) {
     logger.warn(
       {
         jid: state.jid,
         destinationChannelId: state.webhook.destination_channel_id,
-        err: err.message,
+        ...safeDiscordErrorMetadata(error),
       },
       'Failed to deliver Pi trace to monitoring webhook',
     );

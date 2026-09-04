@@ -21,19 +21,23 @@ import {
   activateChannelWebhookProvisioning,
   beginChannelWebhookProvisioning,
   cancelChannelWebhookProvisioning,
+  claimChannelWebhookProvisioningReconciliation,
   clearChannelModelOverride,
   clearChannelWebhook,
   clearPendingMessages,
+  completeChannelWebhookProvisioningReconciliation,
   completeChannelWebhookProvisioningRollback,
   completeWebhookCleanup,
   createDmChannel,
   getChannel,
   getChannelWebhook,
   getChannelWebhookProvisioning,
+  getChannelWebhookReconciliationTargets,
   getPendingWebhookCleanup,
   isChannelWebhookProvisioningStale,
   queueChannelWebhookProvisioningCleanup,
   recordChannelWebhookCreated,
+  recordChannelWebhookReconciliationTargets,
   registerChannel,
   setChannelModelOverride,
   setChannelThinkingOverride,
@@ -65,6 +69,7 @@ import {
   deleteDiscordWebhook,
   isDiscordUnknownWebhookError,
   retireWebhookTrace,
+  safeDiscordErrorMetadata,
   withWebhookConfigLock,
 } from './webhook-monitor.js';
 
@@ -142,6 +147,12 @@ export async function registerGlobalCommands(client: Client<true>): Promise<void
 }
 
 const catalogRefreshesInFlight = new Set<string>();
+
+class WebhookCommandError extends Error {}
+
+function webhookCommandError(message: string): WebhookCommandError {
+  return new WebhookCommandError(message);
+}
 
 /** Refresh a cwd's model catalog off the interaction path, at most once at a time. */
 function scheduleCatalogRefresh(cwd: string): void {
@@ -227,12 +238,35 @@ export async function handleChatCommand(interaction: ChatInputCommandInteraction
       default:
         await interaction.reply(reply(`Unknown subcommand: ${subcommand}`, interaction));
     }
-  } catch (err: any) {
-    logger.error(
-      { err: err.message, command: interaction.commandName, subcommand },
-      'Slash command failed',
-    );
-    const payload = reply(`⚠️ ${err.message}`, interaction);
+  } catch (error) {
+    const isWebhookCommand = subcommand === 'webhook' || subcommand === 'webhook-clear';
+    if (isWebhookCommand) {
+      logger.error(
+        {
+          command: interaction.commandName,
+          subcommand,
+          ...safeDiscordErrorMetadata(error),
+        },
+        'Webhook slash command failed',
+      );
+    } else {
+      logger.error(
+        {
+          err: error instanceof Error ? error.message : String(error),
+          command: interaction.commandName,
+          subcommand,
+        },
+        'Slash command failed',
+      );
+    }
+    const publicMessage = isWebhookCommand
+      ? error instanceof WebhookCommandError
+        ? error.message
+        : 'Webhook command failed safely. Run /pi webhook-clear to inspect or retry cleanup.'
+      : error instanceof Error
+        ? error.message
+        : String(error);
+    const payload = reply(`⚠️ ${publicMessage}`, interaction);
     if (interaction.replied) {
       await interaction.followUp(payload);
     } else if (interaction.deferred) {
@@ -373,12 +407,23 @@ async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promi
     // This SQLite lease is the cross-process serialization point. It exists
     // before Discord creation and prevents unregister/clear from discarding
     // lifecycle state while the network request is outstanding.
-    const provisioning = beginChannelWebhookProvisioning({
-      channel_jid: channel.jid,
-      destination_channel_id: destination.id,
-      destination_channel_name: destination.name,
-      webhook_name: buildWebhookName(channel.name),
-    });
+    let provisioning: ChannelWebhookProvisioning;
+    try {
+      provisioning = beginChannelWebhookProvisioning({
+        channel_jid: channel.jid,
+        destination_channel_id: destination.id,
+        destination_channel_name: destination.name,
+        webhook_name: buildWebhookName(channel.name),
+      });
+    } catch (error) {
+      logger.warn(
+        { jid: channel.jid, ...safeDiscordErrorMetadata(error) },
+        'Monitoring webhook provisioning could not start',
+      );
+      throw webhookCommandError(
+        'Webhook setup could not start. Another setup or cleanup may be active; run /pi webhook-clear to inspect it.',
+      );
+    }
 
     let webhook: Awaited<ReturnType<TextChannel['createWebhook']>>;
     try {
@@ -387,25 +432,27 @@ async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promi
         reason: `Pi activity monitoring configured by Discord user ${interaction.user.id}`,
       });
     } catch (error) {
-      if (isDefinitiveWebhookCreateRejection(error)) {
+      const definitive = isDefinitiveWebhookCreateRejection(error);
+      if (definitive) {
         // A concrete Discord 4xx response (other than timeout/rate limiting)
         // proves that this POST did not create a remote webhook.
         cancelChannelWebhookProvisioning(provisioning.lease_id);
-        throw error;
       }
-
-      // A transport failure, timeout, 408/429, or server error may arrive after
-      // Discord committed the POST. Keep the durable unique-name locator until
-      // /pi webhook-clear positively finds and deletes that webhook.
       logger.warn(
         {
           jid: channel.jid,
           destinationChannelId: destination.id,
           ...safeDiscordErrorMetadata(error),
         },
-        'Webhook creation outcome is uncertain; cleanup remains pending',
+        definitive
+          ? 'Discord rejected monitoring webhook creation'
+          : 'Webhook creation outcome is uncertain; cleanup remains pending',
       );
-      throw cleanupPendingError(error);
+      throw definitive
+        ? webhookCommandError(
+            'Discord rejected webhook creation. Check destination permissions and try again.',
+          )
+        : cleanupPendingError();
     }
 
     if (!webhook.token) {
@@ -416,7 +463,7 @@ async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promi
         destination.id,
       );
       if (deleted) cancelChannelWebhookProvisioning(provisioning.lease_id);
-      throw new Error(
+      throw webhookCommandError(
         deleted
           ? 'Discord created a webhook without a usable token.'
           : 'Discord created a webhook without a usable token. Webhook cleanup is pending; run /pi webhook-clear in this channel to retry.',
@@ -442,6 +489,14 @@ async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promi
       });
       ({ previous } = activateChannelWebhookProvisioning(provisioning.lease_id));
     } catch (error) {
+      logger.warn(
+        {
+          jid: channel.jid,
+          destinationChannelId: destination.id,
+          ...safeDiscordErrorMetadata(error),
+        },
+        'Monitoring webhook validation or activation failed',
+      );
       const deleted = await deleteWebhookObject(
         webhook,
         'Rolling back failed Pi monitoring setup',
@@ -455,7 +510,11 @@ async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promi
         // source vanished, allowing /pi webhook-clear to retry deletion.
         queueChannelWebhookProvisioningCleanup(provisioning.lease_id, createdConfig);
       }
-      throw deleted ? error : cleanupPendingError(error);
+      throw deleted
+        ? webhookCommandError(
+            'Webhook setup failed and the created webhook was removed. Try again.',
+          )
+        : cleanupPendingError();
     }
 
     // Activation is complete at this point. Cleanup failures for the previous
@@ -473,7 +532,9 @@ async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promi
   );
   await interaction.editReply({
     content: `Pi activity for this channel will be sent to <#${destination.id}>.${
-      oldWebhookDeleted ? '' : '\n⚠️ The previous Discord webhook could not be deleted.'
+      oldWebhookDeleted
+        ? ''
+        : '\n⚠️ Cleanup of the previous Discord webhook is pending. Run /pi webhook-clear to retry; note that it also disables the currently active monitoring webhook.'
     }`,
   });
 }
@@ -504,8 +565,14 @@ async function handleWebhookClear(interaction: ChatInputCommandInteraction): Pro
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const result = await withWebhookConfigLock(channelJid, async () => {
     const reconciliation = await reconcileWebhookProvisioning(interaction, channelJid);
-    if (reconciliation === 'uncertain') {
-      return { removed: undefined, remaining: [], uncertain: true, recovered: false };
+    if (reconciliation === 'uncertain' || reconciliation === 'retry') {
+      return {
+        removed: undefined,
+        remaining: [],
+        uncertain: reconciliation === 'uncertain',
+        retry: reconciliation === 'retry',
+        recovered: false,
+      };
     }
 
     // Remove active routing first, but retain the credential in the cleanup
@@ -526,6 +593,7 @@ async function handleWebhookClear(interaction: ChatInputCommandInteraction): Pro
       removed,
       remaining: getPendingWebhookCleanup(channelJid),
       uncertain: false,
+      retry: false,
       recovered: reconciliation === 'recovered',
     };
   });
@@ -536,11 +604,14 @@ async function handleWebhookClear(interaction: ChatInputCommandInteraction): Pro
     return;
   }
 
-  if (result.uncertain) {
-    logger.warn({ jid: channelJid }, 'Webhook creation is still uncertain; locator retained');
+  if (result.uncertain || result.retry) {
+    if (result.uncertain) {
+      logger.warn({ jid: channelJid }, 'Webhook creation is still uncertain; locator retained');
+    }
     await interaction.editReply({
-      content:
-        '⚠️ Discord did not list the interrupted webhook yet, so its cleanup status remains uncertain. The recovery locator was retained; inspect the destination and run /pi webhook-clear in this channel again.',
+      content: result.uncertain
+        ? '⚠️ Discord did not list the interrupted webhook yet, so its cleanup status remains uncertain. The recovery locator was retained; inspect the destination and run /pi webhook-clear in this channel again.'
+        : '⚠️ The interrupted webhook could not be inspected or deleted. Cleanup remains pending; verify the destination and permissions, then run /pi webhook-clear in this channel again.',
     });
     return;
   }
@@ -561,13 +632,13 @@ async function handleWebhookClear(interaction: ChatInputCommandInteraction): Pro
   });
 }
 
-type ProvisioningReconciliation = 'none' | 'queued' | 'recovered' | 'uncertain';
+type ProvisioningReconciliation = 'none' | 'queued' | 'recovered' | 'uncertain' | 'retry';
 
 async function reconcileWebhookProvisioning(
   interaction: ChatInputCommandInteraction,
   channelJid: string,
 ): Promise<ProvisioningReconciliation> {
-  const provisioning = getChannelWebhookProvisioning(channelJid);
+  let provisioning = getChannelWebhookProvisioning(channelJid);
   if (!provisioning) return 'none';
 
   if (provisioning.state === 'created') {
@@ -575,26 +646,87 @@ async function reconcileWebhookProvisioning(
     return 'queued';
   }
   if (!isChannelWebhookProvisioningStale(provisioning)) {
-    throw new Error('Monitoring webhook setup is still in progress. Wait, then try again.');
+    throw webhookCommandError(
+      'Monitoring webhook setup is still in progress. Wait, then try again.',
+    );
   }
 
-  // The process may have crashed in the narrow interval between Discord
-  // creation and credential persistence. The lease's unique webhook name lets
-  // us reconcile that interval without assuming no remote webhook exists.
-  const destination = await interaction.client.channels.fetch(provisioning.destination_channel_id);
-  if (!destination || !('fetchWebhooks' in destination)) {
-    throw new Error('Cannot inspect the destination for the interrupted webhook setup.');
+  // Claim the stale lease before the first remote await. This durable tombstone
+  // prevents a creator in another process from activating while reconciliation
+  // inspects or deletes the remote webhook.
+  provisioning = claimChannelWebhookProvisioningReconciliation(provisioning.lease_id);
+  if (!provisioning) return 'none';
+  if (provisioning.state === 'created') {
+    queueChannelWebhookProvisioningCleanup(provisioning.lease_id, provisioningConfig(provisioning));
+    return 'queued';
   }
-  const webhooks = await destination.fetchWebhooks();
+  if (provisioning.reconciling !== 1) {
+    throw webhookCommandError(
+      'Monitoring webhook setup is still in progress. Wait, then try again.',
+    );
+  }
+
+  let destination: Awaited<ReturnType<typeof interaction.client.channels.fetch>>;
+  try {
+    destination = await interaction.client.channels.fetch(provisioning.destination_channel_id);
+  } catch (error) {
+    logWebhookReconciliationFailure(provisioning, error, 'destination_fetch_failed');
+    return 'retry';
+  }
+  if (!destination || !('fetchWebhooks' in destination)) {
+    logger.warn(
+      {
+        jid: provisioning.channel_jid,
+        destinationChannelId: provisioning.destination_channel_id,
+        reason: destination ? 'unsupported_destination' : 'missing_destination',
+      },
+      'Could not inspect interrupted monitoring webhook; cleanup remains pending',
+    );
+    return 'retry';
+  }
+
+  let webhooks: Awaited<ReturnType<typeof destination.fetchWebhooks>>;
+  try {
+    webhooks = await destination.fetchWebhooks();
+  } catch (error) {
+    logWebhookReconciliationFailure(provisioning, error, 'webhook_fetch_failed');
+    return 'retry';
+  }
   const matches = [...webhooks.values()].filter(
     (webhook) => webhook.name === provisioning.webhook_name,
   );
+  const priorTargets = getChannelWebhookReconciliationTargets(provisioning.lease_id);
   if (matches.length === 0) {
-    // Absence from one snapshot cannot prove that an uncertain POST will not
-    // appear later. Keep the unique-name locator as a tombstone indefinitely;
-    // only a definitive create rejection or positive remote deletion releases it.
+    if (priorTargets.length > 0) {
+      // A prior attempt durably observed these IDs before issuing DELETE. Their
+      // absence now is positive retry evidence that they are gone.
+      completeChannelWebhookProvisioningReconciliation(provisioning.lease_id, priorTargets);
+      return 'recovered';
+    }
+    // Absence from the first snapshot cannot prove that an uncertain POST will
+    // not appear later. Keep the reconciling tombstone indefinitely.
     return 'uncertain';
   }
+
+  const matchIds = matches.flatMap((webhook) =>
+    typeof webhook.id === 'string' ? [webhook.id] : [],
+  );
+  if (matchIds.length !== matches.length) {
+    logger.warn(
+      {
+        jid: provisioning.channel_jid,
+        destinationChannelId: provisioning.destination_channel_id,
+        reason: 'webhook_id_missing',
+      },
+      'Could not finish interrupted monitoring webhook cleanup',
+    );
+    return 'retry';
+  }
+  const reconciliationTargets = recordChannelWebhookReconciliationTargets(
+    provisioning.lease_id,
+    matchIds,
+  );
+  if (reconciliationTargets.length === 0) return 'retry';
 
   for (const webhook of matches) {
     const deleted = await deleteWebhookObject(
@@ -603,23 +735,27 @@ async function reconcileWebhookProvisioning(
       provisioning.channel_jid,
       provisioning.destination_channel_id,
     );
-    if (!deleted) {
-      throw new Error(
-        'Failed to delete the interrupted monitoring webhook. Cleanup is pending; run /pi webhook-clear in this channel again.',
-      );
-    }
+    if (!deleted) return 'retry';
   }
 
-  if (cancelChannelWebhookProvisioning(provisioning.lease_id)) return 'recovered';
+  completeChannelWebhookProvisioningReconciliation(provisioning.lease_id, reconciliationTargets);
+  return 'recovered';
+}
 
-  // A slow creator may have returned while reconciliation was in flight. Its
-  // credentials are now durable, so move them to the ordinary retry queue.
-  const current = getChannelWebhookProvisioning(channelJid);
-  if (current?.lease_id === provisioning.lease_id && current.state === 'created') {
-    queueChannelWebhookProvisioningCleanup(current.lease_id, provisioningConfig(current));
-    return 'queued';
-  }
-  throw new Error('Monitoring webhook setup changed during recovery; run the command again.');
+function logWebhookReconciliationFailure(
+  provisioning: ChannelWebhookProvisioning,
+  error: unknown,
+  reason: string,
+): void {
+  logger.warn(
+    {
+      jid: provisioning.channel_jid,
+      destinationChannelId: provisioning.destination_channel_id,
+      reason,
+      ...safeDiscordErrorMetadata(error),
+    },
+    'Could not inspect interrupted monitoring webhook; cleanup remains pending',
+  );
 }
 
 async function deleteWebhookObject(
@@ -650,30 +786,15 @@ export function isDefinitiveWebhookCreateRejection(error: unknown): boolean {
   return error.status >= 400 && error.status < 500 && error.status !== 408 && error.status !== 429;
 }
 
-function safeDiscordErrorMetadata(error: unknown): {
-  errorName: string;
-  discordCode?: number;
-  httpStatus?: number;
-} {
-  if (typeof error !== 'object' || error === null) return { errorName: typeof error };
-  const value = error as { code?: unknown; status?: unknown };
-  return {
-    errorName: error instanceof Error ? error.constructor.name.slice(0, 100) : 'unknown',
-    ...(typeof value.code === 'number' ? { discordCode: value.code } : {}),
-    ...(typeof value.status === 'number' ? { httpStatus: value.status } : {}),
-  };
-}
-
-function cleanupPendingError(error: unknown): Error {
-  const message = error instanceof Error ? error.message : 'Webhook setup failed.';
-  return new Error(
-    `${message} Webhook cleanup is pending; run /pi webhook-clear in this channel to retry.`,
+function cleanupPendingError(): WebhookCommandError {
+  return webhookCommandError(
+    'Webhook setup did not complete. Cleanup is pending; run /pi webhook-clear in this channel to retry.',
   );
 }
 
 function provisioningConfig(provisioning: ChannelWebhookProvisioning): ChannelWebhookConfig {
   if (!provisioning.webhook_id || !provisioning.webhook_token) {
-    throw new Error('Interrupted webhook setup has no stored credentials.');
+    throw webhookCommandError('Interrupted webhook setup has no stored credentials.');
   }
   return {
     channel_jid: provisioning.channel_jid,

@@ -159,6 +159,27 @@ describe('webhook activity delivery', () => {
     expect(monitor.webhookMonitorStats('dc:source').states).toBe(0);
   });
 
+  it('logs delivery failures without exposing library error messages or tokens', async () => {
+    const monitor = await import('../src/discord/webhook-monitor.js');
+    const { logger } = await import('../src/logger.js');
+    const warn = vi.spyOn(logger, 'warn');
+    getChannelWebhookMock.mockReturnValue(webhook);
+    sendMock.mockRejectedValueOnce(new Error('request failed with webhook-secret'));
+
+    monitor.enqueueWebhookTrace('dc:source', 'safe event');
+    await monitor.flushWebhookTrace('dc:source');
+
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        jid: 'dc:source',
+        destinationChannelId: 'monitor',
+        errorName: 'Error',
+      }),
+      'Failed to deliver Pi trace to monitoring webhook',
+    );
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('webhook-secret');
+  });
+
   it('does nothing when the source channel has no webhook mapping', async () => {
     const monitor = await import('../src/discord/webhook-monitor.js');
     getChannelWebhookMock.mockReturnValue(undefined);
