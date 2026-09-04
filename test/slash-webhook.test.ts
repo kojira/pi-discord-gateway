@@ -388,6 +388,226 @@ describe('webhook slash commands', () => {
     }
   });
 
+  it('completes cleanup when Discord reports that the webhook is already deleted', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'piscord-slash-webhook-gone-'));
+    tempDirs.push(tempDir);
+    process.env.DB_PATH = join(tempDir, 'gateway.db');
+    process.env.PIDG_CONFIG = resolve(tempDir, 'missing.env');
+
+    const db = await import('../src/db.js');
+    const { handleChatCommand } = await import('../src/discord/slash-commands.js');
+    const { RESTJSONErrorCodes } = await import('discord.js');
+    db.initDb();
+    db.registerChannel({
+      jid: 'dc:source',
+      name: 'source',
+      folder: 'ch_source',
+      requiresTrigger: false,
+      isMain: false,
+      modelOverride: '',
+      thinkingOverride: '',
+      cwdOverride: '',
+    });
+    db.setChannelWebhook({
+      channel_jid: 'dc:source',
+      destination_channel_id: 'monitor',
+      destination_channel_name: 'monitoring',
+      webhook_id: 'already-deleted',
+      webhook_token: 'old-token',
+    });
+    webhookDeleteMock.mockRejectedValueOnce({
+      code: RESTJSONErrorCodes.UnknownWebhook,
+      message: 'Unknown Webhook',
+    });
+    const editReply = vi.fn().mockResolvedValue(undefined);
+
+    try {
+      await handleChatCommand({
+        commandName: 'pi',
+        channelId: 'source',
+        guildId: 'guild-1',
+        memberPermissions: { has: () => true },
+        inGuild: () => true,
+        options: { getSubcommand: () => 'webhook-clear' },
+        deferReply: vi.fn().mockResolvedValue(undefined),
+        editReply,
+        reply: vi.fn().mockResolvedValue(undefined),
+        followUp: vi.fn().mockResolvedValue(undefined),
+        replied: false,
+        deferred: true,
+      } as any);
+
+      expect(db.getPendingWebhookCleanup('dc:source')).toEqual([]);
+      expect(editReply).toHaveBeenCalledWith({
+        content: 'Pi activity monitoring is disabled and the Discord webhook was deleted.',
+      });
+      expect(db.unregisterChannel('dc:source')).toBe(true);
+    } finally {
+      db.closeDb();
+    }
+  });
+
+  it('lets an unregistered source retry cleanup left by a late webhook creator', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    const tempDir = mkdtempSync(join(tmpdir(), 'piscord-slash-webhook-late-create-'));
+    tempDirs.push(tempDir);
+    process.env.DB_PATH = join(tempDir, 'gateway.db');
+    process.env.PIDG_CONFIG = resolve(tempDir, 'missing.env');
+
+    const firstDb = await import('../src/db.js');
+    const firstCommands = await import('../src/discord/slash-commands.js');
+    const { ChannelType, RESTJSONErrorCodes } = await import('discord.js');
+    firstDb.initDb();
+    firstDb.registerChannel({
+      jid: 'dc:source',
+      name: 'source',
+      folder: 'ch_source',
+      requiresTrigger: false,
+      isMain: false,
+      modelOverride: '',
+      thinkingOverride: '',
+      cwdOverride: '',
+    });
+
+    let resolveCreate!: (webhook: any) => void;
+    const createWebhook = vi.fn(
+      () =>
+        new Promise<any>((resolve) => {
+          resolveCreate = resolve;
+        }),
+    );
+    const destination = {
+      id: 'monitor',
+      name: 'monitoring',
+      guildId: 'guild-1',
+      type: ChannelType.GuildText,
+      createWebhook,
+      permissionsFor: vi.fn().mockReturnValue({ has: () => true }),
+    };
+    const setEditReply = vi.fn().mockResolvedValue(undefined);
+    const setPromise = firstCommands.handleChatCommand({
+      commandName: 'pi',
+      channelId: 'source',
+      guildId: 'guild-1',
+      guild: { members: { me: { id: 'bot' } } },
+      user: { id: 'admin' },
+      memberPermissions: { has: () => true },
+      inGuild: () => true,
+      options: { getSubcommand: () => 'webhook', getChannel: () => destination },
+      deferReply: vi.fn().mockResolvedValue(undefined),
+      editReply: setEditReply,
+      reply: vi.fn().mockResolvedValue(undefined),
+      followUp: vi.fn().mockResolvedValue(undefined),
+      replied: false,
+      deferred: true,
+    } as any);
+    for (let index = 0; index < 5 && createWebhook.mock.calls.length === 0; index += 1) {
+      await Promise.resolve();
+    }
+    expect(createWebhook).toHaveBeenCalledOnce();
+
+    // A second gateway process has an independent in-memory mutex while
+    // sharing the durable SQLite lease.
+    vi.setSystemTime(
+      new Date('2026-01-01T00:00:00Z').getTime() + firstDb.WEBHOOK_PROVISIONING_LEASE_MS + 1,
+    );
+    vi.resetModules();
+    const secondDb = await import('../src/db.js');
+    const secondCommands = await import('../src/discord/slash-commands.js');
+    secondDb.initDb();
+    const reconciliationReply = vi.fn().mockResolvedValue(undefined);
+    const clearBase = {
+      commandName: 'pi',
+      channelId: 'source',
+      guildId: 'guild-1',
+      guild: { members: { me: { id: 'bot' } } },
+      user: { id: 'admin', username: 'admin' },
+      memberPermissions: { has: () => true },
+      inGuild: () => true,
+      options: { getSubcommand: () => 'webhook-clear' },
+      client: {
+        channels: {
+          fetch: vi.fn().mockResolvedValue({
+            fetchWebhooks: vi.fn().mockResolvedValue(new Map()),
+          }),
+        },
+      },
+      deferReply: vi.fn().mockResolvedValue(undefined),
+      editReply: reconciliationReply,
+      reply: vi.fn().mockResolvedValue(undefined),
+      followUp: vi.fn().mockResolvedValue(undefined),
+      replied: false,
+      deferred: true,
+    };
+
+    try {
+      await secondCommands.handleChatCommand(clearBase as any);
+      expect(secondDb.getChannelWebhookProvisioning('dc:source')).toBeUndefined();
+      expect(secondDb.unregisterChannel('dc:source')).toBe(true);
+
+      const rollbackDelete = vi.fn().mockRejectedValue(new Error('Discord unavailable'));
+      resolveCreate({
+        id: 'late-webhook',
+        token: 'late-token',
+        send: vi.fn(),
+        delete: rollbackDelete,
+      });
+      await setPromise;
+      expect(rollbackDelete).toHaveBeenCalledWith('Rolling back failed Pi monitoring setup');
+      expect(secondDb.getChannel('dc:source')).toBeUndefined();
+      expect(secondDb.getPendingWebhookCleanup('dc:source')).toEqual([
+        {
+          channel_jid: 'dc:source',
+          destination_channel_id: 'monitor',
+          destination_channel_name: 'monitoring',
+          webhook_id: 'late-webhook',
+          webhook_token: 'late-token',
+        },
+      ]);
+
+      const blockedReply = vi.fn().mockResolvedValue(undefined);
+      await secondCommands.handleChatCommand({
+        ...clearBase,
+        options: { getSubcommand: () => 'status' },
+        reply: blockedReply,
+        deferred: false,
+      } as any);
+      await secondCommands.handleChatCommand({
+        ...clearBase,
+        options: { getSubcommand: () => 'webhook', getChannel: () => destination },
+        reply: blockedReply,
+        deferred: false,
+      } as any);
+      expect(blockedReply).toHaveBeenCalledTimes(2);
+      expect(blockedReply).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({ content: expect.stringContaining('not registered') }),
+      );
+      expect(blockedReply).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({ content: expect.stringContaining('not registered') }),
+      );
+      expect(createWebhook).toHaveBeenCalledOnce();
+
+      webhookDeleteMock.mockRejectedValueOnce({
+        code: RESTJSONErrorCodes.UnknownWebhook,
+        message: 'Unknown Webhook',
+      });
+      const retryReply = vi.fn().mockResolvedValue(undefined);
+      await secondCommands.handleChatCommand({ ...clearBase, editReply: retryReply } as any);
+      expect(secondDb.getPendingWebhookCleanup('dc:source')).toEqual([]);
+      expect(secondDb.getChannel('dc:source')).toBeUndefined();
+      expect(retryReply).toHaveBeenCalledWith({
+        content: 'Pi activity monitoring is disabled and the Discord webhook was deleted.',
+      });
+    } finally {
+      secondDb.closeDb();
+      firstDb.closeDb();
+      vi.useRealTimers();
+    }
+  });
+
   it('requires Manage Webhooks permission before creating anything', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'piscord-slash-webhook-permission-'));
     tempDirs.push(tempDir);

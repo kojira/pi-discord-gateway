@@ -25,9 +25,10 @@ vi.mock('../src/db.js', () => ({
   getChannelWebhook: getChannelWebhookMock,
 }));
 
-vi.mock('discord.js', () => ({
-  WebhookClient: WebhookClientMock,
-}));
+vi.mock('discord.js', async () => {
+  const actual = await vi.importActual<typeof import('discord.js')>('discord.js');
+  return { ...actual, WebhookClient: WebhookClientMock };
+});
 
 const webhook = {
   channel_jid: 'dc:source',
@@ -174,6 +175,20 @@ describe('webhook activity delivery', () => {
 
     expect(deleteMock).toHaveBeenCalledWith('disabled');
     expect(destroyMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats only Discord Unknown Webhook as idempotent delete success', async () => {
+    const { RESTJSONErrorCodes } = await import('discord.js');
+    const monitor = await import('../src/discord/webhook-monitor.js');
+
+    deleteMock.mockRejectedValueOnce({
+      code: RESTJSONErrorCodes.UnknownWebhook,
+      message: 'Unknown Webhook',
+    });
+    await expect(monitor.deleteDiscordWebhook(webhook, 'already gone')).resolves.toBe(true);
+
+    deleteMock.mockRejectedValueOnce({ code: 50_013, message: 'Missing Permissions' });
+    await expect(monitor.deleteDiscordWebhook(webhook, 'not authorized')).resolves.toBe(false);
   });
 
   it('bounds shutdown, destroys clients, and rejects later trace events', async () => {

@@ -1,4 +1,4 @@
-import { WebhookClient } from 'discord.js';
+import { RESTJSONErrorCodes, WebhookClient } from 'discord.js';
 import { config } from '../config.js';
 import { getChannelWebhook, type ChannelWebhookConfig } from '../db.js';
 import { logger } from '../logger.js';
@@ -158,6 +158,7 @@ export async function deleteDiscordWebhook(
     await client.delete(reason);
     return true;
   } catch (err: any) {
+    if (isDiscordUnknownWebhookError(err)) return true;
     logger.warn(
       {
         jid: webhook.channel_jid,
@@ -170,6 +171,16 @@ export async function deleteDiscordWebhook(
   } finally {
     client.destroy();
   }
+}
+
+/** Discord reports an already-deleted webhook with this specific REST error. */
+export function isDiscordUnknownWebhookError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    error.code === RESTJSONErrorCodes.UnknownWebhook
+  );
 }
 
 async function drainState(state: WebhookDeliveryState): Promise<void> {
