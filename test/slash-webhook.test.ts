@@ -502,7 +502,7 @@ describe('webhook slash commands', () => {
       webhook_name: 'monitor webhook',
     });
     db.markChannelWebhookCreateRequestIssued(lease.lease_id);
-    db.cancelChannelWebhookProvisioning(lease.lease_id);
+    db.completeDefinitiveChannelWebhookCreateRejection(lease.lease_id);
     db.unregisterChannel('dc:source');
     db.recordChannelWebhookCreated(lease.lease_id, {
       channel_jid: 'dc:source',
@@ -1287,17 +1287,17 @@ describe('webhook slash commands', () => {
     }
   });
 
-  it('releases the provisioning lease only for a definitive Discord client rejection', async () => {
+  it('releases a force-reconciled empty lease after a cross-process definitive rejection', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'piscord-slash-webhook-definitive-create-'));
     tempDirs.push(tempDir);
     process.env.DB_PATH = join(tempDir, 'gateway.db');
     process.env.PIDG_CONFIG = resolve(tempDir, 'missing.env');
 
-    const db = await import('../src/db.js');
-    const { handleChatCommand } = await import('../src/discord/slash-commands.js');
+    const creatorDb = await import('../src/db.js');
+    const creatorCommands = await import('../src/discord/slash-commands.js');
     const { ChannelType, DiscordAPIError, RESTJSONErrorCodes } = await import('discord.js');
-    db.initDb();
-    db.registerChannel({
+    creatorDb.initDb();
+    creatorDb.registerChannel({
       jid: 'dc:source',
       name: 'source',
       folder: 'ch_source',
@@ -1315,44 +1315,108 @@ describe('webhook slash commands', () => {
       'https://discord.invalid/api/channels/monitor/webhooks',
       { files: [], body: {} },
     );
-    const createWebhook = vi.fn().mockRejectedValue(rejection);
-    const editReply = vi.fn().mockResolvedValue(undefined);
+    let rejectCreate!: (error: Error) => void;
+    const createWebhook = vi.fn(
+      () =>
+        new Promise<never>((_resolve, reject) => {
+          rejectCreate = reject;
+        }),
+    );
+    const setEditReply = vi.fn().mockResolvedValue(undefined);
+    const setPromise = creatorCommands.handleChatCommand({
+      commandName: 'pi',
+      channelId: 'source',
+      guildId: 'guild-1',
+      guild: { members: { me: { id: 'bot' } } },
+      user: { id: 'admin' },
+      memberPermissions: { has: () => true },
+      inGuild: () => true,
+      options: {
+        getSubcommand: () => 'webhook',
+        getChannel: () => ({
+          id: 'monitor',
+          name: 'monitoring',
+          guildId: 'guild-1',
+          type: ChannelType.GuildText,
+          createWebhook,
+          permissionsFor: vi.fn().mockReturnValue({ has: () => true }),
+        }),
+      },
+      deferReply: vi.fn().mockResolvedValue(undefined),
+      editReply: setEditReply,
+      reply: vi.fn().mockResolvedValue(undefined),
+      followUp: vi.fn().mockResolvedValue(undefined),
+      replied: false,
+      deferred: true,
+    } as any);
+    for (let index = 0; index < 5 && createWebhook.mock.calls.length === 0; index += 1) {
+      await Promise.resolve();
+    }
+    expect(createWebhook).toHaveBeenCalledOnce();
 
+    vi.resetModules();
+    const reconcilerDb = await import('../src/db.js');
+    const reconcilerCommands = await import('../src/discord/slash-commands.js');
+    reconcilerDb.initDb();
+    const clearEditReply = vi.fn().mockResolvedValue(undefined);
     try {
-      await handleChatCommand({
+      await reconcilerCommands.handleChatCommand({
         commandName: 'pi',
         channelId: 'source',
         guildId: 'guild-1',
-        guild: { members: { me: { id: 'bot' } } },
-        user: { id: 'admin' },
         memberPermissions: { has: () => true },
         inGuild: () => true,
-        options: {
-          getSubcommand: () => 'webhook',
-          getChannel: () => ({
-            id: 'monitor',
-            name: 'monitoring',
-            guildId: 'guild-1',
-            type: ChannelType.GuildText,
-            createWebhook,
-            permissionsFor: vi.fn().mockReturnValue({ has: () => true }),
-          }),
+        options: { getSubcommand: () => 'webhook-clear' },
+        client: {
+          channels: {
+            fetch: vi.fn().mockResolvedValue({
+              fetchWebhooks: vi.fn().mockResolvedValue(new Map()),
+            }),
+          },
         },
         deferReply: vi.fn().mockResolvedValue(undefined),
-        editReply,
+        editReply: clearEditReply,
         reply: vi.fn().mockResolvedValue(undefined),
         followUp: vi.fn().mockResolvedValue(undefined),
         replied: false,
         deferred: true,
       } as any);
+      expect(reconcilerDb.getChannelWebhookProvisioning('dc:source')).toMatchObject({
+        reconciling: 1,
+        reconciliation_webhook_ids: '[]',
+      });
+      expect(clearEditReply).toHaveBeenCalledWith({
+        content: expect.stringContaining('cleanup status remains uncertain'),
+      });
 
-      expect(db.getChannelWebhookProvisioning('dc:source')).toBeUndefined();
-      expect(editReply).toHaveBeenLastCalledWith({
+      rejectCreate(rejection);
+      await setPromise;
+      expect(reconcilerDb.getChannelWebhookProvisioning('dc:source')).toBeUndefined();
+      expect(setEditReply).toHaveBeenLastCalledWith({
         content: expect.not.stringContaining('cleanup is pending'),
       });
-      expect(db.unregisterChannel('dc:source')).toBe(true);
+      expect(reconcilerDb.unregisterChannel('dc:source')).toBe(true);
+      reconcilerDb.registerChannel({
+        jid: 'dc:source',
+        name: 'source',
+        folder: 'ch_source_2',
+        requiresTrigger: false,
+        isMain: false,
+        modelOverride: '',
+        thinkingOverride: '',
+        cwdOverride: '',
+      });
+      expect(
+        reconcilerDb.beginChannelWebhookProvisioning({
+          channel_jid: 'dc:source',
+          destination_channel_id: 'monitor',
+          destination_channel_name: 'monitoring',
+          webhook_name: 'new monitor webhook',
+        }),
+      ).toBeDefined();
     } finally {
-      db.closeDb();
+      reconcilerDb.closeDb();
+      creatorDb.closeDb();
     }
   });
 

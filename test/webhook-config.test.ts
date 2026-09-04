@@ -258,7 +258,16 @@ describe('per-channel webhook configuration', () => {
       };
       const lateLease = db.beginChannelWebhookProvisioning(input);
       expect(db.markChannelWebhookCreateRequestIssued(lateLease.lease_id)).toBe(true);
-      expect(db.cancelChannelWebhookProvisioning(lateLease.lease_id)).toBe(true);
+      expect(db.cancelChannelWebhookProvisioning(lateLease.lease_id)).toBe(false);
+      expect(
+        db.claimChannelWebhookProvisioningReconciliation(lateLease.lease_id, Date.now(), true),
+      ).toMatchObject({ reconciling: 1 });
+      expect(db.recordChannelWebhookReconciliationTargets(lateLease.lease_id, ['late-id'])).toEqual(
+        ['late-id'],
+      );
+      expect(
+        db.completeChannelWebhookProvisioningReconciliation(lateLease.lease_id, ['late-id']),
+      ).toBe(true);
       expect(db.unregisterChannel('dc:source')).toBe(true);
       const lateWebhook = {
         channel_jid: 'dc:source',
@@ -340,6 +349,69 @@ describe('per-channel webhook configuration', () => {
       expect(db.unregisterChannel('dc:source')).toBe(true);
     } finally {
       db.closeDb();
+    }
+  });
+
+  it('serializes definitive rejection against cross-process target recording', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'piscord-webhook-definitive-race-'));
+    tempDirs.push(tempDir);
+    process.env.DB_PATH = join(tempDir, 'gateway.db');
+    process.env.PIDG_CONFIG = resolve(tempDir, 'missing.env');
+    process.env.SESSIONS_DIR = resolve(tempDir, 'sessions');
+
+    const creatorDb = await import('../src/db.js');
+    creatorDb.initDb();
+    creatorDb.registerChannel({
+      jid: 'dc:source',
+      name: 'source',
+      folder: 'source',
+      requiresTrigger: false,
+      isMain: false,
+      modelOverride: '',
+      thinkingOverride: '',
+      cwdOverride: '',
+    });
+    const input = {
+      channel_jid: 'dc:source',
+      destination_channel_id: 'monitor',
+      destination_channel_name: 'monitoring',
+      webhook_name: 'monitor webhook',
+    };
+
+    vi.resetModules();
+    const reconcilerDb = await import('../src/db.js');
+    reconcilerDb.initDb();
+    try {
+      const rejectionWins = creatorDb.beginChannelWebhookProvisioning(input);
+      expect(creatorDb.markChannelWebhookCreateRequestIssued(rejectionWins.lease_id)).toBe(true);
+      expect(reconcilerDb.beginChannelWebhookClear('dc:source').provisioning).toMatchObject({
+        lease_id: rejectionWins.lease_id,
+        reconciling: 1,
+      });
+      expect(
+        creatorDb.completeDefinitiveChannelWebhookCreateRejection(rejectionWins.lease_id),
+      ).toBe(true);
+      expect(reconcilerDb.getChannelWebhookProvisioning('dc:source')).toBeUndefined();
+
+      const targetWins = creatorDb.beginChannelWebhookProvisioning(input);
+      expect(creatorDb.markChannelWebhookCreateRequestIssued(targetWins.lease_id)).toBe(true);
+      reconcilerDb.beginChannelWebhookClear('dc:source');
+      expect(
+        reconcilerDb.recordChannelWebhookReconciliationTargets(targetWins.lease_id, [
+          'observed-webhook',
+        ]),
+      ).toEqual(['observed-webhook']);
+      expect(creatorDb.completeDefinitiveChannelWebhookCreateRejection(targetWins.lease_id)).toBe(
+        false,
+      );
+      expect(reconcilerDb.getChannelWebhookProvisioning('dc:source')).toMatchObject({
+        lease_id: targetWins.lease_id,
+        reconciling: 1,
+        reconciliation_webhook_ids: '["observed-webhook"]',
+      });
+    } finally {
+      reconcilerDb.closeDb();
+      creatorDb.closeDb();
     }
   });
 

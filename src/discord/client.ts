@@ -39,6 +39,7 @@ import {
 } from './attachments.js';
 import { handleAutocomplete, handleChatCommand, registerGlobalCommands } from './slash-commands.js';
 import { writeSupervisorReply, type SupervisorRequest } from '../agent/supervisor-channel.js';
+import { safeDiscordErrorMetadata } from './webhook-monitor.js';
 
 let client: Client | null = null;
 let triggerPattern: RegExp;
@@ -92,7 +93,7 @@ export async function startDiscord(): Promise<void> {
   });
 }
 
-async function handleInteraction(interaction: Interaction): Promise<void> {
+export async function handleInteraction(interaction: Interaction): Promise<void> {
   try {
     if (interaction.isButton() && interaction.customId.startsWith(SUPERVISOR_BUTTON_PREFIX)) {
       await handleSupervisorButton(interaction);
@@ -112,8 +113,11 @@ async function handleInteraction(interaction: Interaction): Promise<void> {
     if (interaction.isChatInputCommand()) {
       await handleChatCommand(interaction);
     }
-  } catch (err: any) {
-    logger.error({ err: err.message, id: interaction.id }, 'Interaction handler failed');
+  } catch (error) {
+    logger.error(
+      { id: interaction.id, ...safeDiscordErrorMetadata(error) },
+      'Interaction handler failed',
+    );
   }
 }
 

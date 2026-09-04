@@ -493,13 +493,31 @@ export function completeChannelWebhookProvisioningRollback(
   })();
 }
 
-/** Cancel a creating lease only after definitive rejection or positive remote deletion. */
+/** Cancel a pre-request lease only when no Discord create side effect can exist. */
 export function cancelChannelWebhookProvisioning(leaseId: string): boolean {
   return (
     db
       .prepare(
         `delete from channel_webhook_provisioning
-         where lease_id = ? and state = 'creating' and reconciling = 0`,
+         where lease_id = ? and state = 'creating' and request_issued = 0 and reconciling = 0`,
+      )
+      .run(leaseId).changes > 0
+  );
+}
+
+/**
+ * Complete a definitive Discord create rejection for this exact lease.
+ * A clear may already have marked the lease reconciling; that is still safe to
+ * remove only while no remote webhook ID has been durably observed. SQLite
+ * serializes this delete with reconciliation target recording.
+ */
+export function completeDefinitiveChannelWebhookCreateRejection(leaseId: string): boolean {
+  return (
+    db
+      .prepare(
+        `delete from channel_webhook_provisioning
+         where lease_id = ? and state = 'creating' and request_issued = 1
+           and reconciliation_webhook_ids = '[]'`,
       )
       .run(leaseId).changes > 0
   );

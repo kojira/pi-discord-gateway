@@ -25,6 +25,7 @@ import {
   claimChannelWebhookProvisioningReconciliation,
   clearChannelModelOverride,
   clearPendingMessages,
+  completeDefinitiveChannelWebhookCreateRejection,
   completeChannelWebhookProvisioningReconciliation,
   completeChannelWebhookProvisioningRollback,
   completeWebhookCleanup,
@@ -322,9 +323,9 @@ async function executeChatCommand(
     } else {
       logger.error(
         {
-          err: error instanceof Error ? error.message : String(error),
           command: interaction.commandName,
           subcommand,
+          ...safeDiscordErrorMetadata(error),
         },
         'Slash command failed',
       );
@@ -333,9 +334,7 @@ async function executeChatCommand(
       ? error instanceof WebhookCommandError
         ? error.message
         : 'Webhook command failed safely. Run /pi webhook-clear to inspect or retry cleanup.'
-      : error instanceof Error
-        ? error.message
-        : String(error);
+      : 'Command failed. Check the gateway logs and try again.';
     const payload = reply(`⚠️ ${publicMessage}`, interaction);
     if (interaction.replied) {
       await interaction.followUp(payload);
@@ -521,22 +520,22 @@ async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promi
     } catch (error) {
       if (!canMutateWebhookDb()) return undefined;
       const definitive = isDefinitiveWebhookCreateRejection(error);
-      if (definitive) {
-        // A concrete Discord 4xx response (other than timeout/rate limiting)
-        // proves that this POST did not create a remote webhook.
-        cancelChannelWebhookProvisioning(provisioning.lease_id);
-      }
+      // A concrete Discord 4xx response (other than timeout/rate limiting)
+      // proves this POST did not create a remote webhook. An independently
+      // observed reconciliation target still wins and keeps cleanup pending.
+      const leaseReleased =
+        definitive && completeDefinitiveChannelWebhookCreateRejection(provisioning.lease_id);
       logger.warn(
         {
           jid: channel.jid,
           destinationChannelId: destination.id,
           ...safeDiscordErrorMetadata(error),
         },
-        definitive
+        leaseReleased
           ? 'Discord rejected monitoring webhook creation'
-          : 'Webhook creation outcome is uncertain; cleanup remains pending',
+          : 'Webhook creation outcome or reconciliation is unresolved; cleanup remains pending',
       );
-      throw definitive
+      throw leaseReleased
         ? webhookCommandError(
             'Discord rejected webhook creation. Check destination permissions and try again.',
           )
