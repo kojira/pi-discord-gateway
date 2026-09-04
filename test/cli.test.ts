@@ -100,6 +100,35 @@ describe('send command', () => {
 });
 
 describe('register command cwd support', () => {
+  it('refuses to unregister a channel until its managed webhook is cleared', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'pidg-cli-webhook-'));
+    tempDirs.push(tempDir);
+    process.env.DB_PATH = resolve(tempDir, 'gateway.db');
+    process.env.SESSIONS_DIR = resolve(tempDir, 'sessions');
+
+    const { main } = await import('../src/cli/index.js');
+    await main(['register', '123', 'source']);
+    const db = await import('../src/db.js');
+    db.initDb();
+    db.setChannelWebhook({
+      channel_jid: 'dc:123',
+      destination_channel_id: 'monitor',
+      destination_channel_name: 'monitoring',
+      webhook_id: 'webhook',
+      webhook_token: 'secret',
+    });
+    db.closeDb();
+
+    await expect(main(['unregister', '123'])).rejects.toThrow(/webhook-clear/);
+    db.initDb();
+    try {
+      expect(db.getChannel('dc:123')).toBeDefined();
+      expect(db.getChannelWebhook('dc:123')).toBeDefined();
+    } finally {
+      db.closeDb();
+    }
+  });
+
   it('stores a per-channel cwd override and shows it in channel listings', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'pidg-cli-'));
     tempDirs.push(tempDir);

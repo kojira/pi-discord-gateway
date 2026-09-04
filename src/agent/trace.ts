@@ -1,25 +1,20 @@
 const MAX_TEXT = 1200;
-const MAX_ARGUMENTS = 400;
+const MAX_LABEL = 120;
 
 /** Convert selected Pi RPC events into concise, bounded monitoring lines. */
 export function formatAgentTraceEvent(event: any): string | undefined {
   switch (event?.type) {
     case 'agent_start':
       return '▶️ agent started';
-    case 'agent_settled':
-      return '⏹️ agent settled';
     case 'message_start':
       if (event.message?.role !== 'user') return undefined;
-      return `👤 user: ${truncate(formatContent(event.message.content), MAX_TEXT)}`;
+      return `👤 user: ${sanitizeText(formatContent(event.message.content), MAX_TEXT)}`;
     case 'message_end':
       return formatCompletedMessage(event.message);
     case 'tool_execution_start':
-      return `🛠️ tool ${safeLabel(event.toolName)}${formatArguments(event.args)}`;
-    case 'tool_execution_end': {
-      const status = event.isError ? 'error' : 'ok';
-      const result = truncate(formatContent(event.result?.content), MAX_TEXT);
-      return `🔧 tool-end ${safeLabel(event.toolName)} ${status}${result ? `: ${result}` : ''}`;
-    }
+      return `🛠️ tool ${safeLabel(event.toolName)}`;
+    case 'tool_execution_end':
+      return `🔧 tool-end ${safeLabel(event.toolName)} ${event.isError ? 'error' : 'ok'}`;
     case 'compaction_start':
       return `🗜️ compaction started${event.reason ? ` (${safeLabel(event.reason)})` : ''}`;
     case 'compaction_end':
@@ -29,7 +24,7 @@ export function formatAgentTraceEvent(event: any): string | undefined {
     case 'auto_retry_end':
       return `🔄 retry ${numberLabel(event.attempt)} ${event.success ? 'succeeded' : 'failed'}`;
     case 'extension_error':
-      return `⚠️ extension error${event.event ? ` (${safeLabel(event.event)})` : ''}: ${truncate(
+      return `⚠️ extension error${event.event ? ` (${safeLabel(event.event)})` : ''}: ${sanitizeText(
         String(event.error || event.errorMessage || 'unknown error'),
         MAX_TEXT,
       )}`;
@@ -40,18 +35,18 @@ export function formatAgentTraceEvent(event: any): string | undefined {
 
 function formatCompletedMessage(message: any): string | undefined {
   if (message?.role !== 'assistant') return undefined;
-  const content = truncate(formatContent(message.content), MAX_TEXT);
+  const content = sanitizeText(formatContent(message.content), MAX_TEXT);
   const model =
     typeof message.model === 'string'
-      ? message.model
+      ? safeLabel(message.model)
       : typeof message.responseModel === 'string'
-        ? message.responseModel
+        ? safeLabel(message.responseModel)
         : '';
-  const provider = typeof message.provider === 'string' ? message.provider : '';
+  const provider = typeof message.provider === 'string' ? safeLabel(message.provider) : '';
   const identity = model ? ` [${provider ? `${provider}/` : ''}${model}]` : '';
   const error =
     message.stopReason === 'error' || typeof message.errorMessage === 'string'
-      ? ` ⚠️ ${truncate(String(message.errorMessage || 'assistant error'), 300)}`
+      ? ` ⚠️ ${sanitizeText(String(message.errorMessage || 'assistant error'), 300)}`
       : '';
   if (!content && !error) return undefined;
   return `🤖 assistant${identity}: ${content || '(no text)'}${error}`;
@@ -67,9 +62,6 @@ function formatContent(content: unknown): string {
       if (block?.type === 'thinking' && typeof block.thinking === 'string') {
         return `💭 ${block.thinking}`;
       }
-      if (block?.type === 'toolCall') {
-        return `🛠️ ${safeLabel(block.name)}${formatArguments(block.arguments)}`;
-      }
       return '';
     })
     .filter(Boolean)
@@ -77,22 +69,28 @@ function formatContent(content: unknown): string {
     .trim();
 }
 
-function formatArguments(args: unknown): string {
-  if (args === undefined || args === null) return '';
-  try {
-    return ` ${truncate(JSON.stringify(args), MAX_ARGUMENTS)}`;
-  } catch {
-    return ' [unserializable arguments]';
-  }
-}
-
-function truncate(text: string, max: number): string {
-  if (text.length <= max) return text;
-  return `${text.slice(0, Math.max(0, max - 12))}…[truncated]`;
+function sanitizeText(text: string, max: number): string {
+  const redacted = text
+    .replace(
+      /(https?:\/\/(?:canary\.|ptb\.)?discord(?:app)?\.com\/api\/webhooks\/\d+)\/[\w.-]+/giu,
+      '$1/[REDACTED]',
+    )
+    .replace(
+      /(\bauthorization\s*[:=]\s*)(?:bearer\s+)?(?:"[^"]*"|'[^']*'|[^\s,;]+)/giu,
+      '$1[REDACTED]',
+    )
+    .replace(
+      /(\b[\w.-]*(?:api[_-]?key|token|secret|password)[\w.-]*\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/giu,
+      '$1[REDACTED]',
+    )
+    .replace(/\b(?:ghp_[\w]+|github_pat_[\w]+|sk-[\w-]{16,}|xox[baprs]-[\w-]+)\b/giu, '[REDACTED]');
+  if (redacted.length <= max) return redacted;
+  return `${redacted.slice(0, Math.max(0, max - 12))}…[truncated]`;
 }
 
 function safeLabel(value: unknown): string {
-  return typeof value === 'string' && value ? value.replace(/[\r\n]/gu, ' ') : 'unknown';
+  if (typeof value !== 'string' || !value) return 'unknown';
+  return sanitizeText(value.replace(/[\r\n]/gu, ' '), MAX_LABEL);
 }
 
 function numberLabel(value: unknown): string {

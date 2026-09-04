@@ -29,13 +29,6 @@ vi.mock('discord.js', () => ({
   WebhookClient: WebhookClientMock,
 }));
 
-import {
-  deleteDiscordWebhook,
-  enqueueWebhookTrace,
-  flushWebhookTrace,
-  stopWebhookMonitor,
-} from '../src/discord/webhook-monitor.js';
-
 const webhook = {
   channel_jid: 'dc:source',
   destination_channel_id: 'monitor',
@@ -44,18 +37,20 @@ const webhook = {
   webhook_token: 'webhook-secret',
 };
 
-afterEach(async () => {
-  await stopWebhookMonitor();
+afterEach(() => {
   vi.clearAllMocks();
+  vi.resetModules();
+  sendMock.mockResolvedValue(undefined);
 });
 
 describe('webhook activity delivery', () => {
   it('batches per-channel traces, suppresses mentions, and never includes the token in content', async () => {
+    const monitor = await import('../src/discord/webhook-monitor.js');
     getChannelWebhookMock.mockReturnValue(webhook);
 
-    enqueueWebhookTrace('dc:source', '👤 user: hello @everyone');
-    enqueueWebhookTrace('dc:source', '🛠️ tool read {"path":"/tmp/a"}');
-    await flushWebhookTrace('dc:source');
+    monitor.enqueueWebhookTrace('dc:source', '👤 user: hello @everyone');
+    monitor.enqueueWebhookTrace('dc:source', '🛠️ tool read');
+    await monitor.flushWebhookTrace('dc:source');
 
     expect(WebhookClientMock).toHaveBeenCalledWith({
       id: 'webhook-id',
@@ -68,22 +63,135 @@ describe('webhook activity delivery', () => {
     });
     expect(sendMock.mock.calls[0][0].content).toContain('🛠️ tool read');
     expect(sendMock.mock.calls[0][0].content).not.toContain('webhook-secret');
-    expect(destroyMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps one bounded queue and reports dropped activity while delivery is blocked', async () => {
+    const monitor = await import('../src/discord/webhook-monitor.js');
+    getChannelWebhookMock.mockReturnValue(webhook);
+    let releaseSend!: () => void;
+    sendMock.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseSend = resolve;
+        }),
+    );
+
+    for (let index = 0; index < 5; index += 1) {
+      monitor.enqueueWebhookTrace('dc:source', `initial-${index}`);
+    }
+    await vi.waitFor(() => expect(sendMock).toHaveBeenCalledTimes(1));
+    for (let index = 0; index < 1000; index += 1) {
+      monitor.enqueueWebhookTrace('dc:source', `queued-${index}-${'x'.repeat(1000)}`);
+    }
+
+    const stats = monitor.webhookMonitorStats('dc:source');
+    expect(stats.states).toBe(1);
+    expect(stats.queuedLines).toBeLessThanOrEqual(100);
+    expect(stats.queuedChars).toBeLessThanOrEqual(64 * 1024);
+    expect(stats.droppedEvents).toBeGreaterThan(0);
+
+    releaseSend();
+    await monitor.flushWebhookTrace('dc:source');
+    expect(
+      sendMock.mock.calls.some(([payload]) =>
+        payload.content.includes(`dropped ${stats.droppedEvents}`),
+      ),
+    ).toBe(true);
+    expect(WebhookClientMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('serializes concurrent set/set and set/clear lifecycle operations per source', async () => {
+    const monitor = await import('../src/discord/webhook-monitor.js');
+    const order: string[] = [];
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+
+    const firstSet = monitor.withWebhookConfigLock('dc:source', async () => {
+      order.push('set-1-start');
+      await firstGate;
+      order.push('set-1-end');
+    });
+    const secondSet = monitor.withWebhookConfigLock('dc:source', async () => {
+      order.push('set-2');
+    });
+    const clear = monitor.withWebhookConfigLock('dc:source', async () => {
+      order.push('clear');
+    });
+
+    await vi.waitFor(() => expect(order).toEqual(['set-1-start']));
+    releaseFirst();
+    await Promise.all([firstSet, secondSet, clear]);
+    expect(order).toEqual(['set-1-start', 'set-1-end', 'set-2', 'clear']);
+  });
+
+  it('does not enqueue old-epoch activity after clear removes the mapping', async () => {
+    const monitor = await import('../src/discord/webhook-monitor.js');
+    let mapping: typeof webhook | undefined = webhook;
+    getChannelWebhookMock.mockImplementation(() => mapping);
+    monitor.enqueueWebhookTrace('dc:source', 'before clear');
+
+    mapping = undefined;
+    monitor.enqueueWebhookTrace('dc:source', 'during clear');
+    await monitor.retireWebhookTrace('dc:source', webhook.webhook_id);
+
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    expect(sendMock.mock.calls[0][0].content).toContain('before clear');
+    expect(sendMock.mock.calls[0][0].content).not.toContain('during clear');
+    expect(monitor.webhookMonitorStats('dc:source').states).toBe(0);
+  });
+
+  it('bounds retirement of a blocked webhook epoch', async () => {
+    const monitor = await import('../src/discord/webhook-monitor.js');
+    getChannelWebhookMock.mockReturnValue(webhook);
+    sendMock.mockImplementation(() => new Promise<void>(() => undefined));
+    for (let index = 0; index < 5; index += 1) {
+      monitor.enqueueWebhookTrace('dc:source', `blocked-${index}`);
+    }
+    await vi.waitFor(() => expect(sendMock).toHaveBeenCalledTimes(1));
+
+    const started = Date.now();
+    await monitor.retireWebhookTrace('dc:source', webhook.webhook_id, 20);
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(destroyMock).toHaveBeenCalled();
+    expect(monitor.webhookMonitorStats('dc:source').states).toBe(0);
   });
 
   it('does nothing when the source channel has no webhook mapping', async () => {
+    const monitor = await import('../src/discord/webhook-monitor.js');
     getChannelWebhookMock.mockReturnValue(undefined);
 
-    enqueueWebhookTrace('dc:source', '▶️ agent started');
-    await flushWebhookTrace('dc:source');
+    monitor.enqueueWebhookTrace('dc:source', '▶️ agent started');
+    await monitor.flushWebhookTrace('dc:source');
 
     expect(WebhookClientMock).not.toHaveBeenCalled();
   });
 
-  it('deletes a managed webhook without logging or returning its credentials', async () => {
-    await expect(deleteDiscordWebhook(webhook, 'disabled')).resolves.toBe(true);
+  it('deletes a managed webhook without returning its credentials', async () => {
+    const monitor = await import('../src/discord/webhook-monitor.js');
+    await expect(monitor.deleteDiscordWebhook(webhook, 'disabled')).resolves.toBe(true);
 
     expect(deleteMock).toHaveBeenCalledWith('disabled');
     expect(destroyMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('bounds shutdown, destroys clients, and rejects later trace events', async () => {
+    const monitor = await import('../src/discord/webhook-monitor.js');
+    getChannelWebhookMock.mockReturnValue(webhook);
+    sendMock.mockImplementation(() => new Promise<void>(() => undefined));
+
+    for (let index = 0; index < 5; index += 1) {
+      monitor.enqueueWebhookTrace('dc:source', `blocked-${index}`);
+    }
+    await vi.waitFor(() => expect(sendMock).toHaveBeenCalledTimes(1));
+
+    const started = Date.now();
+    await monitor.stopWebhookMonitor(20);
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(destroyMock).toHaveBeenCalled();
+
+    monitor.enqueueWebhookTrace('dc:source', 'too late');
+    expect(monitor.webhookMonitorStats('dc:source').states).toBe(0);
   });
 });

@@ -105,7 +105,7 @@ setTimeout(finish, 2000);
     expect(traces).toEqual([
       '▶️ agent started',
       '👤 user: initial prompt',
-      '🤖 assistant: working update\n🛠️ bash {}',
+      '🤖 assistant: working update',
       '👤 user: [Discord user: Alice]\nchange course',
       '🤖 assistant: final answer',
       '⏹️ agent settled',
@@ -132,8 +132,13 @@ process.stdin.on('data', (chunk) => {
 });
 `);
 
-    const result = await invokeAgent('ch_old', 'hello', { cwd: root });
+    const traces: string[] = [];
+    const result = await invokeAgent('ch_old', 'hello', {
+      cwd: root,
+      onTraceEvent: (text) => traces.push(text),
+    });
     expect(result).toEqual({ ok: true, text: 'old Pi final' });
+    expect(traces).toContain('⏹️ agent settled');
   });
 
   it('keeps a legacy invocation alive across automatic retry events', async () => {
@@ -209,6 +214,98 @@ process.stdin.on('data', (chunk) => {
 
     const result = await invokeAgent('ch_error', 'hello', { cwd: root });
     expect(result).toEqual({ ok: false, text: '', error: 'provider failed' });
+  });
+
+  it('rejects an oversized newline-free RPC event without retaining unbounded output', async () => {
+    const root = makeFakePi(`
+let buffer = '';
+process.stdin.on('data', (chunk) => {
+  buffer += chunk.toString('utf8');
+  if (!buffer.includes('\\n')) return;
+  process.stdout.write('x'.repeat(4 * 1024 * 1024 + 1));
+  setInterval(() => {}, 1000);
+});
+`);
+
+    const result = await invokeAgent('ch_oversized', 'hello', { cwd: root });
+    expect(result).toEqual({
+      ok: false,
+      text: '',
+      error: 'Pi RPC event exceeded the 4 MiB safety limit',
+    });
+  });
+
+  it('rejects an unbounded backlog of pending assistant deliveries', async () => {
+    const root = makeFakePi(`
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+let buffer = '';
+process.stdin.on('data', (chunk) => {
+  buffer += chunk.toString('utf8');
+  if (!buffer.includes('\\n')) return;
+  const text = 'x'.repeat(1024 * 1024);
+  for (let index = 0; index < 6; index += 1) {
+    send({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text }] } });
+  }
+  setInterval(() => {}, 1000);
+});
+`);
+
+    const result = await invokeAgent('ch_delivery_limit', 'hello', {
+      cwd: root,
+      // Keep each delivery pending long enough for the RPC reader to observe
+      // the bounded backlog before normal parsing work drains it.
+      onAssistantMessage: () => new Promise((resolve) => setTimeout(resolve, 500)),
+    });
+    expect(result).toEqual({
+      ok: false,
+      text: '',
+      error: 'Pi RPC pending assistant delivery exceeded the 4 MiB safety limit',
+    });
+  });
+
+  it('retains only a bounded stderr prefix from a noisy RPC process', async () => {
+    const root = makeFakePi(`
+let buffer = '';
+process.stdin.on('data', (chunk) => {
+  buffer += chunk.toString('utf8');
+  if (!buffer.includes('\\n')) return;
+  process.stderr.write('diagnostic-start:' + 'x'.repeat(2 * 1024 * 1024));
+  process.exit(1);
+});
+`);
+
+    const result = await invokeAgent('ch_stderr', 'hello', { cwd: root });
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/^diagnostic-start:/);
+    expect(result.error!.length).toBeLessThanOrEqual(600);
+  });
+
+  it('force-kills a Pi child that ignores SIGTERM after shutdown abort', async () => {
+    const root = makeFakePi(`
+process.on('SIGTERM', () => {});
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+let buffer = '';
+process.stdin.on('data', (chunk) => {
+  buffer += chunk.toString('utf8');
+  if (!buffer.includes('\\n')) return;
+  const command = JSON.parse(buffer.slice(0, buffer.indexOf('\\n')));
+  send({ type: 'response', id: command.id, command: 'prompt', success: true });
+  send({ type: 'agent_start' });
+  setInterval(() => {}, 1000);
+});
+`);
+    const controller = new AbortController();
+    const invocation = invokeAgent('ch_kill', 'hello', { cwd: root, signal: controller.signal });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    controller.abort();
+
+    const result = await Promise.race([
+      invocation,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('SIGTERM-ignoring Pi did not settle')), 3000),
+      ),
+    ]);
+    expect(result.ok).toBe(false);
   });
 
   it('reports no active run for an unknown channel', async () => {

@@ -448,12 +448,12 @@ export async function sendResponse(jid: string, text: string): Promise<boolean> 
     const textChannel = channel as TextChannel | DMChannel;
 
     if (text.length <= DISCORD_MAX_LENGTH) {
-      await textChannel.send(text);
+      await textChannel.send(discordTextPayload(text));
     } else {
       // Split at line boundaries when possible
       const chunks = splitMessage(text, DISCORD_MAX_LENGTH);
       for (const chunk of chunks) {
-        await textChannel.send(chunk);
+        await textChannel.send(discordTextPayload(chunk));
       }
     }
     logger.info({ jid, length: text.length }, 'Response sent');
@@ -462,6 +462,13 @@ export async function sendResponse(jid: string, text: string): Promise<boolean> 
     logger.error({ jid, err: err.message }, 'Failed to send message');
     return false;
   }
+}
+
+export function discordTextPayload(content: string): {
+  content: string;
+  allowedMentions: { parse: [] };
+} {
+  return { content, allowedMentions: { parse: [] } };
 }
 
 export async function setTyping(jid: string): Promise<void> {

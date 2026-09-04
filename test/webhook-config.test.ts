@@ -83,8 +83,10 @@ describe('per-channel webhook configuration', () => {
       expect(db.clearChannelWebhook(first.channel_jid)).toBeUndefined();
       expect(db.getChannelWebhook(second.channel_jid)).toEqual(second);
 
+      expect(() => db.unregisterChannel(second.channel_jid)).toThrow(/webhook-clear/);
+      expect(db.getChannelWebhook(second.channel_jid)).toEqual(second);
+      db.clearChannelWebhook(second.channel_jid);
       expect(db.unregisterChannel(second.channel_jid)).toBe(true);
-      expect(db.getChannelWebhook(second.channel_jid)).toBeUndefined();
     } finally {
       db.closeDb();
     }

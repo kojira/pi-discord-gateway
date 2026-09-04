@@ -421,10 +421,9 @@ async function drainActiveTasks(timeoutMs: number): Promise<void> {
   for (const controller of steeringTaskControllers) controller.abort();
 
   if (activeTaskPromises.size > 0 || steeringTaskPromises.size > 0) {
-    await Promise.race([
-      Promise.allSettled([...activeTaskPromises, ...steeringTaskPromises]),
-      new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
-    ]);
+    // Aborted Pi children are force-killed by invokeAgent. Keep Discord and the
+    // database open until every continuation has observed that exit and settled.
+    await Promise.allSettled([...activeTaskPromises, ...steeringTaskPromises]);
   }
 }
 

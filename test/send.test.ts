@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { discordTextPayload } from '../src/discord/client.js';
 import { normalizeChannelJid, validateSendRequest, type SendRequest } from '../src/discord/send.js';
 
 function request(files: string[], text?: string): SendRequest {
@@ -8,6 +9,15 @@ function request(files: string[], text?: string): SendRequest {
     files,
   };
 }
+
+describe('Discord text delivery', () => {
+  it('disables user, role, and everyone mentions in agent-controlled output', () => {
+    expect(discordTextPayload('<@123> <@&456> @everyone')).toEqual({
+      content: '<@123> <@&456> @everyone',
+      allowedMentions: { parse: [] },
+    });
+  });
+});
 
 describe('normalizeChannelJid', () => {
   it('adds the dc: prefix when needed', () => {

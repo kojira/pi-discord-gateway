@@ -1,64 +1,152 @@
 import { WebhookClient } from 'discord.js';
+import { config } from '../config.js';
 import { getChannelWebhook, type ChannelWebhookConfig } from '../db.js';
 import { logger } from '../logger.js';
 
 const FLUSH_INTERVAL_MS = 1000;
 const MAX_LINES_PER_POST = 5;
 const MAX_CONTENT_LENGTH = 1900;
+const MAX_QUEUED_LINES = 100;
+const MAX_QUEUED_CHARS = 64 * 1024;
 
-interface PendingWebhookBatch {
+interface WebhookDeliveryState {
+  key: string;
   jid: string;
   webhook: ChannelWebhookConfig;
+  client?: WebhookClient;
   lines: string[];
+  queuedChars: number;
+  droppedEvents: number;
+  inFlightEvents: number;
   timer?: NodeJS.Timeout;
+  drainPromise?: Promise<void>;
+  retired: boolean;
 }
 
-const pendingBatches = new Map<string, PendingWebhookBatch>();
-const activeSends = new Map<Promise<void>, string>();
-const deliveryChains = new Map<string, Promise<void>>();
+const deliveryStates = new Map<string, WebhookDeliveryState>();
+const configurationLocks = new Map<string, Promise<void>>();
+let stopping = false;
 
 /** Queue a bounded trace line for the webhook configured for this source channel. */
 export function enqueueWebhookTrace(jid: string, line: string): void {
+  if (stopping || !line.trim()) return;
   const webhook = getChannelWebhook(jid);
-  if (!webhook || !line.trim()) return;
+  if (!webhook) return;
 
-  const key = batchKey(webhook);
-  let batch = pendingBatches.get(key);
-  if (!batch) {
-    batch = { jid, webhook, lines: [] };
-    pendingBatches.set(key, batch);
-  }
-
+  const state = getOrCreateState(webhook);
   const timestamp = new Date().toISOString().slice(11, 19);
-  batch.lines.push(`${timestamp} ${line.trim()}`);
-
+  const entry = `${timestamp} ${line.trim()}`;
   if (
-    batch.lines.length >= MAX_LINES_PER_POST ||
-    batch.lines.reduce((total, entry) => total + entry.length + 1, 0) >= MAX_CONTENT_LENGTH
+    state.lines.length >= MAX_QUEUED_LINES ||
+    state.queuedChars + entry.length + 1 > MAX_QUEUED_CHARS
   ) {
-    void flushBatch(key);
+    state.droppedEvents += 1;
     return;
   }
 
-  if (!batch.timer) {
-    batch.timer = setTimeout(() => void flushBatch(key), FLUSH_INTERVAL_MS);
+  state.lines.push(entry);
+  state.queuedChars += entry.length + 1;
+  if (state.lines.length >= MAX_LINES_PER_POST || state.queuedChars >= MAX_CONTENT_LENGTH) {
+    void drainState(state);
+  } else if (!state.timer) {
+    state.timer = setTimeout(() => void drainState(state), FLUSH_INTERVAL_MS);
   }
 }
 
-/** Flush trace output for one source channel before replacing or removing its webhook. */
-export async function flushWebhookTrace(jid: string): Promise<void> {
-  const keys = [...pendingBatches].filter(([, batch]) => batch.jid === jid).map(([key]) => key);
-  await Promise.all(keys.map((key) => flushBatch(key)));
-  await Promise.all(
-    [...activeSends].filter(([, sourceJid]) => sourceJid === jid).map(([send]) => send),
-  );
+/** Serialize webhook lifecycle mutations for one source channel. */
+export async function withWebhookConfigLock<T>(
+  jid: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const previous = configurationLocks.get(jid) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.catch(() => undefined).then(() => current);
+  configurationLocks.set(jid, tail);
+
+  await previous.catch(() => undefined);
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (configurationLocks.get(jid) === tail) configurationLocks.delete(jid);
+  }
 }
 
-/** Flush every configured channel during graceful shutdown. */
-export async function stopWebhookMonitor(): Promise<void> {
-  await Promise.all([...pendingBatches.keys()].map((key) => flushBatch(key)));
-  await Promise.all([...activeSends.keys()]);
-  deliveryChains.clear();
+/** Flush already queued output for one source channel and optional webhook epoch. */
+export async function flushWebhookTrace(jid: string, webhookId?: string): Promise<void> {
+  const states = matchingStates(jid, webhookId);
+  await Promise.all(states.map((state) => drainState(state)));
+}
+
+/** Flush and dispose a replaced or removed webhook's delivery epoch. */
+export async function retireWebhookTrace(
+  jid: string,
+  webhookId: string,
+  timeoutMs = config.shutdownTimeoutMs,
+): Promise<void> {
+  const states = matchingStates(jid, webhookId);
+  const draining = Promise.allSettled(states.map((state) => drainState(state)));
+  let timedOut = false;
+  let timer: NodeJS.Timeout | undefined;
+  if (timeoutMs === 0) {
+    timedOut = states.some((state) => state.lines.length > 0 || state.drainPromise);
+  } else {
+    await Promise.race([
+      draining,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          resolve();
+        }, timeoutMs);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+  }
+  if (timedOut) {
+    const dropped = countUndelivered(states);
+    logger.warn({ jid, webhookId, dropped }, 'Webhook retirement deadline reached');
+  }
+  for (const state of states) retireState(state);
+}
+
+/** Bound monitoring shutdown and stop accepting events once shutdown begins. */
+export async function stopWebhookMonitor(timeoutMs = config.shutdownTimeoutMs): Promise<void> {
+  stopping = true;
+  const states = [...deliveryStates.values()];
+  for (const state of states) {
+    if (state.timer) {
+      clearTimeout(state.timer);
+      state.timer = undefined;
+    }
+  }
+
+  const draining = Promise.allSettled(states.map((state) => drainState(state)));
+  let timedOut = false;
+  if (timeoutMs === 0) {
+    timedOut = states.some((state) => state.lines.length > 0 || state.drainPromise);
+  } else {
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([
+      draining,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          resolve();
+        }, timeoutMs);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+  }
+
+  if (timedOut) {
+    const dropped = countUndelivered(states);
+    logger.warn({ dropped, timeoutMs }, 'Webhook monitoring shutdown deadline reached');
+  }
+  for (const state of states) retireState(state);
+  deliveryStates.clear();
 }
 
 export async function deleteDiscordWebhook(
@@ -84,47 +172,124 @@ export async function deleteDiscordWebhook(
   }
 }
 
-async function flushBatch(key: string): Promise<void> {
-  const batch = pendingBatches.get(key);
-  if (!batch) return;
-  pendingBatches.delete(key);
-  if (batch.timer) clearTimeout(batch.timer);
+async function drainState(state: WebhookDeliveryState): Promise<void> {
+  if (state.drainPromise) return state.drainPromise;
+  if (state.timer) {
+    clearTimeout(state.timer);
+    state.timer = undefined;
+  }
 
-  const chunks = splitLines(batch.lines, MAX_CONTENT_LENGTH);
-  const previous = deliveryChains.get(key) ?? Promise.resolve();
-  const delivery = previous
-    .catch(() => undefined)
-    .then(() => deliver(batch.webhook, batch.jid, chunks));
-  deliveryChains.set(key, delivery);
-  activeSends.set(delivery, batch.jid);
-  await delivery.finally(() => {
-    activeSends.delete(delivery);
-    if (deliveryChains.get(key) === delivery) deliveryChains.delete(key);
+  const run = async () => {
+    while (!state.retired && (state.lines.length > 0 || state.droppedEvents > 0)) {
+      const lines = state.lines.splice(0);
+      state.queuedChars = 0;
+      const dropped = state.droppedEvents;
+      state.droppedEvents = 0;
+      state.inFlightEvents = lines.length + dropped;
+      if (dropped > 0) {
+        lines.push(`⚠️ dropped ${dropped} activity events while the webhook was busy`);
+      }
+      const chunks = splitLines(lines, MAX_CONTENT_LENGTH);
+      try {
+        await deliver(state, chunks);
+      } finally {
+        state.inFlightEvents = 0;
+      }
+    }
+  };
+
+  state.drainPromise = run().finally(() => {
+    state.drainPromise = undefined;
+    if (!state.retired && state.lines.length > 0 && !state.timer) {
+      state.timer = setTimeout(() => void drainState(state), FLUSH_INTERVAL_MS);
+    }
   });
+  return state.drainPromise;
 }
 
-async function deliver(
-  webhook: ChannelWebhookConfig,
-  jid: string,
-  chunks: readonly string[],
-): Promise<void> {
-  const client = new WebhookClient({ id: webhook.webhook_id, token: webhook.webhook_token });
+async function deliver(state: WebhookDeliveryState, chunks: readonly string[]): Promise<void> {
+  state.client ??= new WebhookClient({
+    id: state.webhook.webhook_id,
+    token: state.webhook.webhook_token,
+  });
   try {
     for (const content of chunks) {
-      await client.send({ content, allowedMentions: { parse: [] } });
+      if (state.retired) return;
+      await state.client.send({ content, allowedMentions: { parse: [] } });
     }
   } catch (err: any) {
     logger.warn(
-      { jid, destinationChannelId: webhook.destination_channel_id, err: err.message },
+      {
+        jid: state.jid,
+        destinationChannelId: state.webhook.destination_channel_id,
+        err: err.message,
+      },
       'Failed to deliver Pi trace to monitoring webhook',
     );
-  } finally {
-    client.destroy();
   }
+}
+
+function getOrCreateState(webhook: ChannelWebhookConfig): WebhookDeliveryState {
+  const key = batchKey(webhook);
+  let state = deliveryStates.get(key);
+  if (!state) {
+    state = {
+      key,
+      jid: webhook.channel_jid,
+      webhook,
+      lines: [],
+      queuedChars: 0,
+      droppedEvents: 0,
+      inFlightEvents: 0,
+      retired: false,
+    };
+    deliveryStates.set(key, state);
+  }
+  return state;
+}
+
+function matchingStates(jid: string, webhookId?: string): WebhookDeliveryState[] {
+  return [...deliveryStates.values()].filter(
+    (state) => state.jid === jid && (!webhookId || state.webhook.webhook_id === webhookId),
+  );
+}
+
+function retireState(state: WebhookDeliveryState): void {
+  state.retired = true;
+  if (state.timer) clearTimeout(state.timer);
+  state.timer = undefined;
+  state.lines = [];
+  state.queuedChars = 0;
+  state.droppedEvents = 0;
+  state.inFlightEvents = 0;
+  state.client?.destroy();
+  deliveryStates.delete(state.key);
+}
+
+function countUndelivered(states: readonly WebhookDeliveryState[]): number {
+  return states.reduce(
+    (total, state) => total + state.lines.length + state.droppedEvents + state.inFlightEvents,
+    0,
+  );
 }
 
 function batchKey(webhook: ChannelWebhookConfig): string {
   return `${webhook.channel_jid}:${webhook.webhook_id}`;
+}
+
+export function webhookMonitorStats(jid: string): {
+  states: number;
+  queuedLines: number;
+  queuedChars: number;
+  droppedEvents: number;
+} {
+  const states = matchingStates(jid);
+  return {
+    states: states.length,
+    queuedLines: states.reduce((total, state) => total + state.lines.length, 0),
+    queuedChars: states.reduce((total, state) => total + state.queuedChars, 0),
+    droppedEvents: states.reduce((total, state) => total + state.droppedEvents, 0),
+  };
 }
 
 export function splitWebhookLines(

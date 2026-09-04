@@ -164,11 +164,12 @@ export function registerChannel(ch: RegisteredChannel): void {
 
 export function unregisterChannel(jid: string): boolean {
   return db.transaction(() => {
-    const result = db.prepare('delete from channels where jid = ?').run(jid);
-    if (result.changes > 0) {
-      db.prepare('delete from channel_webhooks where channel_jid = ?').run(jid);
+    if (getChannelWebhook(jid)) {
+      throw new Error(
+        `Channel ${jid} has a managed monitoring webhook. Run /pi webhook-clear in that channel before unregistering it.`,
+      );
     }
-    return result.changes > 0;
+    return db.prepare('delete from channels where jid = ?').run(jid).changes > 0;
   })();
 }
 

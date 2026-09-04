@@ -57,6 +57,9 @@ interface ActiveRpcInvocation {
 }
 
 const activeRpcInvocations = new Map<string, ActiveRpcInvocation>();
+const MAX_RPC_EVENT_BYTES = 4 * 1024 * 1024;
+const MAX_STDERR_BYTES = 64 * 1024;
+const MAX_PENDING_DELIVERY_BYTES = 4 * 1024 * 1024;
 
 /** Queue a Discord message into an active Pi run using Pi's native steering queue. */
 export async function steerActiveAgent(
@@ -128,7 +131,6 @@ export async function invokeAgent(
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     const decoder = new StringDecoder('utf8');
-    const errChunks: Buffer[] = [];
     const pendingCommands = new Map<
       string,
       { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }
@@ -139,6 +141,9 @@ export async function invokeAgent(
       : undefined;
 
     let stdoutBuffer = '';
+    let stderr = '';
+    let fatalRpcError = '';
+    let pendingDeliveryBytes = 0;
     let commandSequence = 0;
     let lastAssistantText = '';
     let lastAssistantError = '';
@@ -221,6 +226,25 @@ export async function invokeAgent(
       resolve(result);
     };
 
+    const emitTrace = (trace: string | undefined) => {
+      if (!trace || !opts?.onTraceEvent) return;
+      try {
+        opts.onTraceEvent(trace);
+      } catch (error: any) {
+        logger.warn({ channelFolder, err: error.message }, 'Failed to enqueue webhook trace');
+      }
+    };
+
+    const failRpcOutput = (error: string) => {
+      if (fatalRpcError) return;
+      fatalRpcError = error;
+      stdoutBuffer = '';
+      unregister();
+      proc.stdin.end();
+      proc.kill('SIGTERM');
+      forceKillTimer = setTimeout(() => proc.kill('SIGKILL'), 1000);
+    };
+
     const handleRpcMessage = (message: any) => {
       if (message?.type === 'response' && typeof message.id === 'string') {
         const pending = pendingCommands.get(message.id);
@@ -231,14 +255,7 @@ export async function invokeAgent(
         return;
       }
 
-      const trace = formatAgentTraceEvent(message);
-      if (trace && opts?.onTraceEvent) {
-        try {
-          opts.onTraceEvent(trace);
-        } catch (error: any) {
-          logger.warn({ channelFolder, err: error.message }, 'Failed to enqueue webhook trace');
-        }
-      }
+      emitTrace(formatAgentTraceEvent(message));
 
       if (message?.type === 'message_start' && message.message?.role === 'user') {
         const userText = extractUserText(message.message.content);
@@ -276,6 +293,12 @@ export async function invokeAgent(
         if (text) {
           lastAssistantText = text;
           if (opts?.onAssistantMessage) {
+            const deliveryBytes = Buffer.byteLength(text);
+            if (pendingDeliveryBytes + deliveryBytes > MAX_PENDING_DELIVERY_BYTES) {
+              failRpcOutput('Pi RPC pending assistant delivery exceeded the 4 MiB safety limit');
+              return;
+            }
+            pendingDeliveryBytes += deliveryBytes;
             deliveryChain = deliveryChain
               .then(() => opts.onAssistantMessage!(text))
               .catch((error: any) => {
@@ -283,6 +306,9 @@ export async function invokeAgent(
                   { channelFolder, err: error.message },
                   'Failed to deliver live assistant message',
                 );
+              })
+              .finally(() => {
+                pendingDeliveryBytes -= deliveryBytes;
               });
           }
         }
@@ -339,6 +365,7 @@ export async function invokeAgent(
       if (settled) return;
       cancelLegacySettlement();
       settled = true;
+      emitTrace('⏹️ agent settled');
       unregister();
       proc.stdin.end();
       forceKillTimer = setTimeout(() => {
@@ -348,6 +375,10 @@ export async function invokeAgent(
     };
 
     const consumeLine = (rawLine: string) => {
+      if (Buffer.byteLength(rawLine) > MAX_RPC_EVENT_BYTES) {
+        failRpcOutput('Pi RPC event exceeded the 4 MiB safety limit');
+        return;
+      }
       const line = rawLine.replace(/\r$/u, '');
       if (!line) return;
       try {
@@ -361,20 +392,29 @@ export async function invokeAgent(
     };
 
     proc.stdout.on('data', (chunk: Buffer) => {
+      if (fatalRpcError) return;
       stdoutBuffer += decoder.write(chunk);
       let newlineIndex = stdoutBuffer.indexOf('\n');
-      while (newlineIndex !== -1) {
+      while (newlineIndex !== -1 && !fatalRpcError) {
         consumeLine(stdoutBuffer.slice(0, newlineIndex));
         stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
         newlineIndex = stdoutBuffer.indexOf('\n');
       }
+      if (!fatalRpcError && Buffer.byteLength(stdoutBuffer) > MAX_RPC_EVENT_BYTES) {
+        failRpcOutput('Pi RPC event exceeded the 4 MiB safety limit');
+      }
     });
     proc.stdout.on('end', () => {
+      if (fatalRpcError) return;
       stdoutBuffer += decoder.end();
       if (stdoutBuffer) consumeLine(stdoutBuffer);
       stdoutBuffer = '';
     });
-    proc.stderr.on('data', (chunk: Buffer) => errChunks.push(chunk));
+    proc.stderr.on('data', (chunk: Buffer) => {
+      const available = Math.max(0, MAX_STDERR_BYTES - Buffer.byteLength(stderr));
+      if (available === 0) return;
+      stderr += chunk.subarray(0, available).toString('utf8');
+    });
 
     if (opts?.signal) {
       const onAbort = () => {
@@ -384,13 +424,12 @@ export async function invokeAgent(
           // them first so `/pi stop` retains its documented stop-all behavior.
           proc.stdin.write('{"type":"clear_queue"}\n{"type":"abort"}\n');
         }
-        forceKillTimer = setTimeout(() => {
-          if (process.platform === 'win32') proc.kill();
-          else {
-            proc.kill('SIGTERM');
-            setTimeout(() => proc.kill('SIGKILL'), 5000);
-          }
-        }, 1000);
+        if (process.platform === 'win32') {
+          proc.kill();
+        } else {
+          proc.kill('SIGTERM');
+          forceKillTimer = setTimeout(() => proc.kill('SIGKILL'), 1500);
+        }
       };
       opts.signal.addEventListener('abort', onAbort, { once: true });
       proc.on('close', () => opts.signal!.removeEventListener('abort', onAbort));
@@ -402,8 +441,12 @@ export async function invokeAgent(
     });
 
     proc.on('close', (code) => {
-      const stderr = Buffer.concat(errChunks).toString('utf8').trim();
+      stderr = stderr.trim();
       void Promise.all([deliveryChain, consumptionChain]).then(() => {
+        if (fatalRpcError) {
+          finish({ ok: false, text: '', error: fatalRpcError });
+          return;
+        }
         if (!settled || code !== 0) {
           logger.warn(
             { code, stderr: stderr.slice(0, 500), channelFolder },
@@ -449,7 +492,7 @@ export async function invokeAgent(
           finish({ ok: false, text: '', error: response.error || 'Pi rejected the prompt' });
           return;
         }
-        if (!settled && !finished) {
+        if (!settled && !finished && !fatalRpcError) {
           activeRpcInvocations.set(channelFolder, activeInvocation);
         }
       })
@@ -665,7 +708,7 @@ async function getSessionStatsViaRpc(
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
-    const errChunks: Buffer[] = [];
+    let stderr = '';
     let stdout = '';
     let response: RpcSessionStatsResponse | undefined;
     let finished = false;
@@ -702,18 +745,33 @@ async function getSessionStatsViaRpc(
       });
     };
 
-    const timeout = setTimeout(() => {
+    const terminate = () => {
       if (process.platform === 'win32') {
         proc.kill();
       } else {
         proc.kill('SIGTERM');
-        setTimeout(() => proc.kill('SIGKILL'), 1000);
+        setTimeout(() => proc.kill('SIGKILL'), 1000).unref();
       }
+    };
+
+    const failOutput = (message: string) => {
+      if (finished) return;
+      terminate();
+      finish(new Error(message));
+    };
+
+    const timeout = setTimeout(() => {
+      terminate();
       finish(new Error('Timed out waiting for pi session stats'));
     }, 2500);
 
     proc.stdout.on('data', (chunk: Buffer) => {
+      if (finished) return;
       stdout += chunk.toString('utf-8');
+      if (Buffer.byteLength(stdout) > MAX_RPC_EVENT_BYTES) {
+        failOutput('Pi session stats RPC event exceeded the 4 MiB safety limit');
+        return;
+      }
 
       let newlineIndex = stdout.indexOf('\n');
       while (newlineIndex !== -1) {
@@ -730,7 +788,7 @@ async function getSessionStatsViaRpc(
               response = message as RpcSessionStatsResponse;
             }
           } catch {
-            // Ignore non-JSON or partial lines from stdout.
+            // Ignore non-JSON output from stdout.
           }
         }
 
@@ -738,7 +796,10 @@ async function getSessionStatsViaRpc(
       }
     });
 
-    proc.stderr.on('data', (chunk: Buffer) => errChunks.push(chunk));
+    proc.stderr.on('data', (chunk: Buffer) => {
+      const available = Math.max(0, MAX_STDERR_BYTES - Buffer.byteLength(stderr));
+      if (available > 0) stderr += chunk.subarray(0, available).toString('utf8');
+    });
     proc.on('error', (err) => finish(err));
     proc.on('close', (code) => {
       const trailingLine = stdout.trim();
@@ -757,8 +818,7 @@ async function getSessionStatsViaRpc(
       }
 
       if (code !== 0) {
-        const stderr = Buffer.concat(errChunks).toString('utf-8').trim();
-        finish(new Error(stderr || `pi exited with code ${code}`));
+        finish(new Error(stderr.trim() || `pi exited with code ${code}`));
         return;
       }
 

@@ -77,18 +77,20 @@ describe('webhook slash commands', () => {
       send: createdSend,
       delete: createdDelete,
     });
+    const destinationPermissions = { has: () => true };
     const destination = {
       id: 'monitor-channel',
       name: 'monitoring',
       guildId: 'guild-1',
       type: ChannelType.GuildText,
       createWebhook,
+      permissionsFor: vi.fn().mockReturnValue(destinationPermissions),
     };
     const editReply = vi.fn().mockResolvedValue(undefined);
     const setInteraction = {
       commandName: 'pi',
       channelId: 'source',
-      guild: {},
+      guild: { members: { me: { id: 'bot' } } },
       guildId: 'guild-1',
       user: { id: 'admin' },
       memberPermissions: {
@@ -142,6 +144,79 @@ describe('webhook slash commands', () => {
       expect(clearEditReply).toHaveBeenCalledWith({
         content: 'Pi activity monitoring is disabled and the Discord webhook was deleted.',
       });
+    } finally {
+      db.closeDb();
+    }
+  });
+
+  it('rejects a destination where the caller lacks effective webhook permission', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'piscord-slash-webhook-destination-'));
+    tempDirs.push(tempDir);
+    process.env.DB_PATH = join(tempDir, 'gateway.db');
+    process.env.PIDG_CONFIG = resolve(tempDir, 'missing.env');
+
+    const db = await import('../src/db.js');
+    const { handleChatCommand } = await import('../src/discord/slash-commands.js');
+    const { ChannelType } = await import('discord.js');
+    db.initDb();
+    db.registerChannel({
+      jid: 'dc:source',
+      name: 'source',
+      folder: 'ch_source',
+      requiresTrigger: false,
+      isMain: false,
+      modelOverride: '',
+      thinkingOverride: '',
+      cwdOverride: '',
+    });
+    const createWebhook = vi.fn();
+    const reply = vi.fn().mockResolvedValue(undefined);
+    const permissionsFor = vi.fn().mockReturnValue({ has: () => false });
+    const interaction = {
+      commandName: 'pi',
+      channelId: 'source',
+      guildId: 'guild-1',
+      guild: { members: { me: { id: 'bot' } } },
+      user: { id: 'caller' },
+      memberPermissions: { has: () => true },
+      inGuild: () => true,
+      options: {
+        getSubcommand: () => 'webhook',
+        getChannel: () => ({
+          id: 'destination',
+          name: 'private',
+          guildId: 'guild-1',
+          type: ChannelType.GuildText,
+          createWebhook,
+          permissionsFor,
+        }),
+      },
+      reply,
+      replied: false,
+      deferred: false,
+    };
+
+    try {
+      await handleChatCommand(interaction as any);
+
+      expect(createWebhook).not.toHaveBeenCalled();
+      expect(reply).toHaveBeenCalledWith(
+        expect.objectContaining({
+          content: 'You need View Channel and Manage Webhooks in the monitoring destination.',
+        }),
+      );
+
+      reply.mockClear();
+      permissionsFor.mockImplementation((subject: unknown) => ({
+        has: () => typeof subject === 'string',
+      }));
+      await handleChatCommand(interaction as any);
+      expect(createWebhook).not.toHaveBeenCalled();
+      expect(reply).toHaveBeenCalledWith(
+        expect.objectContaining({
+          content: 'The bot needs View Channel and Manage Webhooks in the monitoring destination.',
+        }),
+      );
     } finally {
       db.closeDb();
     }
