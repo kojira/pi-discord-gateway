@@ -38,6 +38,8 @@ That's it. The setup wizard checks prerequisites, asks for your Discord bot toke
 - **Per-channel working directories** — optionally override `PI_CWD` for specific channels without changing the global default
 - **Channel access policy** — `open` (all channels), `open-trigger` (all channels, @mention required), or `allowlist` (manual registration only)
 - **SQLite message queue** — survives crashes, auto-recovers stuck messages
+- **Live assistant messages** — posts each completed Pi assistant turn before subsequent tool calls finish
+- **Native steering** — messages sent while Pi is working steer the active run before its next model turn
 - **Concurrency control** — per-channel serial processing + configurable global limit
 - **DM auto-registration** — direct messages work out of the box
 - **Discord slash commands** — `/pi status`, `/pi model`, `/pi thinking`, `/pi new`, `/pi stop`
@@ -66,7 +68,9 @@ The gateway **does not embed or replace `pi`**. It finds and runs your installed
 1. **Binary discovery** — uses `PI_BIN` config or finds `pi` in `PATH`
 2. **Auth reuse** — `pi` reads its own `~/.pi/agent/auth.json` when invoked
 3. **Model catalog** — the gateway imports the pi SDK to populate slash command autocomplete
-4. **Invocation** — each message is processed as `pi --session-dir <dir> --continue -p <message>`
+4. **Invocation** — each channel run uses Pi's JSONL RPC mode for live events and steering
+
+While Pi is working in a channel, another Discord message in that channel is sent through Pi's native `steer` queue. Pi receives it after the current assistant turn and its tool calls complete, before the next model turn. Assistant text is posted to Discord at each `message_end` event instead of being reduced to the final print-mode response.
 
 ## Channel Policy
 

@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { StringDecoder } from 'node:string_decoder';
 import { type AttachmentMeta } from '../discord/attachments.js';
 import { config } from '../config.js';
 import { logger } from '../logger.js';
@@ -35,11 +36,51 @@ export interface ChannelSessionStatus {
   statsSource: 'rpc' | 'jsonl' | 'none';
 }
 
+interface RpcResponse {
+  type: 'response';
+  id?: string;
+  command?: string;
+  success: boolean;
+  error?: string;
+}
+
+interface ActiveRpcInvocation {
+  sendCommand: (command: Record<string, unknown>) => Promise<RpcResponse>;
+}
+
+const activeRpcInvocations = new Map<string, ActiveRpcInvocation>();
+
+/** Queue a Discord message into an active Pi run using Pi's native steering queue. */
+export async function steerActiveAgent(
+  channelFolder: string,
+  userText: string,
+  opts?: { attachments?: string | null; signal?: AbortSignal },
+): Promise<boolean> {
+  const invocation = activeRpcInvocations.get(channelFolder);
+  if (!invocation) return false;
+
+  const prompt = await buildPromptWithAttachments(channelFolder, userText, opts);
+  if (activeRpcInvocations.get(channelFolder) !== invocation) return false;
+
+  try {
+    const response = await invocation.sendCommand({ type: 'steer', message: prompt });
+    if (!response.success) {
+      throw new Error(response.error || 'Pi rejected the steering message');
+    }
+    return true;
+  } catch (error) {
+    // Attachment downloads can outlive the invocation that was captured above.
+    // Treat closure/replacement of that exact process as a retryable inactive race.
+    if (activeRpcInvocations.get(channelFolder) !== invocation) return false;
+    throw error;
+  }
+}
+
 /**
- * Invoke pi agent as a subprocess.
+ * Invoke Pi through its JSONL RPC mode.
  *
- * Each channel gets its own session directory so conversation history persists.
- * Uses `pi --session-dir <dir> --continue -p <message>` (print mode, no TUI).
+ * RPC is required here rather than print mode: it exposes every completed
+ * assistant message and keeps stdin open for native steering while tools run.
  */
 export async function invokeAgent(
   channelFolder: string,
@@ -50,38 +91,271 @@ export async function invokeAgent(
     cwd?: string;
     signal?: AbortSignal;
     attachments?: string | null;
+    onAssistantMessage?: (text: string) => void | Promise<void>;
     onSupervisorRequest?: (request: SupervisorRequest) => void | Promise<void>;
   },
 ): Promise<AgentResult> {
   const sessionDir = resolveChannelSessionDir(channelFolder);
   mkdirSync(sessionDir, { recursive: true });
   const effectiveCwd = opts?.cwd || config.piCwd;
+  const prompt = await buildPromptWithAttachments(channelFolder, userText, opts);
 
-  // `--session` expects a session *file* path. We want a dedicated directory per
-  // Discord channel and to keep reusing the most recent session inside it.
-  const args: string[] = ['--session-dir', sessionDir, '--continue'];
-
-  // Model
-  const model = opts?.model || config.piModel;
-  if (model) args.push('--model', model);
-
-  // Thinking
-  const thinking = opts?.thinking || config.piThinking;
-  if (thinking) args.push('--thinking', thinking);
-
-  // Extra flags
-  if (config.piExtraFlags) {
-    args.push(...config.piExtraFlags.split(/\s+/).filter(Boolean));
+  if (opts?.signal?.aborted) {
+    return { ok: false, text: '', error: 'Agent invocation aborted during shutdown' };
   }
 
-  let attachmentPrompt = '';
+  // `--session` expects a session file. A dedicated session directory plus
+  // `--continue` reuses the newest session for this Discord channel.
+  const args: string[] = ['--mode', 'rpc', '--session-dir', sessionDir, '--continue'];
+  const model = opts?.model || config.piModel;
+  if (model) args.push('--model', model);
+  const thinking = opts?.thinking || config.piThinking;
+  if (thinking) args.push('--thinking', thinking);
+  if (config.piExtraFlags) args.push(...config.piExtraFlags.split(/\s+/).filter(Boolean));
 
-  // Download attachments to disk and pass *paths* to the agent instead of using
-  // `@file` arguments. `@file` eagerly injects file contents into the model
-  // request; that is convenient for small text files but unsafe for binary or
-  // structured files (docx/xlsx/pdf/images) because it can flood the context
-  // window with raw bytes. Path-based handoff keeps the prompt small and lets
-  // pi decide which tools/converters to use for each file type.
+  const { bin: effectiveBin, args: effectiveArgs } = resolvePiSpawn(config.piBin, args);
+  logger.debug(
+    { bin: effectiveBin, args: effectiveArgs, channelFolder, cwd: effectiveCwd },
+    'Spawning pi RPC',
+  );
+
+  return new Promise<AgentResult>((resolve) => {
+    const proc = spawn(effectiveBin, effectiveArgs, {
+      cwd: effectiveCwd,
+      env: process.env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const decoder = new StringDecoder('utf8');
+    const errChunks: Buffer[] = [];
+    const pendingCommands = new Map<
+      string,
+      { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }
+    >();
+    const supervisorWatcher = opts?.onSupervisorRequest
+      ? startSupervisorWatcher({ signal: opts.signal, onRequest: opts.onSupervisorRequest })
+      : undefined;
+
+    let stdoutBuffer = '';
+    let commandSequence = 0;
+    let lastAssistantText = '';
+    let lastAssistantError = '';
+    let lastAssistantFailed = false;
+    let settled = false;
+    let finished = false;
+    let forceKillTimer: NodeJS.Timeout | undefined;
+    let deliveryChain = Promise.resolve();
+
+    const sendCommand = (command: Record<string, unknown>): Promise<RpcResponse> => {
+      if (!proc.stdin.writable || proc.stdin.destroyed) {
+        return Promise.reject(new Error('Pi RPC stdin is closed'));
+      }
+
+      const id = `piscord-${++commandSequence}`;
+      return new Promise<RpcResponse>((resolveCommand, rejectCommand) => {
+        pendingCommands.set(id, { resolve: resolveCommand, reject: rejectCommand });
+        proc.stdin.write(`${JSON.stringify({ ...command, id })}\n`, (error) => {
+          if (!error) return;
+          pendingCommands.delete(id);
+          rejectCommand(error);
+        });
+      });
+    };
+
+    const unregister = () => {
+      if (activeRpcInvocations.get(channelFolder)?.sendCommand === sendCommand) {
+        activeRpcInvocations.delete(channelFolder);
+      }
+    };
+
+    const finish = (result: AgentResult) => {
+      if (finished) return;
+      finished = true;
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      unregister();
+      supervisorWatcher?.stop();
+      for (const pending of pendingCommands.values()) {
+        pending.reject(new Error('Pi RPC process exited before responding'));
+      }
+      pendingCommands.clear();
+      resolve(result);
+    };
+
+    const handleRpcMessage = (message: any) => {
+      if (message?.type === 'response' && typeof message.id === 'string') {
+        const pending = pendingCommands.get(message.id);
+        if (pending) {
+          pendingCommands.delete(message.id);
+          pending.resolve(message as RpcResponse);
+        }
+        return;
+      }
+
+      if (message?.type === 'message_end' && message.message?.role === 'assistant') {
+        const text = extractAssistantText(message.message.content);
+        lastAssistantFailed =
+          message.message.stopReason === 'error' ||
+          typeof message.message.errorMessage === 'string';
+        lastAssistantError = lastAssistantFailed
+          ? message.message.errorMessage || 'Pi assistant message ended with an error'
+          : '';
+        if (text) {
+          lastAssistantText = text;
+          if (opts?.onAssistantMessage) {
+            deliveryChain = deliveryChain
+              .then(() => opts.onAssistantMessage!(text))
+              .catch((error: any) => {
+                logger.error(
+                  { channelFolder, err: error.message },
+                  'Failed to deliver live assistant message',
+                );
+              });
+          }
+        }
+        return;
+      }
+
+      if (message?.type === 'agent_settled') {
+        settleInvocation();
+        return;
+      }
+
+      // Pi versions before agent_settled support use agent_end as the terminal
+      // event. Newer versions include willRetry and then emit agent_settled.
+      if (message?.type === 'agent_end' && !('willRetry' in message)) {
+        settleInvocation();
+      }
+    };
+
+    const settleInvocation = () => {
+      if (settled) return;
+      settled = true;
+      unregister();
+      proc.stdin.end();
+      forceKillTimer = setTimeout(() => {
+        if (process.platform === 'win32') proc.kill();
+        else proc.kill('SIGTERM');
+      }, 2000);
+    };
+
+    const consumeLine = (rawLine: string) => {
+      const line = rawLine.replace(/\r$/u, '');
+      if (!line) return;
+      try {
+        handleRpcMessage(JSON.parse(line));
+      } catch (error: any) {
+        logger.warn(
+          { channelFolder, err: error.message, line: line.slice(0, 300) },
+          'Ignoring malformed Pi RPC output',
+        );
+      }
+    };
+
+    proc.stdout.on('data', (chunk: Buffer) => {
+      stdoutBuffer += decoder.write(chunk);
+      let newlineIndex = stdoutBuffer.indexOf('\n');
+      while (newlineIndex !== -1) {
+        consumeLine(stdoutBuffer.slice(0, newlineIndex));
+        stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+        newlineIndex = stdoutBuffer.indexOf('\n');
+      }
+    });
+    proc.stdout.on('end', () => {
+      stdoutBuffer += decoder.end();
+      if (stdoutBuffer) consumeLine(stdoutBuffer);
+      stdoutBuffer = '';
+    });
+    proc.stderr.on('data', (chunk: Buffer) => errChunks.push(chunk));
+
+    if (opts?.signal) {
+      const onAbort = () => {
+        unregister();
+        if (proc.stdin.writable && !proc.stdin.destroyed) {
+          // Pi's abort command continues already queued steering messages. Clear
+          // them first so `/pi stop` retains its documented stop-all behavior.
+          proc.stdin.write('{"type":"clear_queue"}\n{"type":"abort"}\n');
+        }
+        forceKillTimer = setTimeout(() => {
+          if (process.platform === 'win32') proc.kill();
+          else {
+            proc.kill('SIGTERM');
+            setTimeout(() => proc.kill('SIGKILL'), 5000);
+          }
+        }, 1000);
+      };
+      opts.signal.addEventListener('abort', onAbort, { once: true });
+      proc.on('close', () => opts.signal!.removeEventListener('abort', onAbort));
+    }
+
+    proc.on('error', (error) => {
+      logger.error({ err: error.message }, 'Failed to spawn pi RPC');
+      finish({ ok: false, text: '', error: error.message });
+    });
+
+    proc.on('close', (code) => {
+      const stderr = Buffer.concat(errChunks).toString('utf8').trim();
+      void deliveryChain.then(() => {
+        if (!settled || code !== 0) {
+          logger.warn(
+            { code, stderr: stderr.slice(0, 500), channelFolder },
+            'Pi RPC exited before settling',
+          );
+          finish({
+            ok: false,
+            text: '',
+            error:
+              lastAssistantError ||
+              readLatestAgentErrorFromSession(channelFolder) ||
+              stderr.slice(0, 600) ||
+              `pi RPC exited with code ${code ?? 'unknown'} before agent_settled`,
+          });
+          return;
+        }
+
+        if (lastAssistantFailed) {
+          finish({ ok: false, text: '', error: lastAssistantError });
+          return;
+        }
+
+        if (!lastAssistantText) {
+          finish({
+            ok: false,
+            text: '',
+            error:
+              lastAssistantError ||
+              readLatestAgentErrorFromSession(channelFolder) ||
+              stderr.slice(0, 600) ||
+              'Pi completed without producing an assistant text message',
+          });
+          return;
+        }
+        finish({ ok: true, text: lastAssistantText });
+      });
+    });
+
+    void sendCommand({ type: 'prompt', message: prompt })
+      .then((response) => {
+        if (!response.success) {
+          proc.stdin.end();
+          finish({ ok: false, text: '', error: response.error || 'Pi rejected the prompt' });
+          return;
+        }
+        if (!settled && !finished) {
+          activeRpcInvocations.set(channelFolder, { sendCommand });
+        }
+      })
+      .catch((error: any) => {
+        proc.stdin.end();
+        finish({ ok: false, text: '', error: error.message });
+      });
+  });
+}
+
+async function buildPromptWithAttachments(
+  channelFolder: string,
+  userText: string,
+  opts?: { attachments?: string | null; signal?: AbortSignal },
+): Promise<string> {
+  let attachmentPrompt = '';
   if (opts?.attachments) {
     try {
       const metas: AttachmentMeta[] = JSON.parse(opts.attachments);
@@ -95,92 +369,19 @@ export async function invokeAgent(
       logger.warn({ err: err.message }, 'Failed to process attachments');
     }
   }
+  return attachmentPrompt ? `${userText}\n\n${attachmentPrompt}` : userText;
+}
 
-  if (opts?.signal?.aborted) {
-    return {
-      ok: false,
-      text: '',
-      error: 'Agent invocation aborted during shutdown',
-    };
-  }
-
-  // Prompt (must be last)
-  const prompt = attachmentPrompt ? `${userText}\n\n${attachmentPrompt}` : userText;
-  args.push('-p', prompt);
-
-  const { bin: effectiveBin, args: effectiveArgs } = resolvePiSpawn(config.piBin, args);
-
-  logger.debug(
-    { bin: effectiveBin, args: effectiveArgs.slice(0, -1), channelFolder, cwd: effectiveCwd },
-    'Spawning pi',
-  );
-
-  return new Promise<AgentResult>((resolve, reject) => {
-    const proc = spawn(effectiveBin, effectiveArgs, {
-      cwd: effectiveCwd,
-      env: process.env,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-
-    const chunks: Buffer[] = [];
-    const errChunks: Buffer[] = [];
-    const supervisorWatcher = opts?.onSupervisorRequest
-      ? startSupervisorWatcher({ signal: opts.signal, onRequest: opts.onSupervisorRequest })
-      : undefined;
-
-    proc.stdout.on('data', (c: Buffer) => chunks.push(c));
-    proc.stderr.on('data', (c: Buffer) => errChunks.push(c));
-
-    // Abort support
-    if (opts?.signal) {
-      const onAbort = () => {
-        if (process.platform === 'win32') {
-          proc.kill();
-        } else {
-          proc.kill('SIGTERM');
-          setTimeout(() => proc.kill('SIGKILL'), 5000);
-        }
-      };
-      opts.signal.addEventListener('abort', onAbort, { once: true });
-      proc.on('close', () => opts.signal!.removeEventListener('abort', onAbort));
-    }
-
-    proc.on('close', (code) => {
-      supervisorWatcher?.stop();
-      const stdout = Buffer.concat(chunks).toString('utf-8').trim();
-      const stderr = Buffer.concat(errChunks).toString('utf-8').trim();
-
-      if (code !== 0) {
-        logger.warn({ code, stderr: stderr.slice(0, 500), channelFolder }, 'pi exited with error');
-        resolve({
-          ok: false,
-          text: '',
-          error: stderr.slice(0, 600) || `pi exited with code ${code}`,
-        });
-        return;
-      }
-
-      if (!stdout) {
-        const sessionError = readLatestAgentErrorFromSession(channelFolder);
-        resolve({
-          ok: false,
-          text: '',
-          error:
-            sessionError ||
-            stderr.slice(0, 600) ||
-            'pi completed without producing a response (empty stdout)',
-        });
-        return;
-      }
-
-      resolve({ ok: true, text: stdout });
-    });
-
-    proc.on('error', (err) => {
-      logger.error({ err: err.message }, 'Failed to spawn pi');
-      reject(err);
-    });
-  });
+function extractAssistantText(content: unknown): string {
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter(
+      (block): block is { type: 'text'; text: string } =>
+        block?.type === 'text' && typeof block.text === 'string',
+    )
+    .map((block) => block.text)
+    .join('\n')
+    .trim();
 }
 
 export function buildAttachmentPathPrompt(downloaded: DownloadedFile[]): string {
