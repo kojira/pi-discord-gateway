@@ -2,11 +2,13 @@ import { config } from './config.js';
 import { logger } from './logger.js';
 import { initDb, closeDb, getAllChannels } from './db.js';
 import { startDiscord, stopDiscord, getBotTag } from './discord/client.js';
+import { stopWebhookLifecycle } from './discord/slash-commands.js';
 import { startArchiveCleanup } from './session/archive-cleanup.js';
 import { startMediaCleanup } from './session/media.js';
 import { listAvailableModels } from './agent/model-catalog.js';
 import { startProcessingLoop, stopProcessingLoop } from './agent/queue.js';
 import { startScheduler } from './agent/scheduler.js';
+import { stopWebhookMonitor } from './discord/webhook-monitor.js';
 
 /**
  * pi-discord-gateway - Lightweight Discord gateway for pi coding agent.
@@ -59,10 +61,15 @@ export async function startGateway(): Promise<void> {
       stopArchiveCleanup();
       stopMediaCleanup();
 
+      // Reject new webhook mutations as soon as shutdown starts. SQLite stays
+      // open while the bounded lifecycle drain persists any final state.
+      await stopWebhookLifecycle(config.shutdownTimeoutMs);
+
       if (processingStarted) {
         await stopProcessingLoop({ timeoutMs: config.shutdownTimeoutMs });
       }
 
+      await stopWebhookMonitor();
       stopDiscord();
       closeDb();
       logger.info('Gateway stopped');

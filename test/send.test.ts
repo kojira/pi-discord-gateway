@@ -1,5 +1,12 @@
+import { ActionRowBuilder, ButtonBuilder } from 'discord.js';
 import { describe, expect, it, vi } from 'vitest';
-import { normalizeChannelJid, validateSendRequest, type SendRequest } from '../src/discord/send.js';
+import { discordTextPayload, supervisorPromptPayload } from '../src/discord/client.js';
+import {
+  buildDiscordSendPayload,
+  normalizeChannelJid,
+  validateSendRequest,
+  type SendRequest,
+} from '../src/discord/send.js';
 
 function request(files: string[], text?: string): SendRequest {
   return {
@@ -8,6 +15,31 @@ function request(files: string[], text?: string): SendRequest {
     files,
   };
 }
+
+describe('Discord text delivery', () => {
+  it('disables user, role, and everyone mentions in agent-controlled output', () => {
+    expect(discordTextPayload('<@123> <@&456> @everyone')).toEqual({
+      content: '<@123> <@&456> @everyone',
+      allowedMentions: { parse: [] },
+    });
+  });
+
+  it('explicitly disables mentions while retaining supervisor components', () => {
+    const row = new ActionRowBuilder<ButtonBuilder>();
+    expect(supervisorPromptPayload('@everyone choose', row)).toEqual({
+      content: '@everyone choose',
+      allowedMentions: { parse: [] },
+      components: [row],
+    });
+  });
+
+  it('disables mentions in the direct Discord relay payload', () => {
+    expect(buildDiscordSendPayload('@everyone <@123> <@&456>', [])).toEqual({
+      content: '@everyone <@123> <@&456>',
+      allowedMentions: { parse: [] },
+    });
+  });
+});
 
 describe('normalizeChannelJid', () => {
   it('adds the dc: prefix when needed', () => {

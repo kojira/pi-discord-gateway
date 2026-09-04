@@ -1,10 +1,14 @@
 import {
+  ChannelType,
+  DiscordAPIError,
   MessageFlags,
+  PermissionFlagsBits,
   SlashCommandBuilder,
   type AutocompleteInteraction,
   type ChatInputCommandInteraction,
   type Client,
   type InteractionReplyOptions,
+  type TextChannel,
 } from 'discord.js';
 import {
   getChannelSessionStatus,
@@ -14,13 +18,33 @@ import {
 } from '../agent/invoke.js';
 import { config } from '../config.js';
 import {
+  activateChannelWebhookProvisioning,
+  beginChannelWebhookClear,
+  beginChannelWebhookProvisioning,
+  cancelChannelWebhookProvisioning,
+  claimChannelWebhookProvisioningReconciliation,
   clearChannelModelOverride,
   clearPendingMessages,
+  completeDefinitiveChannelWebhookCreateRejection,
+  completeChannelWebhookProvisioningReconciliation,
+  completeChannelWebhookProvisioningRollback,
+  completeWebhookCleanup,
   createDmChannel,
   getChannel,
+  getChannelWebhook,
+  getChannelWebhookProvisioning,
+  getChannelWebhookReconciliationTargets,
+  getPendingWebhookCleanup,
+  isChannelWebhookProvisioningStale,
+  markChannelWebhookCreateRequestIssued,
+  queueChannelWebhookProvisioningCleanup,
+  recordChannelWebhookCreated,
+  recordChannelWebhookReconciliationTargets,
   registerChannel,
   setChannelModelOverride,
   setChannelThinkingOverride,
+  type ChannelWebhookConfig,
+  type ChannelWebhookProvisioning,
 } from '../db.js';
 import { logger } from '../logger.js';
 import {
@@ -43,6 +67,13 @@ import {
 import { abortChannelTask, isChannelProcessing } from '../agent/queue.js';
 import { rotateChannelSessionDir } from '../session/path.js';
 import type { RegisteredChannel } from '../types.js';
+import {
+  deleteDiscordWebhook,
+  discardWebhookTrace,
+  isDiscordUnknownWebhookError,
+  retireWebhookTrace,
+  safeDiscordErrorMetadata,
+} from './webhook-monitor.js';
 
 const PI_COMMAND = new SlashCommandBuilder()
   .setName('pi')
@@ -93,6 +124,23 @@ const PI_COMMAND = new SlashCommandBuilder()
     sub
       .setName('stop')
       .setDescription('Abort the current task and clear the queue for this channel'),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName('webhook')
+      .setDescription('Send this channel’s Pi activity to a monitoring webhook channel')
+      .addChannelOption((option) =>
+        option
+          .setName('channel')
+          .setDescription('Discord channel that will receive the Pi activity trace')
+          .setRequired(true)
+          .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement),
+      ),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName('webhook-clear')
+      .setDescription('Stop sending this channel’s Pi activity to its monitoring webhook'),
   );
 
 export async function registerGlobalCommands(client: Client<true>): Promise<void> {
@@ -101,6 +149,58 @@ export async function registerGlobalCommands(client: Client<true>): Promise<void
 }
 
 const catalogRefreshesInFlight = new Set<string>();
+
+class WebhookCommandError extends Error {}
+
+const activeWebhookLifecycles = new Set<Promise<void>>();
+let acceptingWebhookLifecycles = true;
+let webhookDbMutationsAllowed = true;
+
+/**
+ * Stop accepting webhook mutations and wait only up to the shutdown budget.
+ * A timed-out handler leaves its pre-await durable provisioning/cleanup record
+ * for recovery and is forbidden from touching SQLite when it resumes.
+ */
+export async function stopWebhookLifecycle(timeoutMs = config.shutdownTimeoutMs): Promise<void> {
+  acceptingWebhookLifecycles = false;
+  const settling = Promise.allSettled([...activeWebhookLifecycles]);
+  let timedOut = false;
+  let timer: NodeJS.Timeout | undefined;
+
+  if (activeWebhookLifecycles.size > 0) {
+    if (timeoutMs <= 0) {
+      timedOut = true;
+    } else {
+      await Promise.race([
+        settling,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(() => {
+            timedOut = true;
+            resolve();
+          }, timeoutMs);
+        }),
+      ]);
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  // The gateway may close SQLite immediately after this function returns.
+  webhookDbMutationsAllowed = false;
+  if (timedOut) {
+    logger.warn(
+      { active: activeWebhookLifecycles.size, timeoutMs },
+      'Webhook lifecycle shutdown deadline reached; durable cleanup state retained',
+    );
+  }
+}
+
+function canMutateWebhookDb(): boolean {
+  return webhookDbMutationsAllowed;
+}
+
+function webhookCommandError(message: string): WebhookCommandError {
+  return new WebhookCommandError(message);
+}
 
 /** Refresh a cwd's model catalog off the interaction path, at most once at a time. */
 function scheduleCatalogRefresh(cwd: string): void {
@@ -156,7 +256,27 @@ export async function handleChatCommand(interaction: ChatInputCommandInteraction
   if (interaction.commandName !== 'pi') return;
 
   const subcommand = interaction.options.getSubcommand();
+  const isWebhookCommand = subcommand === 'webhook' || subcommand === 'webhook-clear';
+  if (!isWebhookCommand) {
+    await executeChatCommand(interaction, subcommand, false);
+    return;
+  }
+  if (!acceptingWebhookLifecycles) return;
 
+  const operation = executeChatCommand(interaction, subcommand, true);
+  activeWebhookLifecycles.add(operation);
+  try {
+    await operation;
+  } finally {
+    activeWebhookLifecycles.delete(operation);
+  }
+}
+
+async function executeChatCommand(
+  interaction: ChatInputCommandInteraction,
+  subcommand: string,
+  isWebhookCommand: boolean,
+): Promise<void> {
   try {
     switch (subcommand) {
       case 'status':
@@ -177,15 +297,45 @@ export async function handleChatCommand(interaction: ChatInputCommandInteraction
       case 'stop':
         await handleStop(interaction);
         return;
+      case 'webhook':
+        await handleWebhookSet(interaction);
+        return;
+      case 'webhook-clear':
+        await handleWebhookClear(interaction);
+        return;
       default:
         await interaction.reply(reply(`Unknown subcommand: ${subcommand}`, interaction));
     }
-  } catch (err: any) {
-    logger.error(
-      { err: err.message, command: interaction.commandName, subcommand },
-      'Slash command failed',
-    );
-    const payload = reply(`⚠️ ${err.message}`, interaction);
+  } catch (error) {
+    // A timed-out lifecycle continuation must not use the closed Discord client
+    // for command replies. All cleanup state needed by the next process was
+    // persisted before the Discord await that timed out.
+    if (isWebhookCommand && !canMutateWebhookDb()) return;
+    if (isWebhookCommand) {
+      logger.error(
+        {
+          command: interaction.commandName,
+          subcommand,
+          ...safeDiscordErrorMetadata(error),
+        },
+        'Webhook slash command failed',
+      );
+    } else {
+      logger.error(
+        {
+          command: interaction.commandName,
+          subcommand,
+          ...safeDiscordErrorMetadata(error),
+        },
+        'Slash command failed',
+      );
+    }
+    const publicMessage = isWebhookCommand
+      ? error instanceof WebhookCommandError
+        ? error.message
+        : 'Webhook command failed safely. Run /pi webhook-clear to inspect or retry cleanup.'
+      : 'Command failed. Check the gateway logs and try again.';
+    const payload = reply(`⚠️ ${publicMessage}`, interaction);
     if (interaction.replied) {
       await interaction.followUp(payload);
     } else if (interaction.deferred) {
@@ -256,6 +406,559 @@ async function handleStop(interaction: ChatInputCommandInteraction): Promise<voi
   await interaction.reply(reply(notes.join(' '), interaction));
 }
 
+async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promise<void> {
+  const channel = ensureManagedChannel(interaction);
+  if (!channel) {
+    await interaction.reply(reply(notRegisteredMessage(), interaction));
+    return;
+  }
+  if (!interaction.inGuild() || !interaction.guildId) {
+    await interaction.reply(
+      reply('Monitoring webhooks can only be configured in a server.', interaction),
+    );
+    return;
+  }
+  if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageWebhooks)) {
+    await interaction.reply(reply('Manage Webhooks permission is required.', interaction));
+    return;
+  }
+
+  const destination = interaction.options.getChannel('channel', true);
+  const destinationGuildId =
+    'guildId' in destination && typeof destination.guildId === 'string'
+      ? destination.guildId
+      : 'guild_id' in destination && typeof destination.guild_id === 'string'
+        ? destination.guild_id
+        : undefined;
+  if (
+    destinationGuildId !== interaction.guildId ||
+    (destination.type !== ChannelType.GuildText &&
+      destination.type !== ChannelType.GuildAnnouncement) ||
+    !('createWebhook' in destination)
+  ) {
+    await interaction.reply(
+      reply('Choose a text or announcement channel in this server.', interaction),
+    );
+    return;
+  }
+
+  const destinationChannel = destination as TextChannel;
+  const callerPermissions = destinationChannel.permissionsFor(interaction.user.id);
+  if (
+    !callerPermissions?.has(PermissionFlagsBits.ViewChannel) ||
+    !callerPermissions.has(PermissionFlagsBits.ManageWebhooks)
+  ) {
+    await interaction.reply(
+      reply(
+        'You need View Channel and Manage Webhooks in the monitoring destination.',
+        interaction,
+      ),
+    );
+    return;
+  }
+  const botMember = interaction.guild?.members.me;
+  const botPermissions = botMember ? destinationChannel.permissionsFor(botMember) : undefined;
+  if (
+    !botPermissions?.has(PermissionFlagsBits.ViewChannel) ||
+    !botPermissions.has(PermissionFlagsBits.ManageWebhooks)
+  ) {
+    await interaction.reply(
+      reply(
+        'The bot needs View Channel and Manage Webhooks in the monitoring destination.',
+        interaction,
+      ),
+    );
+    return;
+  }
+
+  // Acquire the cross-process lease before the first await on the valid setup
+  // path. A concurrent clear can now tombstone this lease even while Discord's
+  // interaction acknowledgement is blocked.
+  let provisioning: ChannelWebhookProvisioning;
+  try {
+    provisioning = beginChannelWebhookProvisioning({
+      channel_jid: channel.jid,
+      destination_channel_id: destination.id,
+      destination_channel_name: destination.name,
+      webhook_name: buildWebhookName(channel.name),
+    });
+  } catch (error) {
+    logger.warn(
+      { jid: channel.jid, ...safeDiscordErrorMetadata(error) },
+      'Monitoring webhook provisioning could not start',
+    );
+    throw webhookCommandError(
+      'Webhook setup could not start. Another setup or cleanup may be active; run /pi webhook-clear to inspect it.',
+    );
+  }
+
+  try {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  } catch {
+    // No Discord create request has been issued, so this lease is safe to
+    // cancel. cancelChannelWebhookProvisioning refuses reconciled tombstones.
+    if (canMutateWebhookDb()) cancelChannelWebhookProvisioning(provisioning.lease_id);
+    throw webhookCommandError('Discord did not acknowledge webhook setup. Try again.');
+  }
+  if (!canMutateWebhookDb()) return;
+
+  // This is the durable side-effect boundary. There must be no await between
+  // this compare-and-set and invoking createWebhook below.
+  if (!markChannelWebhookCreateRequestIssued(provisioning.lease_id)) {
+    throw webhookCommandError(
+      'Webhook setup was canceled before creation. Monitoring remains disabled.',
+    );
+  }
+
+  const oldWebhookDeleted = await (async (): Promise<boolean | undefined> => {
+    let webhook: Awaited<ReturnType<TextChannel['createWebhook']>>;
+    try {
+      webhook = await destinationChannel.createWebhook({
+        name: provisioning.webhook_name,
+        reason: `Pi activity monitoring configured by Discord user ${interaction.user.id}`,
+      });
+    } catch (error) {
+      if (!canMutateWebhookDb()) return undefined;
+      const definitive = isDefinitiveWebhookCreateRejection(error);
+      // A concrete Discord 4xx response (other than timeout/rate limiting)
+      // proves this POST did not create a remote webhook. An independently
+      // observed reconciliation target still wins and keeps cleanup pending.
+      const leaseReleased =
+        definitive && completeDefinitiveChannelWebhookCreateRejection(provisioning.lease_id);
+      logger.warn(
+        {
+          jid: channel.jid,
+          destinationChannelId: destination.id,
+          ...safeDiscordErrorMetadata(error),
+        },
+        leaseReleased
+          ? 'Discord rejected monitoring webhook creation'
+          : 'Webhook creation outcome or reconciliation is unresolved; cleanup remains pending',
+      );
+      throw leaseReleased
+        ? webhookCommandError(
+            'Discord rejected webhook creation. Check destination permissions and try again.',
+          )
+        : cleanupPendingError();
+    }
+
+    if (!canMutateWebhookDb()) return undefined;
+    if (!webhook.token) {
+      // The remote webhook ID is the only durable recovery handle available
+      // without a token. Claim reconciliation and persist the ID before DELETE
+      // so a crash after Discord accepts deletion is recoverable from an empty
+      // destination snapshot on the next /pi webhook-clear.
+      const claimed = claimChannelWebhookProvisioningReconciliation(
+        provisioning.lease_id,
+        Date.now(),
+        true,
+      );
+      const targets = claimed?.reconciling
+        ? recordChannelWebhookReconciliationTargets(provisioning.lease_id, [webhook.id])
+        : [];
+      if (targets.length === 0) {
+        logger.warn(
+          { jid: channel.jid, destinationChannelId: destination.id },
+          'Could not persist tokenless webhook cleanup target',
+        );
+        throw cleanupPendingError();
+      }
+
+      const deleted = await deleteWebhookObject(
+        webhook,
+        'Webhook creation returned no usable token',
+        channel.jid,
+        destination.id,
+      );
+      if (!canMutateWebhookDb()) return undefined;
+      if (deleted) {
+        completeChannelWebhookProvisioningReconciliation(provisioning.lease_id, targets);
+      }
+      throw webhookCommandError(
+        deleted
+          ? 'Discord created a webhook without a usable token, so it was deleted.'
+          : 'Discord created a webhook without a usable token. Webhook cleanup is pending; run /pi webhook-clear in this channel to retry.',
+      );
+    }
+
+    const createdConfig: ChannelWebhookConfig = {
+      channel_jid: channel.jid,
+      destination_channel_id: destination.id,
+      destination_channel_name: destination.name,
+      webhook_id: webhook.id,
+      webhook_token: webhook.token,
+    };
+    let previous: ChannelWebhookConfig | undefined;
+    try {
+      if (!recordChannelWebhookCreated(provisioning.lease_id, createdConfig)) {
+        throw new Error('Monitoring webhook setup lease expired before activation.');
+      }
+
+      await webhook.send({
+        content: `✅ Pi activity monitoring enabled for **${escapeDiscordMarkdown(channel.name)}**.`,
+        allowedMentions: { parse: [] },
+      });
+      if (!canMutateWebhookDb()) return undefined;
+      ({ previous } = activateChannelWebhookProvisioning(provisioning.lease_id));
+    } catch (error) {
+      if (!canMutateWebhookDb()) return undefined;
+      logger.warn(
+        {
+          jid: channel.jid,
+          destinationChannelId: destination.id,
+          ...safeDiscordErrorMetadata(error),
+        },
+        'Monitoring webhook validation or activation failed',
+      );
+      const deleted = await deleteWebhookObject(
+        webhook,
+        'Rolling back failed Pi monitoring setup',
+        channel.jid,
+        destination.id,
+      );
+      if (!canMutateWebhookDb()) return undefined;
+      if (deleted) {
+        completeChannelWebhookProvisioningRollback(provisioning.lease_id, createdConfig.webhook_id);
+      } else {
+        // This stores the returned token even if activation failed or the
+        // source vanished, allowing /pi webhook-clear to retry deletion.
+        queueChannelWebhookProvisioningCleanup(provisioning.lease_id, createdConfig);
+      }
+      throw deleted
+        ? webhookCommandError(
+            'Webhook setup failed and the created webhook was removed. Try again.',
+          )
+        : cleanupPendingError();
+    }
+
+    // Activation is complete at this point. Cleanup failures for the previous
+    // epoch must not roll back or delete the newly active webhook.
+    if (!previous || previous.webhook_id === webhook.id) return true;
+    await retireWebhookTrace(channel.jid, previous.webhook_id);
+    if (!canMutateWebhookDb()) return undefined;
+    const deleted = await deleteDiscordWebhook(previous, 'Pi monitoring destination replaced');
+    if (!canMutateWebhookDb()) return undefined;
+    if (deleted) completeWebhookCleanup(previous.webhook_id);
+    return deleted;
+  })();
+
+  if (oldWebhookDeleted === undefined || !canMutateWebhookDb()) return;
+  logger.info(
+    { jid: channel.jid, destinationChannelId: destination.id },
+    'Channel monitoring webhook configured',
+  );
+  await interaction.editReply({
+    content: `Pi activity for this channel will be sent to <#${destination.id}>.${
+      oldWebhookDeleted
+        ? ''
+        : '\n⚠️ Cleanup of the previous Discord webhook is pending. Run /pi webhook-clear to retry; note that it also disables the currently active monitoring webhook.'
+    }`,
+  });
+}
+
+async function handleWebhookClear(interaction: ChatInputCommandInteraction): Promise<void> {
+  if (!interaction.inGuild()) {
+    await interaction.reply(
+      reply('Monitoring webhooks can only be configured in a server.', interaction),
+    );
+    return;
+  }
+  if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageWebhooks)) {
+    await interaction.reply(reply('Manage Webhooks permission is required.', interaction));
+    return;
+  }
+
+  const channelJid = `dc:${interaction.channelId}`;
+  const channel = getChannel(channelJid);
+  const hasWebhookLifecycle =
+    Boolean(getChannelWebhook(channelJid)) ||
+    Boolean(getChannelWebhookProvisioning(channelJid)) ||
+    getPendingWebhookCleanup(channelJid).length > 0;
+  if (!channel && !hasWebhookLifecycle) {
+    await interaction.reply(reply(notRegisteredMessage(), interaction));
+    return;
+  }
+
+  // This durable transition deliberately happens before defer/network awaits
+  // and outside the process-local setup lock. It disables routing immediately
+  // and prevents even a fresh or hung creator from activating later.
+  const clearStart = beginChannelWebhookClear(channelJid);
+  discardWebhookTrace(channelJid);
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  if (!canMutateWebhookDb()) return;
+  const pendingBefore = getPendingWebhookCleanup(channelJid);
+
+  // Credential cleanup is independent of name-based provisioning recovery.
+  // A failed/empty provisioning scan must never reactivate the old epoch.
+  for (const webhook of pendingBefore) {
+    const deleted = await deleteDiscordWebhook(webhook, 'Pi activity monitoring disabled');
+    if (!canMutateWebhookDb()) return;
+    if (deleted) completeWebhookCleanup(webhook.webhook_id);
+  }
+
+  const reconciliation = await reconcileWebhookProvisioning(interaction, channelJid);
+  if (!canMutateWebhookDb() || reconciliation === 'stopped') return;
+  const remaining = getPendingWebhookCleanup(channelJid);
+  const hasLifecycle = Boolean(getChannelWebhookProvisioning(channelJid));
+  const result =
+    !clearStart.removed &&
+    pendingBefore.length === 0 &&
+    !clearStart.provisioning &&
+    reconciliation === 'none' &&
+    !hasLifecycle
+      ? undefined
+      : {
+          removed: clearStart.removed,
+          remaining,
+          reconciliation,
+          hasLifecycle,
+        };
+  if (!result) {
+    await interaction.editReply({
+      content: 'No monitoring webhook is configured for this channel.',
+    });
+    return;
+  }
+
+  const provisioningPending =
+    result.reconciliation === 'uncertain' ||
+    result.reconciliation === 'retry' ||
+    result.hasLifecycle;
+  if (result.reconciliation === 'uncertain') {
+    logger.warn({ jid: channelJid }, 'Webhook creation is still uncertain; locator retained');
+  }
+  logger.info(
+    {
+      jid: channelJid,
+      pendingCleanup: result.remaining.length,
+      provisioningPending,
+    },
+    'Channel monitoring webhook cleared',
+  );
+
+  const pendingParts: string[] = [];
+  if (result.remaining.length > 0) {
+    pendingParts.push(
+      `${result.remaining.length} webhook cleanup ${
+        result.remaining.length === 1 ? 'attempt remains' : 'attempts remain'
+      }`,
+    );
+  }
+  if (provisioningPending) {
+    pendingParts.push(
+      result.reconciliation === 'uncertain'
+        ? 'the interrupted setup cleanup status remains uncertain because Discord did not list the webhook yet; the recovery locator was retained'
+        : 'interrupted setup cleanup remains pending; verify the destination and permissions',
+    );
+  }
+
+  await interaction.editReply({
+    content:
+      pendingParts.length > 0
+        ? `Pi activity monitoring is disabled. ⚠️ ${pendingParts.join(
+            '; ',
+          )}. Inspect the destination if needed, then run /pi webhook-clear again to retry.`
+        : result.reconciliation === 'recovered'
+          ? 'Pi activity monitoring is disabled. Interrupted webhook setup was recovered and the Discord webhook was deleted.'
+          : 'Pi activity monitoring is disabled and the Discord webhook was deleted.',
+  });
+}
+
+type ProvisioningReconciliation =
+  'none' | 'queued' | 'recovered' | 'uncertain' | 'retry' | 'stopped';
+
+async function reconcileWebhookProvisioning(
+  interaction: ChatInputCommandInteraction,
+  channelJid: string,
+): Promise<ProvisioningReconciliation> {
+  let provisioning = getChannelWebhookProvisioning(channelJid);
+  if (!provisioning) return 'none';
+
+  if (provisioning.state === 'created') {
+    queueChannelWebhookProvisioningCleanup(provisioning.lease_id, provisioningConfig(provisioning));
+    return 'queued';
+  }
+  if (!isChannelWebhookProvisioningStale(provisioning)) {
+    throw webhookCommandError(
+      'Monitoring webhook setup is still in progress. Wait, then try again.',
+    );
+  }
+
+  // Claim the stale lease before the first remote await. This durable tombstone
+  // prevents a creator in another process from activating while reconciliation
+  // inspects or deletes the remote webhook.
+  provisioning = claimChannelWebhookProvisioningReconciliation(provisioning.lease_id);
+  if (!provisioning) return 'none';
+  if (provisioning.state === 'created') {
+    queueChannelWebhookProvisioningCleanup(provisioning.lease_id, provisioningConfig(provisioning));
+    return 'queued';
+  }
+  if (provisioning.reconciling !== 1) {
+    throw webhookCommandError(
+      'Monitoring webhook setup is still in progress. Wait, then try again.',
+    );
+  }
+
+  let destination: Awaited<ReturnType<typeof interaction.client.channels.fetch>>;
+  try {
+    destination = await interaction.client.channels.fetch(provisioning.destination_channel_id);
+  } catch (error) {
+    if (!canMutateWebhookDb()) return 'stopped';
+    logWebhookReconciliationFailure(provisioning, error, 'destination_fetch_failed');
+    return 'retry';
+  }
+  if (!canMutateWebhookDb()) return 'stopped';
+  if (!destination || !('fetchWebhooks' in destination)) {
+    logger.warn(
+      {
+        jid: provisioning.channel_jid,
+        destinationChannelId: provisioning.destination_channel_id,
+        reason: destination ? 'unsupported_destination' : 'missing_destination',
+      },
+      'Could not inspect interrupted monitoring webhook; cleanup remains pending',
+    );
+    return 'retry';
+  }
+
+  let webhooks: Awaited<ReturnType<typeof destination.fetchWebhooks>>;
+  try {
+    webhooks = await destination.fetchWebhooks();
+  } catch (error) {
+    if (!canMutateWebhookDb()) return 'stopped';
+    logWebhookReconciliationFailure(provisioning, error, 'webhook_fetch_failed');
+    return 'retry';
+  }
+  if (!canMutateWebhookDb()) return 'stopped';
+  const priorTargets = getChannelWebhookReconciliationTargets(provisioning.lease_id);
+  const priorTargetSet = new Set(priorTargets);
+  const matches = [...webhooks.values()].filter(
+    (webhook) =>
+      webhook.name === provisioning.webhook_name ||
+      (typeof webhook.id === 'string' && priorTargetSet.has(webhook.id)),
+  );
+  if (matches.length === 0) {
+    if (priorTargets.length > 0) {
+      // A prior attempt durably observed these IDs before issuing DELETE. Their
+      // absence now is positive retry evidence that they are gone.
+      completeChannelWebhookProvisioningReconciliation(provisioning.lease_id, priorTargets);
+      return 'recovered';
+    }
+    // Absence from the first snapshot cannot prove that an uncertain POST will
+    // not appear later. Keep the reconciling tombstone indefinitely.
+    return 'uncertain';
+  }
+
+  const matchIds = matches.flatMap((webhook) =>
+    typeof webhook.id === 'string' ? [webhook.id] : [],
+  );
+  if (matchIds.length !== matches.length) {
+    logger.warn(
+      {
+        jid: provisioning.channel_jid,
+        destinationChannelId: provisioning.destination_channel_id,
+        reason: 'webhook_id_missing',
+      },
+      'Could not finish interrupted monitoring webhook cleanup',
+    );
+    return 'retry';
+  }
+  const reconciliationTargets = recordChannelWebhookReconciliationTargets(
+    provisioning.lease_id,
+    matchIds,
+  );
+  if (reconciliationTargets.length === 0) return 'retry';
+
+  for (const webhook of matches) {
+    const deleted = await deleteWebhookObject(
+      webhook,
+      'Recovering interrupted Pi monitoring setup',
+      provisioning.channel_jid,
+      provisioning.destination_channel_id,
+    );
+    if (!canMutateWebhookDb()) return 'stopped';
+    if (!deleted) return 'retry';
+  }
+
+  completeChannelWebhookProvisioningReconciliation(provisioning.lease_id, reconciliationTargets);
+  return 'recovered';
+}
+
+function logWebhookReconciliationFailure(
+  provisioning: ChannelWebhookProvisioning,
+  error: unknown,
+  reason: string,
+): void {
+  logger.warn(
+    {
+      jid: provisioning.channel_jid,
+      destinationChannelId: provisioning.destination_channel_id,
+      reason,
+      ...safeDiscordErrorMetadata(error),
+    },
+    'Could not inspect interrupted monitoring webhook; cleanup remains pending',
+  );
+}
+
+async function deleteWebhookObject(
+  webhook: { delete(reason?: string): Promise<unknown> },
+  reason: string,
+  channelJid: string,
+  destinationChannelId: string,
+): Promise<boolean> {
+  try {
+    await webhook.delete(reason);
+    return true;
+  } catch (error) {
+    if (isDiscordUnknownWebhookError(error)) return true;
+    logger.warn(
+      {
+        jid: channelJid,
+        destinationChannelId,
+        ...safeDiscordErrorMetadata(error),
+      },
+      'Failed to roll back Discord monitoring webhook; cleanup remains pending',
+    );
+    return false;
+  }
+}
+
+export function isDefinitiveWebhookCreateRejection(error: unknown): boolean {
+  if (!(error instanceof DiscordAPIError)) return false;
+  return error.status >= 400 && error.status < 500 && error.status !== 408 && error.status !== 429;
+}
+
+function cleanupPendingError(): WebhookCommandError {
+  return webhookCommandError(
+    'Webhook setup did not complete. Cleanup is pending; run /pi webhook-clear in this channel to retry.',
+  );
+}
+
+function provisioningConfig(provisioning: ChannelWebhookProvisioning): ChannelWebhookConfig {
+  if (!provisioning.webhook_id || !provisioning.webhook_token) {
+    throw webhookCommandError('Interrupted webhook setup has no stored credentials.');
+  }
+  return {
+    channel_jid: provisioning.channel_jid,
+    destination_channel_id: provisioning.destination_channel_id,
+    destination_channel_name: provisioning.destination_channel_name,
+    webhook_id: provisioning.webhook_id,
+    webhook_token: provisioning.webhook_token,
+  };
+}
+
+function buildWebhookName(sourceName: string): string {
+  const compact = sourceName.replace(/[\r\n]/gu, ' ').trim() || 'channel';
+  return `ぴーこ monitor · ${compact}`.slice(0, 80);
+}
+
+function escapeDiscordMarkdown(text: string): string {
+  const markdownCharacters = new Set('\\`*_{}[]()<>#+-.!|');
+  return [...text]
+    .map((character) => (markdownCharacters.has(character) ? `\\${character}` : character))
+    .join('');
+}
+
 async function handleStatus(interaction: ChatInputCommandInteraction): Promise<void> {
   const channel = ensureManagedChannel(interaction);
   if (!channel) {
@@ -269,7 +972,9 @@ async function handleStatus(interaction: ChatInputCommandInteraction): Promise<v
 
   const effective = computeEffectiveChannelSettings(channel);
   const sessionStatus = await getChannelSessionStatus(channel.folder, effective.effectiveCwd);
-  await interaction.editReply({ content: buildStatusMessage(effective, sessionStatus) });
+  await interaction.editReply({
+    content: buildStatusMessage(channel.jid, effective, sessionStatus),
+  });
 }
 
 async function handleModelSet(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -409,13 +1114,21 @@ function notRegisteredMessage(): string {
 }
 
 function buildStatusMessage(
+  channelJid: string,
   effective: EffectiveChannelSettings,
   sessionStatus: ChannelSessionStatus,
 ): string {
+  const webhook = getChannelWebhook(channelJid);
   const rows: Array<[string, string]> = [
     ['Model', formatModelValue(effective)],
     ['Thinking', formatThinkingValue(effective)],
     ['Working dir', formatWorkingDirValue(effective)],
+    [
+      'Webhook',
+      webhook
+        ? `#${webhook.destination_channel_name} (${webhook.destination_channel_id})`
+        : 'disabled',
+    ],
   ];
 
   if (effective.thinkingAdjusted) {
