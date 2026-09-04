@@ -335,7 +335,8 @@ describe('webhook slash commands', () => {
       expect(unrelatedDelete).not.toHaveBeenCalled();
       expect(db.getChannelWebhookProvisioning('dc:source')).toBeUndefined();
       expect(editReply).toHaveBeenCalledWith({
-        content: 'Interrupted webhook setup was recovered and the Discord webhook was deleted.',
+        content:
+          'Pi activity monitoring is disabled. Interrupted webhook setup was recovered and the Discord webhook was deleted.',
       });
     } finally {
       db.closeDb();
@@ -783,7 +784,8 @@ describe('webhook slash commands', () => {
       expect(remoteDelete).toHaveBeenCalledWith('Recovering interrupted Pi monitoring setup');
       expect(db.getChannelWebhookProvisioning('dc:source')).toBeUndefined();
       expect(editReply).toHaveBeenCalledWith({
-        content: 'Interrupted webhook setup was recovered and the Discord webhook was deleted.',
+        content:
+          'Pi activity monitoring is disabled. Interrupted webhook setup was recovered and the Discord webhook was deleted.',
       });
     } finally {
       db.closeDb();
@@ -799,6 +801,8 @@ describe('webhook slash commands', () => {
 
     const db = await import('../src/db.js');
     const { handleChatCommand } = await import('../src/discord/slash-commands.js');
+    const { enqueueWebhookTrace, webhookMonitorStats } =
+      await import('../src/discord/webhook-monitor.js');
     db.initDb();
     db.registerChannel({
       jid: 'dc:source',
@@ -809,6 +813,13 @@ describe('webhook slash commands', () => {
       modelOverride: '',
       thinkingOverride: '',
       cwdOverride: '',
+    });
+    db.setChannelWebhook({
+      channel_jid: 'dc:source',
+      destination_channel_id: 'old-monitor',
+      destination_channel_name: 'old monitoring',
+      webhook_id: 'old-active',
+      webhook_token: 'old-token',
     });
     const lease = db.beginChannelWebhookProvisioning(
       {
@@ -846,6 +857,9 @@ describe('webhook slash commands', () => {
 
     try {
       await handleChatCommand(interaction as any);
+      expect(db.getChannelWebhook('dc:source')).toBeUndefined();
+      enqueueWebhookTrace('dc:source', 'must not route after clear');
+      expect(webhookMonitorStats('dc:source').states).toBe(0);
       expect(db.getChannelWebhookProvisioning('dc:source')?.lease_id).toBe(lease.lease_id);
       expect(() => db.unregisterChannel('dc:source')).toThrow(/active setup/);
       expect(editReply).toHaveBeenLastCalledWith({
@@ -1054,7 +1068,8 @@ describe('webhook slash commands', () => {
       expect(reconcilerDb.getChannelWebhookProvisioning('dc:source')).toBeUndefined();
       expect(reconcilerDb.getPendingWebhookCleanup('dc:source')).toEqual([]);
       expect(editReply).toHaveBeenCalledWith({
-        content: 'Interrupted webhook setup was recovered and the Discord webhook was deleted.',
+        content:
+          'Pi activity monitoring is disabled. Interrupted webhook setup was recovered and the Discord webhook was deleted.',
       });
     } finally {
       reconcilerDb.closeDb();
@@ -1134,7 +1149,7 @@ describe('webhook slash commands', () => {
         reconciliation_webhook_ids: '["observed-webhook"]',
       });
       expect(editReply).toHaveBeenLastCalledWith({
-        content: expect.stringContaining('Cleanup remains pending'),
+        content: expect.stringContaining('cleanup remains pending'),
       });
 
       // Simulate a new process retry after the prior DELETE may have succeeded
@@ -1143,7 +1158,8 @@ describe('webhook slash commands', () => {
       await handleChatCommand(interaction as any);
       expect(db.getChannelWebhookProvisioning('dc:source')).toBeUndefined();
       expect(editReply).toHaveBeenCalledWith({
-        content: 'Interrupted webhook setup was recovered and the Discord webhook was deleted.',
+        content:
+          'Pi activity monitoring is disabled. Interrupted webhook setup was recovered and the Discord webhook was deleted.',
       });
     } finally {
       db.closeDb();
@@ -1158,6 +1174,8 @@ describe('webhook slash commands', () => {
 
     const db = await import('../src/db.js');
     const { handleChatCommand } = await import('../src/discord/slash-commands.js');
+    const { enqueueWebhookTrace, webhookMonitorStats } =
+      await import('../src/discord/webhook-monitor.js');
     const { logger } = await import('../src/logger.js');
     db.initDb();
     db.registerChannel({
@@ -1169,6 +1187,13 @@ describe('webhook slash commands', () => {
       modelOverride: '',
       thinkingOverride: '',
       cwdOverride: '',
+    });
+    db.setChannelWebhook({
+      channel_jid: 'dc:source',
+      destination_channel_id: 'old-monitor',
+      destination_channel_name: 'old monitoring',
+      webhook_id: 'old-active',
+      webhook_token: 'old-token',
     });
     const lease = db.beginChannelWebhookProvisioning(
       {
@@ -1210,9 +1235,12 @@ describe('webhook slash commands', () => {
       for (let attempt = 0; attempt < 4; attempt += 1) {
         editReply.mockClear();
         await handleChatCommand(interaction as any);
+        expect(db.getChannelWebhook('dc:source')).toBeUndefined();
+        enqueueWebhookTrace('dc:source', 'must not route after failed inspection');
+        expect(webhookMonitorStats('dc:source').states).toBe(0);
         expect(editReply).toHaveBeenCalledWith({
           content: expect.stringContaining(
-            'Cleanup remains pending; verify the destination and permissions, then run /pi webhook-clear',
+            'cleanup remains pending; verify the destination and permissions',
           ),
         });
         expect(db.getChannelWebhookProvisioning('dc:source')).toMatchObject({
@@ -1223,6 +1251,108 @@ describe('webhook slash commands', () => {
       expect(fetch).toHaveBeenCalledTimes(4);
       expect(JSON.stringify(warn.mock.calls)).not.toContain(leaked);
       expect(JSON.stringify(editReply.mock.calls)).not.toContain(leaked);
+    } finally {
+      db.closeDb();
+    }
+  });
+
+  it('recovers a tokenless create when deletion commits before its response is lost', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'piscord-slash-webhook-tokenless-'));
+    tempDirs.push(tempDir);
+    process.env.DB_PATH = join(tempDir, 'gateway.db');
+    process.env.PIDG_CONFIG = resolve(tempDir, 'missing.env');
+
+    const db = await import('../src/db.js');
+    const { handleChatCommand } = await import('../src/discord/slash-commands.js');
+    const { ChannelType } = await import('discord.js');
+    db.initDb();
+    db.registerChannel({
+      jid: 'dc:source',
+      name: 'source',
+      folder: 'ch_source',
+      requiresTrigger: false,
+      isMain: false,
+      modelOverride: '',
+      thinkingOverride: '',
+      cwdOverride: '',
+    });
+
+    let remoteExists = true;
+    let leaseId = '';
+    const remoteDelete = vi.fn().mockImplementation(async () => {
+      const provisioning = db.getChannelWebhookProvisioning('dc:source');
+      expect(provisioning).toMatchObject({ reconciling: 1 });
+      leaseId = provisioning!.lease_id;
+      expect(db.getChannelWebhookReconciliationTargets(leaseId)).toEqual(['tokenless-id']);
+      remoteExists = false;
+      // Discord committed DELETE, but the response was lost. The durable ID
+      // must let a restarted process interpret the next empty snapshot.
+      throw new Error('socket closed after delete commit hidden-secret');
+    });
+    const createWebhook = vi.fn().mockResolvedValue({
+      id: 'tokenless-id',
+      token: null,
+      delete: remoteDelete,
+    });
+    const destination = {
+      id: 'monitor',
+      name: 'monitoring',
+      guildId: 'guild-1',
+      type: ChannelType.GuildText,
+      createWebhook,
+      permissionsFor: vi.fn().mockReturnValue({ has: () => true }),
+    };
+    const editReply = vi.fn().mockResolvedValue(undefined);
+    const baseInteraction = {
+      commandName: 'pi',
+      channelId: 'source',
+      guildId: 'guild-1',
+      guild: { members: { me: { id: 'bot' } } },
+      user: { id: 'admin' },
+      memberPermissions: { has: () => true },
+      inGuild: () => true,
+      deferReply: vi.fn().mockResolvedValue(undefined),
+      editReply,
+      reply: vi.fn().mockResolvedValue(undefined),
+      followUp: vi.fn().mockResolvedValue(undefined),
+      replied: false,
+      deferred: true,
+    };
+
+    try {
+      await handleChatCommand({
+        ...baseInteraction,
+        options: { getSubcommand: () => 'webhook', getChannel: () => destination },
+      } as any);
+      expect(remoteDelete).toHaveBeenCalledWith('Webhook creation returned no usable token');
+      expect(remoteExists).toBe(false);
+      expect(db.getChannelWebhookProvisioning('dc:source')).toMatchObject({
+        lease_id: leaseId,
+        reconciling: 1,
+        reconciliation_webhook_ids: '["tokenless-id"]',
+      });
+      expect(JSON.stringify(editReply.mock.calls)).not.toContain('hidden-secret');
+
+      db.closeDb();
+      db.initDb();
+      editReply.mockClear();
+      await handleChatCommand({
+        ...baseInteraction,
+        options: { getSubcommand: () => 'webhook-clear' },
+        client: {
+          channels: {
+            fetch: vi.fn().mockResolvedValue({
+              fetchWebhooks: vi.fn().mockResolvedValue(new Map()),
+            }),
+          },
+        },
+      } as any);
+
+      expect(db.getChannelWebhookProvisioning('dc:source')).toBeUndefined();
+      expect(editReply).toHaveBeenCalledWith({
+        content:
+          'Pi activity monitoring is disabled. Interrupted webhook setup was recovered and the Discord webhook was deleted.',
+      });
     } finally {
       db.closeDb();
     }

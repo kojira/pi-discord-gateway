@@ -220,7 +220,7 @@ Most users won't need to edit this file directly — `piscord setup` generates i
 | `PI_CWD`                           | `$HOME`                         | Default working directory for pi; can be overridden per registered channel |
 | `PI_EXTRA_FLAGS`                   | _(none)_                        | Extra flags passed to pi                                                   |
 | `TRIGGER_NAME`                     | `pi`                            | Bot trigger name for @mentions                                             |
-| `CHANNEL_POLICY`                   | `open`                          | Channel access: `open`, `open-trigger`, or `allowlist`                     |
+| `CHANNEL_POLICY`                   | `allowlist`                     | Channel access: `open`, `open-trigger`, or `allowlist`                     |
 | `EXCLUDED_CHANNELS`                | _(none)_                        | Comma-separated channel IDs to exclude from auto-registration              |
 | `MAX_CONCURRENCY`                  | `3`                             | Max parallel pi invocations                                                |
 | `MAX_SCHEDULED_CONCURRENCY`        | `1`                             | Max scheduled tasks enqueued per tick                                      |

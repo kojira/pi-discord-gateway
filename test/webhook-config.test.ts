@@ -59,7 +59,7 @@ describe('per-channel webhook configuration', () => {
         }),
       ).toThrow(/already in progress/);
       expect(() => db.unregisterChannel('dc:source')).toThrow(/active setup/);
-      expect(() => db.clearChannelWebhook('dc:source')).toThrow(/still in progress/);
+      expect(db.clearChannelWebhook('dc:source')).toBeUndefined();
       expect(
         db.isChannelWebhookProvisioningStale(lease, 1_000 + db.WEBHOOK_PROVISIONING_LEASE_MS),
       ).toBe(true);

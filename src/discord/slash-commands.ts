@@ -456,16 +456,38 @@ async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promi
     }
 
     if (!webhook.token) {
+      // The remote webhook ID is the only durable recovery handle available
+      // without a token. Claim reconciliation and persist the ID before DELETE
+      // so a crash after Discord accepts deletion is recoverable from an empty
+      // destination snapshot on the next /pi webhook-clear.
+      const claimed = claimChannelWebhookProvisioningReconciliation(
+        provisioning.lease_id,
+        Date.now(),
+        true,
+      );
+      const targets = claimed?.reconciling
+        ? recordChannelWebhookReconciliationTargets(provisioning.lease_id, [webhook.id])
+        : [];
+      if (targets.length === 0) {
+        logger.warn(
+          { jid: channel.jid, destinationChannelId: destination.id },
+          'Could not persist tokenless webhook cleanup target',
+        );
+        throw cleanupPendingError();
+      }
+
       const deleted = await deleteWebhookObject(
         webhook,
         'Webhook creation returned no usable token',
         channel.jid,
         destination.id,
       );
-      if (deleted) cancelChannelWebhookProvisioning(provisioning.lease_id);
+      if (deleted) {
+        completeChannelWebhookProvisioningReconciliation(provisioning.lease_id, targets);
+      }
       throw webhookCommandError(
         deleted
-          ? 'Discord created a webhook without a usable token.'
+          ? 'Discord created a webhook without a usable token, so it was deleted.'
           : 'Discord created a webhook without a usable token. Webhook cleanup is pending; run /pi webhook-clear in this channel to retry.',
       );
     }
@@ -564,38 +586,39 @@ async function handleWebhookClear(interaction: ChatInputCommandInteraction): Pro
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const result = await withWebhookConfigLock(channelJid, async () => {
-    const reconciliation = await reconcileWebhookProvisioning(interaction, channelJid);
-    if (reconciliation === 'uncertain' || reconciliation === 'retry') {
-      return {
-        removed: undefined,
-        remaining: [],
-        uncertain: reconciliation === 'uncertain',
-        retry: reconciliation === 'retry',
-        recovered: false,
-      };
-    }
-
-    // Remove active routing first, but retain the credential in the cleanup
-    // table until Discord confirms remote deletion. Re-running this command
-    // retries every failed cleanup for the source channel, including cleanup
-    // left by a late creator after that source was unregistered.
+    // This is the first mutation under the command lock. It atomically removes
+    // active routing and retains the credential for deletion even when an
+    // interrupted replacement provisioning record also exists.
     const removed = clearChannelWebhook(channelJid);
-    const pending = getPendingWebhookCleanup(channelJid);
-    if (!removed && pending.length === 0 && reconciliation !== 'recovered') return undefined;
+    const pendingBefore = getPendingWebhookCleanup(channelJid);
+    const provisioningBefore = getChannelWebhookProvisioning(channelJid);
+    if (removed) await retireWebhookTrace(channelJid, removed.webhook_id);
 
-    for (const webhook of pending) {
-      await retireWebhookTrace(channelJid, webhook.webhook_id);
+    // Credential cleanup is independent of name-based provisioning recovery.
+    // A failed/empty provisioning scan must never leave the old active epoch
+    // forwarding or prevent deletion attempts for known webhook credentials.
+    for (const webhook of pendingBefore) {
+      if (!removed || webhook.webhook_id !== removed.webhook_id) {
+        await retireWebhookTrace(channelJid, webhook.webhook_id);
+      }
       if (await deleteDiscordWebhook(webhook, 'Pi activity monitoring disabled')) {
         completeWebhookCleanup(webhook.webhook_id);
       }
     }
-    return {
-      removed,
-      remaining: getPendingWebhookCleanup(channelJid),
-      uncertain: false,
-      retry: false,
-      recovered: reconciliation === 'recovered',
-    };
+
+    const reconciliation = await reconcileWebhookProvisioning(interaction, channelJid);
+    const remaining = getPendingWebhookCleanup(channelJid);
+    const hasLifecycle = Boolean(getChannelWebhookProvisioning(channelJid));
+    if (
+      !removed &&
+      pendingBefore.length === 0 &&
+      !provisioningBefore &&
+      reconciliation === 'none' &&
+      !hasLifecycle
+    ) {
+      return undefined;
+    }
+    return { removed, remaining, reconciliation, hasLifecycle };
   });
   if (!result) {
     await interaction.editReply({
@@ -604,31 +627,47 @@ async function handleWebhookClear(interaction: ChatInputCommandInteraction): Pro
     return;
   }
 
-  if (result.uncertain || result.retry) {
-    if (result.uncertain) {
-      logger.warn({ jid: channelJid }, 'Webhook creation is still uncertain; locator retained');
-    }
-    await interaction.editReply({
-      content: result.uncertain
-        ? '⚠️ Discord did not list the interrupted webhook yet, so its cleanup status remains uncertain. The recovery locator was retained; inspect the destination and run /pi webhook-clear in this channel again.'
-        : '⚠️ The interrupted webhook could not be inspected or deleted. Cleanup remains pending; verify the destination and permissions, then run /pi webhook-clear in this channel again.',
-    });
-    return;
+  const provisioningPending =
+    result.reconciliation === 'uncertain' ||
+    result.reconciliation === 'retry' ||
+    result.hasLifecycle;
+  if (result.reconciliation === 'uncertain') {
+    logger.warn({ jid: channelJid }, 'Webhook creation is still uncertain; locator retained');
   }
-
   logger.info(
-    { jid: channelJid, pendingCleanup: result.remaining.length },
+    {
+      jid: channelJid,
+      pendingCleanup: result.remaining.length,
+      provisioningPending,
+    },
     'Channel monitoring webhook cleared',
   );
+
+  const pendingParts: string[] = [];
+  if (result.remaining.length > 0) {
+    pendingParts.push(
+      `${result.remaining.length} webhook cleanup ${
+        result.remaining.length === 1 ? 'attempt remains' : 'attempts remain'
+      }`,
+    );
+  }
+  if (provisioningPending) {
+    pendingParts.push(
+      result.reconciliation === 'uncertain'
+        ? 'the interrupted setup cleanup status remains uncertain because Discord did not list the webhook yet; the recovery locator was retained'
+        : 'interrupted setup cleanup remains pending; verify the destination and permissions',
+    );
+  }
+
   await interaction.editReply({
     content:
-      result.remaining.length === 0
-        ? result.recovered
-          ? 'Interrupted webhook setup was recovered and the Discord webhook was deleted.'
-          : 'Pi activity monitoring is disabled and the Discord webhook was deleted.'
-        : `Pi activity monitoring is disabled. ⚠️ ${result.remaining.length} webhook cleanup ${
-            result.remaining.length === 1 ? 'attempt failed' : 'attempts failed'
-          }; run /pi webhook-clear again to retry.`,
+      pendingParts.length > 0
+        ? `Pi activity monitoring is disabled. ⚠️ ${pendingParts.join(
+            '; ',
+          )}. Inspect the destination if needed, then run /pi webhook-clear again to retry.`
+        : result.reconciliation === 'recovered'
+          ? 'Pi activity monitoring is disabled. Interrupted webhook setup was recovered and the Discord webhook was deleted.'
+          : 'Pi activity monitoring is disabled and the Discord webhook was deleted.',
   });
 }
 

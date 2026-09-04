@@ -492,12 +492,13 @@ export function isChannelWebhookProvisioningStale(
 export function claimChannelWebhookProvisioningReconciliation(
   leaseId: string,
   now = Date.now(),
+  force = false,
 ): ChannelWebhookProvisioning | undefined {
   return db.transaction(() => {
     const current = selectWebhookProvisioningByLease(leaseId);
     if (!current) return undefined;
     if (current.state === 'created') return current;
-    if (!isChannelWebhookProvisioningStale(current, now)) return current;
+    if (!force && !isChannelWebhookProvisioningStale(current, now)) return current;
 
     db.prepare(
       `update channel_webhook_provisioning
@@ -597,18 +598,22 @@ export function setChannelWebhook(webhook: ChannelWebhookConfig): ChannelWebhook
   return result;
 }
 
-/** Disable trace routing while retaining credentials until remote deletion succeeds. */
+/**
+ * Atomically disable trace routing while retaining credentials until remote
+ * deletion succeeds. This intentionally works while provisioning is active:
+ * /pi webhook-clear must stop the old epoch before inspecting an interrupted
+ * replacement.
+ */
 export function clearChannelWebhook(channelJid: string): ChannelWebhookConfig | undefined {
-  return db.transaction(() => {
-    if (getChannelWebhookProvisioning(channelJid)) {
-      throw new Error('Monitoring webhook setup is still in progress.');
-    }
-    const existing = getChannelWebhook(channelJid);
-    if (!existing) return undefined;
-    insertPendingWebhookCleanup(existing);
+  const existing = db.transaction(() => {
+    const current = getChannelWebhook(channelJid);
+    if (!current) return undefined;
+    insertPendingWebhookCleanup(current);
     db.prepare('delete from channel_webhooks where channel_jid = ?').run(channelJid);
-    return existing;
+    return current;
   })();
+  hardenDatabaseFiles();
+  return existing;
 }
 
 export function getPendingWebhookCleanup(channelJid: string): ChannelWebhookConfig[] {
