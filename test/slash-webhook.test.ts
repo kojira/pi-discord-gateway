@@ -538,7 +538,7 @@ describe('webhook slash commands', () => {
     }
   });
 
-  it('retains the locator across an empty scan and guides cleanup after a late rollback failure', async () => {
+  it('force-claims a fresh cross-process create and blocks late activation', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
     const tempDir = mkdtempSync(join(tmpdir(), 'piscord-slash-webhook-late-create-'));
@@ -602,10 +602,7 @@ describe('webhook slash commands', () => {
     expect(createWebhook).toHaveBeenCalledOnce();
 
     // A second gateway process has an independent in-memory mutex while
-    // sharing the durable SQLite lease.
-    vi.setSystemTime(
-      new Date('2026-01-01T00:00:00Z').getTime() + firstDb.WEBHOOK_PROVISIONING_LEASE_MS + 1,
-    );
+    // sharing the durable SQLite lease. Clear must claim even this fresh lease.
     vi.resetModules();
     const secondDb = await import('../src/db.js');
     const secondCommands = await import('../src/discord/slash-commands.js');
@@ -698,6 +695,113 @@ describe('webhook slash commands', () => {
       secondDb.closeDb();
       firstDb.closeDb();
       vi.useRealTimers();
+    }
+  });
+
+  it('does not let a same-process hung create delay clear deactivation or response', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'piscord-slash-webhook-hung-create-clear-'));
+    tempDirs.push(tempDir);
+    process.env.DB_PATH = join(tempDir, 'gateway.db');
+    process.env.PIDG_CONFIG = resolve(tempDir, 'missing.env');
+
+    const db = await import('../src/db.js');
+    const { handleChatCommand } = await import('../src/discord/slash-commands.js');
+    const { enqueueWebhookTrace, webhookMonitorStats } =
+      await import('../src/discord/webhook-monitor.js');
+    const { ChannelType } = await import('discord.js');
+    db.initDb();
+    db.registerChannel({
+      jid: 'dc:source',
+      name: 'source',
+      folder: 'ch_source',
+      requiresTrigger: false,
+      isMain: false,
+      modelOverride: '',
+      thinkingOverride: '',
+      cwdOverride: '',
+    });
+    db.setChannelWebhook({
+      channel_jid: 'dc:source',
+      destination_channel_id: 'old-monitor',
+      destination_channel_name: 'old monitoring',
+      webhook_id: 'old-id',
+      webhook_token: 'old-token',
+    });
+    enqueueWebhookTrace('dc:source', 'queued before clear');
+
+    let resolveCreate!: (webhook: any) => void;
+    const createWebhook = vi.fn(
+      () =>
+        new Promise<any>((resolve) => {
+          resolveCreate = resolve;
+        }),
+    );
+    const destination = {
+      id: 'monitor',
+      name: 'monitoring',
+      guildId: 'guild-1',
+      type: ChannelType.GuildText,
+      createWebhook,
+      permissionsFor: vi.fn().mockReturnValue({ has: () => true }),
+    };
+    const common = {
+      commandName: 'pi',
+      channelId: 'source',
+      guildId: 'guild-1',
+      guild: { members: { me: { id: 'bot' } } },
+      user: { id: 'admin' },
+      memberPermissions: { has: () => true },
+      inGuild: () => true,
+      deferReply: vi.fn().mockResolvedValue(undefined),
+      reply: vi.fn().mockResolvedValue(undefined),
+      followUp: vi.fn().mockResolvedValue(undefined),
+      replied: false,
+      deferred: true,
+    };
+    const setReply = vi.fn().mockResolvedValue(undefined);
+    const setPromise = handleChatCommand({
+      ...common,
+      options: { getSubcommand: () => 'webhook', getChannel: () => destination },
+      editReply: setReply,
+    } as any);
+    await vi.waitFor(() => expect(createWebhook).toHaveBeenCalledOnce());
+
+    const clearReply = vi.fn().mockResolvedValue(undefined);
+    const clearPromise = handleChatCommand({
+      ...common,
+      options: { getSubcommand: () => 'webhook-clear' },
+      client: {
+        channels: {
+          fetch: vi.fn().mockResolvedValue({
+            fetchWebhooks: vi.fn().mockResolvedValue(new Map()),
+          }),
+        },
+      },
+      editReply: clearReply,
+    } as any);
+
+    try {
+      await vi.waitFor(() => expect(clearReply).toHaveBeenCalledOnce());
+      await clearPromise;
+      expect(db.getChannelWebhook('dc:source')).toBeUndefined();
+      expect(db.getChannelWebhookProvisioning('dc:source')).toMatchObject({ reconciling: 1 });
+      expect(webhookMonitorStats('dc:source').states).toBe(0);
+      expect(clearReply).toHaveBeenCalledWith({
+        content: expect.stringContaining('Pi activity monitoring is disabled'),
+      });
+
+      const lateDelete = vi.fn().mockResolvedValue(undefined);
+      resolveCreate({
+        id: 'late-id',
+        token: 'late-token',
+        send: vi.fn().mockResolvedValue(undefined),
+        delete: lateDelete,
+      });
+      await setPromise;
+      expect(lateDelete).toHaveBeenCalledWith('Rolling back failed Pi monitoring setup');
+      expect(db.getChannelWebhook('dc:source')).toBeUndefined();
+    } finally {
+      db.closeDb();
     }
   });
 

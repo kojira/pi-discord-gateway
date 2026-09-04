@@ -23,6 +23,11 @@ export interface ChannelWebhookReplacement {
   previous?: ChannelWebhookConfig;
 }
 
+export interface ChannelWebhookClearStart {
+  removed?: ChannelWebhookConfig;
+  provisioning?: ChannelWebhookProvisioning;
+}
+
 export type ChannelWebhookProvisioningState = 'creating' | 'created';
 
 export interface ChannelWebhookProvisioning {
@@ -600,9 +605,7 @@ export function setChannelWebhook(webhook: ChannelWebhookConfig): ChannelWebhook
 
 /**
  * Atomically disable trace routing while retaining credentials until remote
- * deletion succeeds. This intentionally works while provisioning is active:
- * /pi webhook-clear must stop the old epoch before inspecting an interrupted
- * replacement.
+ * deletion succeeds. This intentionally works while provisioning is active.
  */
 export function clearChannelWebhook(channelJid: string): ChannelWebhookConfig | undefined {
   const existing = db.transaction(() => {
@@ -614,6 +617,44 @@ export function clearChannelWebhook(channelJid: string): ChannelWebhookConfig | 
   })();
   hardenDatabaseFiles();
   return existing;
+}
+
+/**
+ * First, synchronous step of /pi webhook-clear. It disables routing and claims
+ * every in-progress setup before any process-local lock or remote await, so a
+ * delayed creator can persist cleanup credentials but can never activate.
+ */
+export function beginChannelWebhookClear(channelJid: string): ChannelWebhookClearStart {
+  const result = db.transaction((): ChannelWebhookClearStart => {
+    const removed = getChannelWebhook(channelJid);
+    if (removed) {
+      insertPendingWebhookCleanup(removed);
+      db.prepare('delete from channel_webhooks where channel_jid = ?').run(channelJid);
+    }
+
+    const provisioning = getChannelWebhookProvisioning(channelJid);
+    if (!provisioning) return { removed };
+
+    if (provisioning.state === 'created') {
+      insertPendingWebhookCleanup(provisioningWebhookConfig(provisioning));
+      db.prepare('delete from channel_webhook_provisioning where lease_id = ?').run(
+        provisioning.lease_id,
+      );
+      return { removed, provisioning };
+    }
+
+    db.prepare(
+      `update channel_webhook_provisioning
+       set reconciling = 1
+       where lease_id = ? and state = 'creating'`,
+    ).run(provisioning.lease_id);
+    return {
+      removed,
+      provisioning: selectWebhookProvisioningByLease(provisioning.lease_id),
+    };
+  })();
+  hardenDatabaseFiles();
+  return result;
 }
 
 export function getPendingWebhookCleanup(channelJid: string): ChannelWebhookConfig[] {

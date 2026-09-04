@@ -19,11 +19,11 @@ import {
 import { config } from '../config.js';
 import {
   activateChannelWebhookProvisioning,
+  beginChannelWebhookClear,
   beginChannelWebhookProvisioning,
   cancelChannelWebhookProvisioning,
   claimChannelWebhookProvisioningReconciliation,
   clearChannelModelOverride,
-  clearChannelWebhook,
   clearPendingMessages,
   completeChannelWebhookProvisioningReconciliation,
   completeChannelWebhookProvisioningRollback,
@@ -67,6 +67,7 @@ import { rotateChannelSessionDir } from '../session/path.js';
 import type { RegisteredChannel } from '../types.js';
 import {
   deleteDiscordWebhook,
+  discardWebhookTrace,
   isDiscordUnknownWebhookError,
   retireWebhookTrace,
   safeDiscordErrorMetadata,
@@ -584,42 +585,39 @@ async function handleWebhookClear(interaction: ChatInputCommandInteraction): Pro
     return;
   }
 
+  // This durable transition deliberately happens before defer/network awaits
+  // and outside the process-local setup lock. It disables routing immediately
+  // and prevents even a fresh or hung creator from activating later.
+  const clearStart = beginChannelWebhookClear(channelJid);
+  discardWebhookTrace(channelJid);
+
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-  const result = await withWebhookConfigLock(channelJid, async () => {
-    // This is the first mutation under the command lock. It atomically removes
-    // active routing and retains the credential for deletion even when an
-    // interrupted replacement provisioning record also exists.
-    const removed = clearChannelWebhook(channelJid);
-    const pendingBefore = getPendingWebhookCleanup(channelJid);
-    const provisioningBefore = getChannelWebhookProvisioning(channelJid);
-    if (removed) await retireWebhookTrace(channelJid, removed.webhook_id);
+  const pendingBefore = getPendingWebhookCleanup(channelJid);
 
-    // Credential cleanup is independent of name-based provisioning recovery.
-    // A failed/empty provisioning scan must never leave the old active epoch
-    // forwarding or prevent deletion attempts for known webhook credentials.
-    for (const webhook of pendingBefore) {
-      if (!removed || webhook.webhook_id !== removed.webhook_id) {
-        await retireWebhookTrace(channelJid, webhook.webhook_id);
-      }
-      if (await deleteDiscordWebhook(webhook, 'Pi activity monitoring disabled')) {
-        completeWebhookCleanup(webhook.webhook_id);
-      }
+  // Credential cleanup is independent of name-based provisioning recovery.
+  // A failed/empty provisioning scan must never reactivate the old epoch.
+  for (const webhook of pendingBefore) {
+    if (await deleteDiscordWebhook(webhook, 'Pi activity monitoring disabled')) {
+      completeWebhookCleanup(webhook.webhook_id);
     }
+  }
 
-    const reconciliation = await reconcileWebhookProvisioning(interaction, channelJid);
-    const remaining = getPendingWebhookCleanup(channelJid);
-    const hasLifecycle = Boolean(getChannelWebhookProvisioning(channelJid));
-    if (
-      !removed &&
-      pendingBefore.length === 0 &&
-      !provisioningBefore &&
-      reconciliation === 'none' &&
-      !hasLifecycle
-    ) {
-      return undefined;
-    }
-    return { removed, remaining, reconciliation, hasLifecycle };
-  });
+  const reconciliation = await reconcileWebhookProvisioning(interaction, channelJid);
+  const remaining = getPendingWebhookCleanup(channelJid);
+  const hasLifecycle = Boolean(getChannelWebhookProvisioning(channelJid));
+  const result =
+    !clearStart.removed &&
+    pendingBefore.length === 0 &&
+    !clearStart.provisioning &&
+    reconciliation === 'none' &&
+    !hasLifecycle
+      ? undefined
+      : {
+          removed: clearStart.removed,
+          remaining,
+          reconciliation,
+          hasLifecycle,
+        };
   if (!result) {
     await interaction.editReply({
       content: 'No monitoring webhook is configured for this channel.',

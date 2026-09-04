@@ -106,6 +106,125 @@ describe('per-channel webhook configuration', () => {
     }
   });
 
+  it('atomically disables routing and force-claims a fresh creator during clear', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'piscord-webhook-begin-clear-'));
+    tempDirs.push(tempDir);
+    process.env.DB_PATH = join(tempDir, 'gateway.db');
+    process.env.PIDG_CONFIG = resolve(tempDir, 'missing.env');
+    process.env.SESSIONS_DIR = resolve(tempDir, 'sessions');
+
+    const db = await import('../src/db.js');
+    db.initDb();
+    db.registerChannel({
+      jid: 'dc:source',
+      name: 'source',
+      folder: 'source',
+      requiresTrigger: false,
+      isMain: false,
+      modelOverride: '',
+      thinkingOverride: '',
+      cwdOverride: '',
+    });
+
+    const active = {
+      channel_jid: 'dc:source',
+      destination_channel_id: 'old-monitor',
+      destination_channel_name: 'old monitoring',
+      webhook_id: 'old-id',
+      webhook_token: 'old-token',
+    };
+    db.setChannelWebhook(active);
+    const lease = db.beginChannelWebhookProvisioning({
+      channel_jid: 'dc:source',
+      destination_channel_id: 'new-monitor',
+      destination_channel_name: 'new monitoring',
+      webhook_name: 'new webhook',
+    });
+
+    try {
+      const started = db.beginChannelWebhookClear('dc:source');
+      expect(started.removed).toEqual(active);
+      expect(started.provisioning).toMatchObject({
+        lease_id: lease.lease_id,
+        state: 'creating',
+        reconciling: 1,
+      });
+      expect(db.getChannelWebhook('dc:source')).toBeUndefined();
+      expect(db.getPendingWebhookCleanup('dc:source')).toEqual([active]);
+
+      const late = {
+        channel_jid: 'dc:source',
+        destination_channel_id: 'new-monitor',
+        destination_channel_name: 'new monitoring',
+        webhook_id: 'late-id',
+        webhook_token: 'late-token',
+      };
+      expect(db.recordChannelWebhookCreated(lease.lease_id, late)).toBe(false);
+      expect(() => db.activateChannelWebhookProvisioning(lease.lease_id)).toThrow(
+        /no longer active/,
+      );
+      expect(db.getChannelWebhook('dc:source')).toBeUndefined();
+      expect(db.getChannelWebhookProvisioning('dc:source')).toMatchObject({
+        lease_id: lease.lease_id,
+        state: 'created',
+        reconciling: 1,
+        webhook_id: 'late-id',
+        webhook_token: 'late-token',
+      });
+    } finally {
+      db.closeDb();
+    }
+  });
+
+  it('moves already-created provisioning credentials to cleanup during clear', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'piscord-webhook-created-clear-'));
+    tempDirs.push(tempDir);
+    process.env.DB_PATH = join(tempDir, 'gateway.db');
+    process.env.PIDG_CONFIG = resolve(tempDir, 'missing.env');
+    process.env.SESSIONS_DIR = resolve(tempDir, 'sessions');
+
+    const db = await import('../src/db.js');
+    db.initDb();
+    db.registerChannel({
+      jid: 'dc:source',
+      name: 'source',
+      folder: 'source',
+      requiresTrigger: false,
+      isMain: false,
+      modelOverride: '',
+      thinkingOverride: '',
+      cwdOverride: '',
+    });
+    const lease = db.beginChannelWebhookProvisioning({
+      channel_jid: 'dc:source',
+      destination_channel_id: 'monitor',
+      destination_channel_name: 'monitoring',
+      webhook_name: 'webhook',
+    });
+    const created = {
+      channel_jid: 'dc:source',
+      destination_channel_id: 'monitor',
+      destination_channel_name: 'monitoring',
+      webhook_id: 'created-id',
+      webhook_token: 'created-token',
+    };
+    db.recordChannelWebhookCreated(lease.lease_id, created);
+
+    try {
+      expect(db.beginChannelWebhookClear('dc:source').provisioning).toMatchObject({
+        state: 'created',
+        webhook_id: 'created-id',
+      });
+      expect(db.getChannelWebhookProvisioning('dc:source')).toBeUndefined();
+      expect(db.getPendingWebhookCleanup('dc:source')).toEqual([created]);
+      expect(() => db.activateChannelWebhookProvisioning(lease.lease_id)).toThrow(
+        /no longer active/,
+      );
+    } finally {
+      db.closeDb();
+    }
+  });
+
   it('retains late or failed provisioning credentials for retry cleanup', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'piscord-webhook-late-provisioning-'));
     tempDirs.push(tempDir);

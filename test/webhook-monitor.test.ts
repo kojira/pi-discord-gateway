@@ -127,19 +127,32 @@ describe('webhook activity delivery', () => {
     expect(order).toEqual(['set-1-start', 'set-1-end', 'set-2', 'clear']);
   });
 
-  it('does not enqueue old-epoch activity after clear removes the mapping', async () => {
+  it('immediately discards queued old-epoch activity after clear', async () => {
     const monitor = await import('../src/discord/webhook-monitor.js');
     let mapping: typeof webhook | undefined = webhook;
     getChannelWebhookMock.mockImplementation(() => mapping);
     monitor.enqueueWebhookTrace('dc:source', 'before clear');
 
     mapping = undefined;
+    monitor.discardWebhookTrace('dc:source');
     monitor.enqueueWebhookTrace('dc:source', 'during clear');
-    await monitor.retireWebhookTrace('dc:source', webhook.webhook_id);
+    await monitor.flushWebhookTrace('dc:source');
 
-    expect(sendMock).toHaveBeenCalledTimes(1);
-    expect(sendMock.mock.calls[0][0].content).toContain('before clear');
-    expect(sendMock.mock.calls[0][0].content).not.toContain('during clear');
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(monitor.webhookMonitorStats('dc:source').states).toBe(0);
+  });
+
+  it('revalidates the durable mapping before a stale process sends', async () => {
+    const monitor = await import('../src/discord/webhook-monitor.js');
+    let mapping: typeof webhook | undefined = webhook;
+    getChannelWebhookMock.mockImplementation(() => mapping);
+    monitor.enqueueWebhookTrace('dc:source', 'queued in another process');
+
+    mapping = undefined;
+    await monitor.flushWebhookTrace('dc:source');
+
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(WebhookClientMock).not.toHaveBeenCalled();
     expect(monitor.webhookMonitorStats('dc:source').states).toBe(0);
   });
 

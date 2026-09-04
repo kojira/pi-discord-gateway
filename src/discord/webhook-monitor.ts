@@ -81,6 +81,11 @@ export async function flushWebhookTrace(jid: string, webhookId?: string): Promis
   await Promise.all(states.map((state) => drainState(state)));
 }
 
+/** Immediately drop queued output and destroy clients for a disabled route. */
+export function discardWebhookTrace(jid: string, webhookId?: string): void {
+  for (const state of matchingStates(jid, webhookId)) retireState(state);
+}
+
 /** Flush and dispose a replaced or removed webhook's delivery epoch. */
 export async function retireWebhookTrace(
   jid: string,
@@ -233,13 +238,16 @@ async function drainState(state: WebhookDeliveryState): Promise<void> {
 }
 
 async function deliver(state: WebhookDeliveryState, chunks: readonly string[]): Promise<void> {
-  state.client ??= new WebhookClient({
-    id: state.webhook.webhook_id,
-    token: state.webhook.webhook_token,
-  });
   try {
     for (const content of chunks) {
-      if (state.retired) return;
+      if (state.retired || !isCurrentWebhookEpoch(state)) {
+        retireState(state);
+        return;
+      }
+      state.client ??= new WebhookClient({
+        id: state.webhook.webhook_id,
+        token: state.webhook.webhook_token,
+      });
       await state.client.send({ content, allowedMentions: { parse: [] } });
     }
   } catch (error) {
@@ -252,6 +260,10 @@ async function deliver(state: WebhookDeliveryState, chunks: readonly string[]): 
       'Failed to deliver Pi trace to monitoring webhook',
     );
   }
+}
+
+function isCurrentWebhookEpoch(state: WebhookDeliveryState): boolean {
+  return getChannelWebhook(state.jid)?.webhook_id === state.webhook.webhook_id;
 }
 
 function getOrCreateState(webhook: ChannelWebhookConfig): WebhookDeliveryState {
