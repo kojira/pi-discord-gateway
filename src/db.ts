@@ -298,9 +298,9 @@ export function getChannelWebhookProvisioning(
 
 /**
  * Acquire the durable, cross-process setup lease before calling Discord.
- * A stale creating lease is intentionally not stolen here: /pi webhook-clear
- * first reconciles its unique Discord webhook name, so a webhook created just
- * before a process crash cannot be orphaned.
+ * A creating lease is intentionally never stolen: after an uncertain request,
+ * /pi webhook-clear retains its unique Discord name until it positively deletes
+ * the remote webhook or Discord definitively rejects creation.
  */
 export function beginChannelWebhookProvisioning(
   input: ChannelWebhookProvisioningInput,
@@ -434,7 +434,7 @@ export function completeChannelWebhookProvisioningRollback(
   })();
 }
 
-/** Cancel a pre-create/stale lease only after Discord creation failed or reconciliation found none. */
+/** Cancel a creating lease only after definitive rejection or positive remote deletion. */
 export function cancelChannelWebhookProvisioning(leaseId: string): boolean {
   return (
     db

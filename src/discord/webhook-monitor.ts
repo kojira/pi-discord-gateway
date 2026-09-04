@@ -157,13 +157,13 @@ export async function deleteDiscordWebhook(
   try {
     await client.delete(reason);
     return true;
-  } catch (err: any) {
-    if (isDiscordUnknownWebhookError(err)) return true;
+  } catch (error) {
+    if (isDiscordUnknownWebhookError(error)) return true;
     logger.warn(
       {
         jid: webhook.channel_jid,
         destinationChannelId: webhook.destination_channel_id,
-        err: err.message,
+        ...safeDiscordErrorMetadata(error),
       },
       'Failed to delete Discord monitoring webhook',
     );
@@ -171,6 +171,20 @@ export async function deleteDiscordWebhook(
   } finally {
     client.destroy();
   }
+}
+
+function safeDiscordErrorMetadata(error: unknown): {
+  errorName: string;
+  discordCode?: number;
+  httpStatus?: number;
+} {
+  if (typeof error !== 'object' || error === null) return { errorName: typeof error };
+  const value = error as { code?: unknown; status?: unknown };
+  return {
+    errorName: error instanceof Error ? error.constructor.name.slice(0, 100) : 'unknown',
+    ...(typeof value.code === 'number' ? { discordCode: value.code } : {}),
+    ...(typeof value.status === 'number' ? { httpStatus: value.status } : {}),
+  };
 }
 
 /** Discord reports an already-deleted webhook with this specific REST error. */
