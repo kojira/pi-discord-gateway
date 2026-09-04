@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- Forward every completed assistant message from Pi's RPC event stream to Discord, including progress text emitted before tool calls.
+- Route new same-channel Discord messages into an active Pi run through Pi's native steering queue.
+
+### Changed
+
+- Replace one-shot print-mode agent invocations with the official JSONL RPC protocol.
+
 ## [1.7.0] - 2026-07-17
 
 ### Changed
