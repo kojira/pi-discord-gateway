@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const originalEnv = { ...process.env };
@@ -75,6 +76,7 @@ describe('per-channel webhook configuration', () => {
         ),
       ).toThrow(/webhook-clear/);
 
+      expect(db.markChannelWebhookCreateRequestIssued(lease.lease_id, 1_500)).toBe(true);
       const created = {
         channel_jid: 'dc:source',
         destination_channel_id: 'monitor',
@@ -140,6 +142,7 @@ describe('per-channel webhook configuration', () => {
       destination_channel_name: 'new monitoring',
       webhook_name: 'new webhook',
     });
+    expect(db.markChannelWebhookCreateRequestIssued(lease.lease_id)).toBe(true);
 
     try {
       const started = db.beginChannelWebhookClear('dc:source');
@@ -208,6 +211,7 @@ describe('per-channel webhook configuration', () => {
       webhook_id: 'created-id',
       webhook_token: 'created-token',
     };
+    db.markChannelWebhookCreateRequestIssued(lease.lease_id);
     db.recordChannelWebhookCreated(lease.lease_id, created);
 
     try {
@@ -253,6 +257,7 @@ describe('per-channel webhook configuration', () => {
         webhook_name: 'monitor webhook',
       };
       const lateLease = db.beginChannelWebhookProvisioning(input);
+      expect(db.markChannelWebhookCreateRequestIssued(lateLease.lease_id)).toBe(true);
       expect(db.cancelChannelWebhookProvisioning(lateLease.lease_id)).toBe(true);
       expect(db.unregisterChannel('dc:source')).toBe(true);
       const lateWebhook = {
@@ -277,6 +282,7 @@ describe('per-channel webhook configuration', () => {
         cwdOverride: '',
       });
       const failedLease = db.beginChannelWebhookProvisioning(input);
+      expect(db.markChannelWebhookCreateRequestIssued(failedLease.lease_id)).toBe(true);
       const failedWebhook = {
         ...lateWebhook,
         webhook_id: 'failed-id',
@@ -287,6 +293,98 @@ describe('per-channel webhook configuration', () => {
       expect(db.getChannelWebhookProvisioning('dc:source')).toBeUndefined();
       expect(db.getPendingWebhookCleanup('dc:source')).toEqual([failedWebhook, lateWebhook]);
       expect(() => db.unregisterChannel('dc:source')).toThrow(/pending cleanup/);
+    } finally {
+      db.closeDb();
+    }
+  });
+
+  it('conclusively clears a pre-request lease after restart', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'piscord-webhook-pre-request-restart-'));
+    tempDirs.push(tempDir);
+    process.env.DB_PATH = join(tempDir, 'gateway.db');
+    process.env.PIDG_CONFIG = resolve(tempDir, 'missing.env');
+    process.env.SESSIONS_DIR = resolve(tempDir, 'sessions');
+
+    const db = await import('../src/db.js');
+    db.initDb();
+    db.registerChannel({
+      jid: 'dc:source',
+      name: 'source',
+      folder: 'source',
+      requiresTrigger: false,
+      isMain: false,
+      modelOverride: '',
+      thinkingOverride: '',
+      cwdOverride: '',
+    });
+    const lease = db.beginChannelWebhookProvisioning({
+      channel_jid: 'dc:source',
+      destination_channel_id: 'monitor',
+      destination_channel_name: 'monitoring',
+      webhook_name: 'monitor webhook',
+    });
+    expect(lease.request_issued).toBe(0);
+
+    try {
+      db.closeDb();
+      db.initDb();
+      expect(db.getChannelWebhookProvisioning('dc:source')).toMatchObject({
+        lease_id: lease.lease_id,
+        request_issued: 0,
+      });
+      expect(db.beginChannelWebhookClear('dc:source').provisioning).toMatchObject({
+        lease_id: lease.lease_id,
+        request_issued: 0,
+      });
+      expect(db.getChannelWebhookProvisioning('dc:source')).toBeUndefined();
+      expect(db.unregisterChannel('dc:source')).toBe(true);
+    } finally {
+      db.closeDb();
+    }
+  });
+
+  it('migrates legacy provisioning rows as request-issued and uncertain', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'piscord-webhook-request-migration-'));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, 'gateway.db');
+    process.env.DB_PATH = dbPath;
+    process.env.PIDG_CONFIG = resolve(tempDir, 'missing.env');
+    process.env.SESSIONS_DIR = resolve(tempDir, 'sessions');
+
+    const legacy = new Database(dbPath);
+    legacy.exec(`
+      create table channel_webhook_provisioning (
+        channel_jid text primary key,
+        lease_id text not null unique,
+        destination_channel_id text not null,
+        destination_channel_name text not null,
+        webhook_name text not null,
+        state text not null,
+        reconciling integer not null default 0,
+        reconciliation_webhook_ids text not null default '[]',
+        webhook_id text,
+        webhook_token text,
+        updated_at_ms integer not null
+      );
+      insert into channel_webhook_provisioning values (
+        'dc:legacy', 'legacy-lease', 'monitor', 'monitoring', 'legacy webhook',
+        'creating', 0, '[]', null, null, 1000
+      );
+    `);
+    legacy.close();
+
+    const db = await import('../src/db.js');
+    try {
+      db.initDb();
+      expect(db.getChannelWebhookProvisioning('dc:legacy')).toMatchObject({
+        lease_id: 'legacy-lease',
+        request_issued: 1,
+      });
+      expect(db.beginChannelWebhookClear('dc:legacy').provisioning).toMatchObject({
+        request_issued: 1,
+        reconciling: 1,
+      });
+      expect(db.getChannelWebhookProvisioning('dc:legacy')).toBeDefined();
     } finally {
       db.closeDb();
     }

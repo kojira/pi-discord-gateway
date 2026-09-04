@@ -35,6 +35,7 @@ import {
   getChannelWebhookReconciliationTargets,
   getPendingWebhookCleanup,
   isChannelWebhookProvisioningStale,
+  markChannelWebhookCreateRequestIssued,
   queueChannelWebhookProvisioningCleanup,
   recordChannelWebhookCreated,
   recordChannelWebhookReconciliationTargets,
@@ -502,12 +503,9 @@ async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promi
   }
   if (!canMutateWebhookDb()) return;
 
-  const currentProvisioning = getChannelWebhookProvisioning(channel.jid);
-  if (
-    currentProvisioning?.lease_id !== provisioning.lease_id ||
-    currentProvisioning.state !== 'creating' ||
-    currentProvisioning.reconciling !== 0
-  ) {
+  // This is the durable side-effect boundary. There must be no await between
+  // this compare-and-set and invoking createWebhook below.
+  if (!markChannelWebhookCreateRequestIssued(provisioning.lease_id)) {
     throw webhookCommandError(
       'Webhook setup was canceled before creation. Monitoring remains disabled.',
     );

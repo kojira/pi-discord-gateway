@@ -37,6 +37,8 @@ export interface ChannelWebhookProvisioning {
   destination_channel_name: string;
   webhook_name: string;
   state: ChannelWebhookProvisioningState;
+  /** 0 proves no remote POST began; 1 means creation was issued or is uncertain. */
+  request_issued: number;
   /** Durable tombstone: creator paths may persist credentials but cannot activate. */
   reconciling: number;
   reconciliation_webhook_ids: string;
@@ -133,6 +135,7 @@ export function initDb(): void {
       destination_channel_name text not null,
       webhook_name             text not null,
       state                    text not null check(state in ('creating', 'created')),
+      request_issued           integer not null default 0 check(request_issued in (0, 1)),
       reconciling              integer not null default 0 check(reconciling in (0, 1)),
       reconciliation_webhook_ids text not null default '[]',
       webhook_id               text,
@@ -140,7 +143,7 @@ export function initDb(): void {
       updated_at_ms            integer not null,
       check(
         (state = 'creating' and webhook_id is null and webhook_token is null) or
-        (state = 'created' and webhook_id is not null and webhook_token is not null)
+        (state = 'created' and request_issued = 1 and webhook_id is not null and webhook_token is not null)
       )
     );
 
@@ -173,6 +176,9 @@ export function initDb(): void {
   ensureTableColumn('channels', 'thinking_override', "text not null default ''");
   ensureTableColumn('channels', 'cwd_override', "text not null default ''");
   ensureTableColumn('message_queue', 'attachments', 'text');
+  // Legacy rows may already represent an in-flight/uncertain POST, so migrate
+  // them conservatively. New leases always insert request_issued = 0 explicitly.
+  ensureTableColumn('channel_webhook_provisioning', 'request_issued', 'integer not null default 1');
   ensureTableColumn('channel_webhook_provisioning', 'reconciling', 'integer not null default 0');
   ensureTableColumn(
     'channel_webhook_provisioning',
@@ -306,7 +312,7 @@ export function getChannelWebhookProvisioning(
   return db
     .prepare(
       `select channel_jid, lease_id, destination_channel_id, destination_channel_name,
-              webhook_name, state, reconciling, reconciliation_webhook_ids,
+              webhook_name, state, request_issued, reconciling, reconciliation_webhook_ids,
               webhook_id, webhook_token, updated_at_ms
        from channel_webhook_provisioning where channel_jid = ?`,
     )
@@ -340,9 +346,9 @@ export function beginChannelWebhookProvisioning(
     db.prepare(
       `insert into channel_webhook_provisioning (
          channel_jid, lease_id, destination_channel_id, destination_channel_name,
-         webhook_name, state, reconciling, reconciliation_webhook_ids,
+         webhook_name, state, request_issued, reconciling, reconciliation_webhook_ids,
          webhook_id, webhook_token, updated_at_ms
-       ) values (?, ?, ?, ?, ?, 'creating', 0, '[]', null, null, ?)`,
+       ) values (?, ?, ?, ?, ?, 'creating', 0, 0, '[]', null, null, ?)`,
     ).run(
       input.channel_jid,
       leaseId,
@@ -357,6 +363,24 @@ export function beginChannelWebhookProvisioning(
   return result;
 }
 
+/**
+ * Durably cross the remote-side-effect boundary immediately before POST.
+ * Failure means clear/reconciliation already claimed or removed this exact lease.
+ */
+export function markChannelWebhookCreateRequestIssued(leaseId: string, now = Date.now()): boolean {
+  const marked =
+    db
+      .prepare(
+        `update channel_webhook_provisioning
+         set request_issued = 1, updated_at_ms = ?
+         where lease_id = ? and state = 'creating'
+           and request_issued = 0 and reconciling = 0`,
+      )
+      .run(now, leaseId).changes > 0;
+  if (marked) hardenDatabaseFiles();
+  return marked;
+}
+
 /** Record returned credentials before any validation send or activation work. */
 export function recordChannelWebhookCreated(
   leaseId: string,
@@ -368,7 +392,8 @@ export function recordChannelWebhookCreated(
       .prepare(
         `update channel_webhook_provisioning
          set state = 'created', webhook_id = ?, webhook_token = ?, updated_at_ms = ?
-         where lease_id = ? and channel_jid = ? and state = 'creating' and reconciling = 0`,
+         where lease_id = ? and channel_jid = ? and state = 'creating'
+           and request_issued = 1 and reconciling = 0`,
       )
       .run(webhook.webhook_id, webhook.webhook_token, now, leaseId, webhook.channel_jid);
     if (result.changes > 0) return true;
@@ -381,7 +406,8 @@ export function recordChannelWebhookCreated(
       .prepare(
         `update channel_webhook_provisioning
          set state = 'created', webhook_id = ?, webhook_token = ?, updated_at_ms = ?
-         where lease_id = ? and channel_jid = ? and state = 'creating' and reconciling = 1`,
+         where lease_id = ? and channel_jid = ? and state = 'creating'
+           and request_issued = 1 and reconciling = 1`,
       )
       .run(webhook.webhook_id, webhook.webhook_token, now, leaseId, webhook.channel_jid);
     if (retained.changes > 0) return false;
@@ -401,7 +427,7 @@ export function activateChannelWebhookProvisioning(leaseId: string): ChannelWebh
     const provisioning = db
       .prepare(
         `select channel_jid, lease_id, destination_channel_id, destination_channel_name,
-                webhook_name, state, reconciling, reconciliation_webhook_ids,
+                webhook_name, state, request_issued, reconciling, reconciliation_webhook_ids,
                 webhook_id, webhook_token, updated_at_ms
          from channel_webhook_provisioning where lease_id = ?`,
       )
@@ -440,7 +466,7 @@ export function queueChannelWebhookProvisioningCleanup(
     const provisioning = db
       .prepare(
         `select channel_jid, lease_id, destination_channel_id, destination_channel_name,
-                webhook_name, state, reconciling, reconciliation_webhook_ids,
+                webhook_name, state, request_issued, reconciling, reconciliation_webhook_ids,
                 webhook_id, webhook_token, updated_at_ms
          from channel_webhook_provisioning where lease_id = ?`,
       )
@@ -504,11 +530,16 @@ export function claimChannelWebhookProvisioningReconciliation(
     if (!current) return undefined;
     if (current.state === 'created') return current;
     if (!force && !isChannelWebhookProvisioningStale(current, now)) return current;
+    if (current.request_issued === 0) {
+      // No remote side effect can exist, so recovery is conclusive and local.
+      db.prepare('delete from channel_webhook_provisioning where lease_id = ?').run(leaseId);
+      return undefined;
+    }
 
     db.prepare(
       `update channel_webhook_provisioning
        set reconciling = 1
-       where lease_id = ? and state = 'creating'`,
+       where lease_id = ? and state = 'creating' and request_issued = 1`,
     ).run(leaseId);
     return selectWebhookProvisioningByLease(leaseId);
   })();
@@ -635,6 +666,15 @@ export function beginChannelWebhookClear(channelJid: string): ChannelWebhookClea
     const provisioning = getChannelWebhookProvisioning(channelJid);
     if (!provisioning) return { removed };
 
+    if (provisioning.state === 'creating' && provisioning.request_issued === 0) {
+      // The creator has not crossed the POST boundary. Removing the exact
+      // lease makes clear immediately final without inventing remote cleanup.
+      db.prepare('delete from channel_webhook_provisioning where lease_id = ?').run(
+        provisioning.lease_id,
+      );
+      return { removed, provisioning };
+    }
+
     if (provisioning.state === 'created') {
       insertPendingWebhookCleanup(provisioningWebhookConfig(provisioning));
       db.prepare('delete from channel_webhook_provisioning where lease_id = ?').run(
@@ -646,7 +686,7 @@ export function beginChannelWebhookClear(channelJid: string): ChannelWebhookClea
     db.prepare(
       `update channel_webhook_provisioning
        set reconciling = 1
-       where lease_id = ? and state = 'creating'`,
+       where lease_id = ? and state = 'creating' and request_issued = 1`,
     ).run(provisioning.lease_id);
     return {
       removed,
@@ -677,7 +717,7 @@ function selectWebhookProvisioningByLease(leaseId: string): ChannelWebhookProvis
   return db
     .prepare(
       `select channel_jid, lease_id, destination_channel_id, destination_channel_name,
-              webhook_name, state, reconciling, reconciliation_webhook_ids,
+              webhook_name, state, request_issued, reconciling, reconciliation_webhook_ids,
               webhook_id, webhook_token, updated_at_ms
        from channel_webhook_provisioning where lease_id = ?`,
     )

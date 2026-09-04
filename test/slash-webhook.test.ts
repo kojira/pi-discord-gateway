@@ -266,7 +266,7 @@ describe('webhook slash commands', () => {
     }
   });
 
-  it('reconciles a stale pre-create lease by its unique Discord webhook name', async () => {
+  it('reconciles a stale request-issued lease by its unique Discord webhook name', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'piscord-slash-webhook-recovery-'));
     tempDirs.push(tempDir);
     process.env.DB_PATH = join(tempDir, 'gateway.db');
@@ -294,6 +294,7 @@ describe('webhook slash commands', () => {
       },
       0,
     );
+    db.markChannelWebhookCreateRequestIssued(lease.lease_id, 1);
     const interruptedDelete = vi.fn().mockResolvedValue(undefined);
     const unrelatedDelete = vi.fn();
     const editReply = vi.fn().mockResolvedValue(undefined);
@@ -500,6 +501,7 @@ describe('webhook slash commands', () => {
       destination_channel_name: 'monitoring',
       webhook_name: 'monitor webhook',
     });
+    db.markChannelWebhookCreateRequestIssued(lease.lease_id);
     db.cancelChannelWebhookProvisioning(lease.lease_id);
     db.unregisterChannel('dc:source');
     db.recordChannelWebhookCreated(lease.lease_id, {
@@ -958,7 +960,7 @@ describe('webhook slash commands', () => {
 
     try {
       await handleChatCommand(interaction as any);
-      expect(db.getChannelWebhookProvisioning('dc:source')).toBeDefined();
+      expect(db.getChannelWebhookProvisioning('dc:source')).toMatchObject({ request_issued: 1 });
       expect(editReply).toHaveBeenLastCalledWith({
         content: expect.stringContaining(
           'Cleanup is pending; run /pi webhook-clear in this channel',
@@ -1023,6 +1025,7 @@ describe('webhook slash commands', () => {
       },
       0,
     );
+    db.markChannelWebhookCreateRequestIssued(lease.lease_id, 1);
     const remoteWebhooks = new Map<string, any>();
     const remoteDelete = vi.fn().mockResolvedValue(undefined);
     const editReply = vi.fn().mockResolvedValue(undefined);
@@ -1157,6 +1160,7 @@ describe('webhook slash commands', () => {
         expect(blockedDefer).toHaveBeenCalledOnce();
         expect(db.getChannelWebhookProvisioning('dc:source')).toMatchObject({
           state: 'creating',
+          request_issued: 0,
           reconciling: 0,
         });
       });
@@ -1184,18 +1188,34 @@ describe('webhook slash commands', () => {
         deferred: true,
       } as any);
 
-      expect(db.getChannelWebhookProvisioning('dc:source')).toMatchObject({
-        state: 'creating',
-        reconciling: 1,
-      });
+      expect(db.getChannelWebhookProvisioning('dc:source')).toBeUndefined();
       expect(clearEditReply).toHaveBeenCalledWith({
-        content: expect.stringContaining('cleanup status remains uncertain'),
+        content: 'Pi activity monitoring is disabled and the Discord webhook was deleted.',
       });
+      expect(db.unregisterChannel('dc:source')).toBe(true);
+      db.registerChannel({
+        jid: 'dc:source',
+        name: 'source',
+        folder: 'ch_source',
+        requiresTrigger: false,
+        isMain: false,
+        modelOverride: '',
+        thinkingOverride: '',
+        cwdOverride: '',
+      });
+      const nextLease = db.beginChannelWebhookProvisioning({
+        channel_jid: 'dc:source',
+        destination_channel_id: 'monitor',
+        destination_channel_name: 'monitoring',
+        webhook_name: 'next webhook',
+      });
+      expect(nextLease.request_issued).toBe(0);
 
       releaseDefer();
       await setOperation;
       expect(createWebhook).not.toHaveBeenCalled();
       expect(db.getChannelWebhook('dc:source')).toBeUndefined();
+      expect(db.getChannelWebhookProvisioning('dc:source')?.lease_id).toBe(nextLease.lease_id);
       expect(setEditReply).toHaveBeenCalledWith({
         content: expect.stringContaining('Webhook setup was canceled before creation'),
       });
@@ -1363,6 +1383,7 @@ describe('webhook slash commands', () => {
       },
       0,
     );
+    creatorDb.markChannelWebhookCreateRequestIssued(lease.lease_id, 1);
 
     vi.resetModules();
     const reconcilerDb = await import('../src/db.js');
@@ -1468,6 +1489,7 @@ describe('webhook slash commands', () => {
       },
       0,
     );
+    db.markChannelWebhookCreateRequestIssued(lease.lease_id, 1);
     const remoteDelete = vi
       .fn()
       .mockRejectedValueOnce(new Error('unknown delete outcome secret-value'))
@@ -1580,6 +1602,7 @@ describe('webhook slash commands', () => {
       },
       0,
     );
+    db.markChannelWebhookCreateRequestIssued(lease.lease_id, 1);
     const leaked = 'discord-error-secret-token';
     const fetch = vi
       .fn()
