@@ -332,12 +332,7 @@ export async function promptSupervisorRequest(
   );
 
   await abortableDiscordRequest(
-    Promise.resolve().then(() =>
-      (channel as TextChannel).send({
-        ...discordTextPayload(body),
-        components: [row],
-      }),
-    ),
+    Promise.resolve().then(() => (channel as TextChannel).send(supervisorPromptPayload(body, row))),
     signal,
   );
   logger.info({ jid, requestId: request.id, runId: request.runId }, 'Supervisor prompt sent');
@@ -482,6 +477,21 @@ export async function sendResponse(
     }
     return false;
   }
+}
+
+export function supervisorPromptPayload(
+  content: string,
+  row: ActionRowBuilder<ButtonBuilder>,
+): {
+  content: string;
+  allowedMentions: { parse: [] };
+  components: ActionRowBuilder<ButtonBuilder>[];
+} {
+  return {
+    content,
+    allowedMentions: { parse: [] },
+    components: [row],
+  };
 }
 
 export function discordTextPayload(content: string): {

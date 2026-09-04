@@ -117,7 +117,7 @@ Run `/pi webhook channel:#monitoring` in a registered source channel to create a
 
 Only members with Discord's **Manage Webhooks** permission can configure or clear monitoring. The bot also needs **Manage Webhooks** in the selected destination. Responses are ephemeral, webhook tokens are stored in the gateway SQLite database and never displayed, and forwarded content disables Discord mentions.
 
-Use `/pi webhook-clear` in the source channel to stop forwarding and delete its managed Discord webhook. A channel with monitoring enabled cannot be unregistered until this cleanup command succeeds. `/pi status` shows the configured destination without exposing its token.
+Use `/pi webhook-clear` in the source channel to stop forwarding and delete its managed Discord webhook. It also retries failed deletion and safely reconciles an interrupted setup after its ten-minute setup lease expires. A channel with monitoring enabled, an active setup lease, or pending cleanup cannot be unregistered until cleanup succeeds. `/pi status` shows the configured destination without exposing its token.
 
 > **Privacy:** activity traces can contain user text, model reasoning, and local file paths mentioned by the model. Tool events are metadata-only (name and completion status), but you should still select a private destination with an appropriate retention policy.
 

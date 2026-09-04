@@ -1,5 +1,6 @@
+import { ActionRowBuilder, ButtonBuilder } from 'discord.js';
 import { describe, expect, it, vi } from 'vitest';
-import { discordTextPayload } from '../src/discord/client.js';
+import { discordTextPayload, supervisorPromptPayload } from '../src/discord/client.js';
 import {
   buildDiscordSendPayload,
   normalizeChannelJid,
@@ -20,6 +21,15 @@ describe('Discord text delivery', () => {
     expect(discordTextPayload('<@123> <@&456> @everyone')).toEqual({
       content: '<@123> <@&456> @everyone',
       allowedMentions: { parse: [] },
+    });
+  });
+
+  it('explicitly disables mentions while retaining supervisor components', () => {
+    const row = new ActionRowBuilder<ButtonBuilder>();
+    expect(supervisorPromptPayload('@everyone choose', row)).toEqual({
+      content: '@everyone choose',
+      allowedMentions: { parse: [] },
+      components: [row],
     });
   });
 

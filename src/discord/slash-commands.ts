@@ -17,18 +17,27 @@ import {
 } from '../agent/invoke.js';
 import { config } from '../config.js';
 import {
+  activateChannelWebhookProvisioning,
+  beginChannelWebhookProvisioning,
+  cancelChannelWebhookProvisioning,
   clearChannelModelOverride,
   clearChannelWebhook,
   clearPendingMessages,
+  completeChannelWebhookProvisioningRollback,
   completeWebhookCleanup,
   createDmChannel,
   getChannel,
   getChannelWebhook,
+  getChannelWebhookProvisioning,
   getPendingWebhookCleanup,
+  isChannelWebhookProvisioningStale,
+  queueChannelWebhookProvisioningCleanup,
+  recordChannelWebhookCreated,
   registerChannel,
   setChannelModelOverride,
   setChannelThinkingOverride,
-  setChannelWebhook,
+  type ChannelWebhookConfig,
+  type ChannelWebhookProvisioning,
 } from '../db.js';
 import { logger } from '../logger.js';
 import {
@@ -359,36 +368,84 @@ async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promi
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const oldWebhookDeleted = await withWebhookConfigLock(channel.jid, async () => {
-    const webhook = await destinationChannel.createWebhook({
-      name: buildWebhookName(channel.name),
-      reason: `Pi activity monitoring configured by Discord user ${interaction.user.id}`,
+    // This SQLite lease is the cross-process serialization point. It exists
+    // before Discord creation and prevents unregister/clear from discarding
+    // lifecycle state while the network request is outstanding.
+    const provisioning = beginChannelWebhookProvisioning({
+      channel_jid: channel.jid,
+      destination_channel_id: destination.id,
+      destination_channel_name: destination.name,
+      webhook_name: buildWebhookName(channel.name),
     });
 
-    if (!webhook.token) {
-      await webhook.delete('Webhook creation returned no usable token').catch(() => undefined);
-      throw new Error('Discord created a webhook without a usable token.');
-    }
-
-    let previous: ReturnType<typeof setChannelWebhook>['previous'];
+    let webhook: Awaited<ReturnType<TextChannel['createWebhook']>> | undefined;
+    let createdConfig: ChannelWebhookConfig | undefined;
+    let previous: ChannelWebhookConfig | undefined;
     try {
-      await webhook.send({
-        content: `✅ Pi activity monitoring enabled for **${escapeDiscordMarkdown(channel.name)}**.`,
-        allowedMentions: { parse: [] },
+      webhook = await destinationChannel.createWebhook({
+        name: provisioning.webhook_name,
+        reason: `Pi activity monitoring configured by Discord user ${interaction.user.id}`,
       });
-      // This transaction verifies that the source still exists, switches trace
-      // routing, and persists the prior credential as pending cleanup.
-      ({ previous } = setChannelWebhook({
+
+      if (!webhook.token) {
+        const deleted = await webhook
+          .delete('Webhook creation returned no usable token')
+          .then(() => true)
+          .catch(() => false);
+        if (deleted) cancelChannelWebhookProvisioning(provisioning.lease_id);
+        throw new Error(
+          deleted
+            ? 'Discord created a webhook without a usable token.'
+            : 'Discord created a webhook without a usable token and rollback failed; run /pi webhook-clear after the setup lease expires.',
+        );
+      }
+
+      createdConfig = {
         channel_jid: channel.jid,
         destination_channel_id: destination.id,
         destination_channel_name: destination.name,
         webhook_id: webhook.id,
         webhook_token: webhook.token,
-      }));
+      };
+      if (!recordChannelWebhookCreated(provisioning.lease_id, createdConfig)) {
+        throw new Error('Monitoring webhook setup lease expired before activation.');
+      }
+
+      await webhook.send({
+        content: `✅ Pi activity monitoring enabled for **${escapeDiscordMarkdown(channel.name)}**.`,
+        allowedMentions: { parse: [] },
+      });
+      ({ previous } = activateChannelWebhookProvisioning(provisioning.lease_id));
     } catch (error) {
-      await webhook.delete('Rolling back failed Pi monitoring setup').catch(() => undefined);
+      if (!webhook) {
+        // Discord rejected creation, so no remote resource can exist.
+        cancelChannelWebhookProvisioning(provisioning.lease_id);
+        throw error;
+      }
+
+      const deleted = await webhook
+        .delete('Rolling back failed Pi monitoring setup')
+        .then(() => true)
+        .catch(() => false);
+      if (createdConfig) {
+        if (deleted) {
+          completeChannelWebhookProvisioningRollback(
+            provisioning.lease_id,
+            createdConfig.webhook_id,
+          );
+        } else {
+          // This stores the returned token even if activation failed or the
+          // source vanished, allowing /pi webhook-clear to retry deletion.
+          queueChannelWebhookProvisioningCleanup(provisioning.lease_id, createdConfig);
+        }
+      } else if (deleted) {
+        cancelChannelWebhookProvisioning(provisioning.lease_id);
+      }
       throw error;
     }
 
+    // Activation is complete at this point. Cleanup failures for the previous
+    // epoch must not roll back or delete the newly active webhook.
     if (!previous || previous.webhook_id === webhook.id) return true;
     await retireWebhookTrace(channel.jid, previous.webhook_id);
     const deleted = await deleteDiscordWebhook(previous, 'Pi monitoring destination replaced');
@@ -426,6 +483,8 @@ async function handleWebhookClear(interaction: ChatInputCommandInteraction): Pro
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const result = await withWebhookConfigLock(channel.jid, async () => {
+    await reconcileWebhookProvisioning(interaction, channel.jid);
+
     // Remove active routing first, but retain the credential in the cleanup
     // table until Discord confirms remote deletion. Re-running this command
     // retries every failed cleanup for the source channel.
@@ -463,6 +522,61 @@ async function handleWebhookClear(interaction: ChatInputCommandInteraction): Pro
             result.remaining.length === 1 ? 'attempt failed' : 'attempts failed'
           }; run /pi webhook-clear again to retry.`,
   });
+}
+
+async function reconcileWebhookProvisioning(
+  interaction: ChatInputCommandInteraction,
+  channelJid: string,
+): Promise<void> {
+  const provisioning = getChannelWebhookProvisioning(channelJid);
+  if (!provisioning) return;
+
+  if (provisioning.state === 'created') {
+    queueChannelWebhookProvisioningCleanup(provisioning.lease_id, provisioningConfig(provisioning));
+    return;
+  }
+  if (!isChannelWebhookProvisioningStale(provisioning)) {
+    throw new Error('Monitoring webhook setup is still in progress. Wait, then try again.');
+  }
+
+  // The process may have crashed in the narrow interval between Discord
+  // creation and credential persistence. The lease's unique webhook name lets
+  // us reconcile that interval without assuming no remote webhook exists.
+  const destination = await interaction.client.channels.fetch(provisioning.destination_channel_id);
+  if (!destination || !('fetchWebhooks' in destination)) {
+    throw new Error('Cannot inspect the destination for the interrupted webhook setup.');
+  }
+  const webhooks = await destination.fetchWebhooks();
+  const matches = [...webhooks.values()].filter(
+    (webhook) => webhook.name === provisioning.webhook_name,
+  );
+  for (const webhook of matches) {
+    await webhook.delete('Recovering interrupted Pi monitoring setup');
+  }
+
+  if (cancelChannelWebhookProvisioning(provisioning.lease_id)) return;
+
+  // A slow creator may have returned while reconciliation was in flight. Its
+  // credentials are now durable, so move them to the ordinary retry queue.
+  const current = getChannelWebhookProvisioning(channelJid);
+  if (current?.lease_id === provisioning.lease_id && current.state === 'created') {
+    queueChannelWebhookProvisioningCleanup(current.lease_id, provisioningConfig(current));
+    return;
+  }
+  throw new Error('Monitoring webhook setup changed during recovery; run the command again.');
+}
+
+function provisioningConfig(provisioning: ChannelWebhookProvisioning): ChannelWebhookConfig {
+  if (!provisioning.webhook_id || !provisioning.webhook_token) {
+    throw new Error('Interrupted webhook setup has no stored credentials.');
+  }
+  return {
+    channel_jid: provisioning.channel_jid,
+    destination_channel_id: provisioning.destination_channel_id,
+    destination_channel_name: provisioning.destination_channel_name,
+    webhook_id: provisioning.webhook_id,
+    webhook_token: provisioning.webhook_token,
+  };
 }
 
 function buildWebhookName(sourceName: string): string {

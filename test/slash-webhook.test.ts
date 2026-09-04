@@ -209,9 +209,106 @@ describe('webhook slash commands', () => {
       });
       await handleChatCommand(setInteraction as any);
       expect(db.getChannelWebhook('dc:source')).toBeUndefined();
+      expect(db.getChannel('dc:source')).toBeDefined();
+      expect(db.getChannelWebhookProvisioning('dc:source')).toBeUndefined();
       expect(raceDelete).toHaveBeenCalledWith('Rolling back failed Pi monitoring setup');
       expect(editReply).toHaveBeenLastCalledWith({
-        content: expect.stringContaining('no longer registered'),
+        content: expect.stringContaining('active setup'),
+      });
+
+      const failedRollbackDelete = vi.fn().mockRejectedValue(new Error('Discord unavailable'));
+      createWebhook.mockResolvedValueOnce({
+        id: 'failed-rollback-webhook',
+        token: 'failed-rollback-token',
+        send: vi.fn().mockRejectedValue(new Error('validation failed')),
+        delete: failedRollbackDelete,
+      });
+      await handleChatCommand(setInteraction as any);
+      expect(db.getChannelWebhookProvisioning('dc:source')).toBeUndefined();
+      expect(db.getPendingWebhookCleanup('dc:source')).toEqual([
+        {
+          channel_jid: 'dc:source',
+          destination_channel_id: 'monitor-channel',
+          destination_channel_name: 'monitoring',
+          webhook_id: 'failed-rollback-webhook',
+          webhook_token: 'failed-rollback-token',
+        },
+      ]);
+      expect(editReply).toHaveBeenLastCalledWith({
+        content: expect.stringContaining('validation failed'),
+      });
+    } finally {
+      db.closeDb();
+    }
+  });
+
+  it('reconciles a stale pre-create lease by its unique Discord webhook name', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'piscord-slash-webhook-recovery-'));
+    tempDirs.push(tempDir);
+    process.env.DB_PATH = join(tempDir, 'gateway.db');
+    process.env.PIDG_CONFIG = resolve(tempDir, 'missing.env');
+
+    const db = await import('../src/db.js');
+    const { handleChatCommand } = await import('../src/discord/slash-commands.js');
+    db.initDb();
+    db.registerChannel({
+      jid: 'dc:source',
+      name: 'source',
+      folder: 'ch_source',
+      requiresTrigger: false,
+      isMain: false,
+      modelOverride: '',
+      thinkingOverride: '',
+      cwdOverride: '',
+    });
+    const lease = db.beginChannelWebhookProvisioning(
+      {
+        channel_jid: 'dc:source',
+        destination_channel_id: 'monitor',
+        destination_channel_name: 'monitoring',
+        webhook_name: 'monitor webhook',
+      },
+      0,
+    );
+    const interruptedDelete = vi.fn().mockResolvedValue(undefined);
+    const unrelatedDelete = vi.fn();
+    const editReply = vi.fn().mockResolvedValue(undefined);
+
+    try {
+      await handleChatCommand({
+        commandName: 'pi',
+        channelId: 'source',
+        guildId: 'guild-1',
+        guild: { members: { me: { id: 'bot' } } },
+        user: { id: 'admin' },
+        memberPermissions: { has: () => true },
+        inGuild: () => true,
+        options: { getSubcommand: () => 'webhook-clear' },
+        client: {
+          channels: {
+            fetch: vi.fn().mockResolvedValue({
+              fetchWebhooks: vi.fn().mockResolvedValue(
+                new Map([
+                  ['interrupted', { name: lease.webhook_name, delete: interruptedDelete }],
+                  ['unrelated', { name: 'someone else', delete: unrelatedDelete }],
+                ]),
+              ),
+            }),
+          },
+        },
+        deferReply: vi.fn().mockResolvedValue(undefined),
+        editReply,
+        reply: vi.fn().mockResolvedValue(undefined),
+        followUp: vi.fn().mockResolvedValue(undefined),
+        replied: false,
+        deferred: true,
+      } as any);
+
+      expect(interruptedDelete).toHaveBeenCalledWith('Recovering interrupted Pi monitoring setup');
+      expect(unrelatedDelete).not.toHaveBeenCalled();
+      expect(db.getChannelWebhookProvisioning('dc:source')).toBeUndefined();
+      expect(editReply).toHaveBeenCalledWith({
+        content: 'No monitoring webhook is configured for this channel.',
       });
     } finally {
       db.closeDb();

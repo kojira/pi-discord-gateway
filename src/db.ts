@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import { chmodSync, existsSync, mkdirSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { dirname } from 'node:path';
 import { config } from './config.js';
 import { logger } from './logger.js';
@@ -21,6 +22,29 @@ export interface ChannelWebhookConfig {
 export interface ChannelWebhookReplacement {
   previous?: ChannelWebhookConfig;
 }
+
+export type ChannelWebhookProvisioningState = 'creating' | 'created';
+
+export interface ChannelWebhookProvisioning {
+  channel_jid: string;
+  lease_id: string;
+  destination_channel_id: string;
+  destination_channel_name: string;
+  webhook_name: string;
+  state: ChannelWebhookProvisioningState;
+  webhook_id: string | null;
+  webhook_token: string | null;
+  updated_at_ms: number;
+}
+
+export interface ChannelWebhookProvisioningInput {
+  channel_jid: string;
+  destination_channel_id: string;
+  destination_channel_name: string;
+  webhook_name: string;
+}
+
+export const WEBHOOK_PROVISIONING_LEASE_MS = 10 * 60 * 1000;
 
 export interface ScheduledTaskRow {
   id: number;
@@ -93,6 +117,22 @@ export function initDb(): void {
 
     create index if not exists idx_webhook_cleanup_channel
       on channel_webhook_cleanup(channel_jid);
+
+    create table if not exists channel_webhook_provisioning (
+      channel_jid              text primary key,
+      lease_id                 text not null unique,
+      destination_channel_id   text not null,
+      destination_channel_name text not null,
+      webhook_name             text not null,
+      state                    text not null check(state in ('creating', 'created')),
+      webhook_id               text,
+      webhook_token            text,
+      updated_at_ms            integer not null,
+      check(
+        (state = 'creating' and webhook_id is null and webhook_token is null) or
+        (state = 'created' and webhook_id is not null and webhook_token is not null)
+      )
+    );
 
     create table if not exists message_log (
       rowid         integer primary key autoincrement,
@@ -180,9 +220,13 @@ export function registerChannel(ch: RegisteredChannel): void {
 
 export function unregisterChannel(jid: string): boolean {
   return db.transaction(() => {
-    if (getChannelWebhook(jid) || getPendingWebhookCleanup(jid).length > 0) {
+    if (
+      getChannelWebhook(jid) ||
+      getChannelWebhookProvisioning(jid) ||
+      getPendingWebhookCleanup(jid).length > 0
+    ) {
       throw new Error(
-        `Channel ${jid} has a managed monitoring webhook or pending cleanup. Run /pi webhook-clear in that channel before unregistering it.`,
+        `Channel ${jid} has a managed monitoring webhook, active setup, or pending cleanup. Run /pi webhook-clear in that channel before unregistering it.`,
       );
     }
     return db.prepare('delete from channels where jid = ?').run(jid).changes > 0;
@@ -240,6 +284,178 @@ export function clearChannelThinkingOverride(jid: string): boolean {
   return result.changes > 0;
 }
 
+export function getChannelWebhookProvisioning(
+  channelJid: string,
+): ChannelWebhookProvisioning | undefined {
+  return db
+    .prepare(
+      `select channel_jid, lease_id, destination_channel_id, destination_channel_name,
+              webhook_name, state, webhook_id, webhook_token, updated_at_ms
+       from channel_webhook_provisioning where channel_jid = ?`,
+    )
+    .get(channelJid) as ChannelWebhookProvisioning | undefined;
+}
+
+/**
+ * Acquire the durable, cross-process setup lease before calling Discord.
+ * A stale creating lease is intentionally not stolen here: /pi webhook-clear
+ * first reconciles its unique Discord webhook name, so a webhook created just
+ * before a process crash cannot be orphaned.
+ */
+export function beginChannelWebhookProvisioning(
+  input: ChannelWebhookProvisioningInput,
+  now = Date.now(),
+): ChannelWebhookProvisioning {
+  const leaseId = randomUUID();
+  const webhookName = `${input.webhook_name.slice(0, 69)} · ${leaseId.slice(0, 8)}`;
+  const result = db.transaction(() => {
+    if (!getChannel(input.channel_jid)) {
+      throw new Error(`Source channel ${input.channel_jid} is no longer registered.`);
+    }
+    const existing = getChannelWebhookProvisioning(input.channel_jid);
+    if (existing) {
+      const suffix = isChannelWebhookProvisioningStale(existing, now)
+        ? ' Run /pi webhook-clear to recover the interrupted setup.'
+        : ' Wait for it to finish.';
+      throw new Error(`A monitoring webhook setup is already in progress.${suffix}`);
+    }
+
+    db.prepare(
+      `insert into channel_webhook_provisioning (
+         channel_jid, lease_id, destination_channel_id, destination_channel_name,
+         webhook_name, state, webhook_id, webhook_token, updated_at_ms
+       ) values (?, ?, ?, ?, ?, 'creating', null, null, ?)`,
+    ).run(
+      input.channel_jid,
+      leaseId,
+      input.destination_channel_id,
+      input.destination_channel_name,
+      webhookName,
+      now,
+    );
+    return getChannelWebhookProvisioning(input.channel_jid)!;
+  })();
+  hardenDatabaseFiles();
+  return result;
+}
+
+/** Record returned credentials before any validation send or activation work. */
+export function recordChannelWebhookCreated(
+  leaseId: string,
+  webhook: ChannelWebhookConfig,
+  now = Date.now(),
+): boolean {
+  const recorded = db.transaction(() => {
+    const result = db
+      .prepare(
+        `update channel_webhook_provisioning
+         set state = 'created', webhook_id = ?, webhook_token = ?, updated_at_ms = ?
+         where lease_id = ? and channel_jid = ? and state = 'creating'`,
+      )
+      .run(webhook.webhook_id, webhook.webhook_token, now, leaseId, webhook.channel_jid);
+    if (result.changes > 0) return true;
+
+    // A stale owner may return after its lease was reconciled or replaced.
+    // Retain its credentials independently of source-channel existence.
+    insertPendingWebhookCleanup(webhook);
+    return false;
+  })();
+  hardenDatabaseFiles();
+  return recorded;
+}
+
+/** Atomically activate the created webhook and retain any replaced credential. */
+export function activateChannelWebhookProvisioning(leaseId: string): ChannelWebhookReplacement {
+  const result = db.transaction((): ChannelWebhookReplacement & { sourceMissing?: boolean } => {
+    const provisioning = db
+      .prepare(
+        `select channel_jid, lease_id, destination_channel_id, destination_channel_name,
+                webhook_name, state, webhook_id, webhook_token, updated_at_ms
+         from channel_webhook_provisioning where lease_id = ?`,
+      )
+      .get(leaseId) as ChannelWebhookProvisioning | undefined;
+    if (!provisioning || provisioning.state !== 'created') {
+      throw new Error('Monitoring webhook setup lease is no longer active.');
+    }
+    const webhook = provisioningWebhookConfig(provisioning);
+    if (!getChannel(webhook.channel_jid)) {
+      insertPendingWebhookCleanup(webhook);
+      db.prepare('delete from channel_webhook_provisioning where lease_id = ?').run(leaseId);
+      return { sourceMissing: true };
+    }
+
+    const previous = getChannelWebhook(webhook.channel_jid);
+    upsertChannelWebhook(webhook);
+    if (previous && previous.webhook_id !== webhook.webhook_id) {
+      insertPendingWebhookCleanup(previous);
+    }
+    db.prepare('delete from channel_webhook_provisioning where lease_id = ?').run(leaseId);
+    return { previous };
+  })();
+  hardenDatabaseFiles();
+  if (result.sourceMissing) {
+    throw new Error('Source channel is no longer registered; webhook cleanup is pending.');
+  }
+  return result;
+}
+
+/** Move a post-create failed setup to the durable retry-cleanup queue. */
+export function queueChannelWebhookProvisioningCleanup(
+  leaseId: string,
+  fallback: ChannelWebhookConfig,
+): void {
+  db.transaction(() => {
+    const provisioning = db
+      .prepare(
+        `select channel_jid, lease_id, destination_channel_id, destination_channel_name,
+                webhook_name, state, webhook_id, webhook_token, updated_at_ms
+         from channel_webhook_provisioning where lease_id = ?`,
+      )
+      .get(leaseId) as ChannelWebhookProvisioning | undefined;
+    insertPendingWebhookCleanup(
+      provisioning?.state === 'created' ? provisioningWebhookConfig(provisioning) : fallback,
+    );
+    db.prepare('delete from channel_webhook_provisioning where lease_id = ?').run(leaseId);
+  })();
+  hardenDatabaseFiles();
+}
+
+/** Complete rollback only after Discord confirms that the created webhook is gone. */
+export function completeChannelWebhookProvisioningRollback(
+  leaseId: string,
+  webhookId: string,
+): void {
+  db.transaction(() => {
+    db.prepare(
+      `delete from channel_webhook_provisioning
+       where lease_id = ? and (webhook_id = ? or webhook_id is null)`,
+    ).run(leaseId, webhookId);
+    db.prepare('delete from channel_webhook_cleanup where webhook_id = ?').run(webhookId);
+  })();
+}
+
+/** Cancel a pre-create/stale lease only after Discord creation failed or reconciliation found none. */
+export function cancelChannelWebhookProvisioning(leaseId: string): boolean {
+  return (
+    db
+      .prepare(
+        `delete from channel_webhook_provisioning
+         where lease_id = ? and state = 'creating'`,
+      )
+      .run(leaseId).changes > 0
+  );
+}
+
+export function isChannelWebhookProvisioningStale(
+  provisioning: ChannelWebhookProvisioning,
+  now = Date.now(),
+): boolean {
+  return (
+    provisioning.state === 'creating' &&
+    provisioning.updated_at_ms <= now - WEBHOOK_PROVISIONING_LEASE_MS
+  );
+}
+
 export function getChannelWebhook(channelJid: string): ChannelWebhookConfig | undefined {
   return db
     .prepare(
@@ -254,25 +470,12 @@ export function setChannelWebhook(webhook: ChannelWebhookConfig): ChannelWebhook
     if (!getChannel(webhook.channel_jid)) {
       throw new Error(`Source channel ${webhook.channel_jid} is no longer registered.`);
     }
+    if (getChannelWebhookProvisioning(webhook.channel_jid)) {
+      throw new Error('Monitoring webhook setup is still in progress.');
+    }
 
     const previous = getChannelWebhook(webhook.channel_jid);
-    db.prepare(
-      `insert into channel_webhooks (
-         channel_jid, destination_channel_id, destination_channel_name, webhook_id, webhook_token
-       ) values (?, ?, ?, ?, ?)
-       on conflict(channel_jid) do update set
-         destination_channel_id = excluded.destination_channel_id,
-         destination_channel_name = excluded.destination_channel_name,
-         webhook_id = excluded.webhook_id,
-         webhook_token = excluded.webhook_token,
-         updated_at = datetime('now')`,
-    ).run(
-      webhook.channel_jid,
-      webhook.destination_channel_id,
-      webhook.destination_channel_name,
-      webhook.webhook_id,
-      webhook.webhook_token,
-    );
+    upsertChannelWebhook(webhook);
     if (previous && previous.webhook_id !== webhook.webhook_id) {
       insertPendingWebhookCleanup(previous);
     }
@@ -285,6 +488,9 @@ export function setChannelWebhook(webhook: ChannelWebhookConfig): ChannelWebhook
 /** Disable trace routing while retaining credentials until remote deletion succeeds. */
 export function clearChannelWebhook(channelJid: string): ChannelWebhookConfig | undefined {
   return db.transaction(() => {
+    if (getChannelWebhookProvisioning(channelJid)) {
+      throw new Error('Monitoring webhook setup is still in progress.');
+    }
     const existing = getChannelWebhook(channelJid);
     if (!existing) return undefined;
     insertPendingWebhookCleanup(existing);
@@ -306,6 +512,39 @@ export function completeWebhookCleanup(webhookId: string): boolean {
   return (
     db.prepare('delete from channel_webhook_cleanup where webhook_id = ?').run(webhookId).changes >
     0
+  );
+}
+
+function provisioningWebhookConfig(provisioning: ChannelWebhookProvisioning): ChannelWebhookConfig {
+  if (!provisioning.webhook_id || !provisioning.webhook_token) {
+    throw new Error('Provisioning record does not contain webhook credentials.');
+  }
+  return {
+    channel_jid: provisioning.channel_jid,
+    destination_channel_id: provisioning.destination_channel_id,
+    destination_channel_name: provisioning.destination_channel_name,
+    webhook_id: provisioning.webhook_id,
+    webhook_token: provisioning.webhook_token,
+  };
+}
+
+function upsertChannelWebhook(webhook: ChannelWebhookConfig): void {
+  db.prepare(
+    `insert into channel_webhooks (
+       channel_jid, destination_channel_id, destination_channel_name, webhook_id, webhook_token
+     ) values (?, ?, ?, ?, ?)
+     on conflict(channel_jid) do update set
+       destination_channel_id = excluded.destination_channel_id,
+       destination_channel_name = excluded.destination_channel_name,
+       webhook_id = excluded.webhook_id,
+       webhook_token = excluded.webhook_token,
+       updated_at = datetime('now')`,
+  ).run(
+    webhook.channel_jid,
+    webhook.destination_channel_id,
+    webhook.destination_channel_name,
+    webhook.webhook_id,
+    webhook.webhook_token,
   );
 }
 
