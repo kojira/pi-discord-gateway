@@ -22,7 +22,6 @@ import {
   type Message,
   type ModalSubmitInteraction,
   type TextChannel,
-  type DMChannel,
 } from 'discord.js';
 import { type RegisteredChannel } from '../types.js';
 import { config } from '../config.js';
@@ -276,6 +275,7 @@ const alwaysSupervisorReplies = new Map<string, string>();
 export async function promptSupervisorRequest(
   jid: string,
   request: SupervisorRequest,
+  signal?: AbortSignal,
 ): Promise<void> {
   const alwaysReply = alwaysSupervisorReplies.get(supervisorAlwaysKey(request));
   if (alwaysReply) {
@@ -291,7 +291,7 @@ export async function promptSupervisorRequest(
   if (!client) return;
 
   const channelId = jid.replace(/^dc:/, '');
-  const channel = await client.channels.fetch(channelId);
+  const channel = await abortableDiscordRequest(client.channels.fetch(channelId), signal);
   if (!channel || !('send' in channel)) {
     logger.warn({ jid, requestId: request.id }, 'Cannot send supervisor prompt to Discord channel');
     return;
@@ -331,7 +331,15 @@ export async function promptSupervisorRequest(
       .setStyle(ButtonStyle.Danger),
   );
 
-  await (channel as TextChannel | DMChannel).send({ content: body, components: [row] });
+  await abortableDiscordRequest(
+    Promise.resolve().then(() =>
+      (channel as TextChannel).send({
+        ...discordTextPayload(body),
+        components: [row],
+      }),
+    ),
+    signal,
+  );
   logger.info({ jid, requestId: request.id, runId: request.runId }, 'Supervisor prompt sent');
 }
 
@@ -433,33 +441,45 @@ function truncateForDiscordBlock(text: string, max: number): string {
 
 const DISCORD_MAX_LENGTH = 2000;
 
-export async function sendResponse(jid: string, text: string): Promise<boolean> {
+export async function sendResponse(
+  jid: string,
+  text: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
   if (!client) return false;
 
   const channelId = jid.replace(/^dc:/, '');
 
   try {
-    const channel = await client.channels.fetch(channelId);
+    const channel = await abortableDiscordRequest(client.channels.fetch(channelId), signal);
     if (!channel || !('send' in channel)) {
       logger.warn({ jid }, 'Channel not found or not text-based');
       return false;
     }
 
-    const textChannel = channel as TextChannel | DMChannel;
+    const textChannel = channel as TextChannel;
 
     if (text.length <= DISCORD_MAX_LENGTH) {
-      await textChannel.send(discordTextPayload(text));
+      await abortableDiscordRequest(
+        Promise.resolve().then(() => textChannel.send(discordTextPayload(text))),
+        signal,
+      );
     } else {
       // Split at line boundaries when possible
       const chunks = splitMessage(text, DISCORD_MAX_LENGTH);
       for (const chunk of chunks) {
-        await textChannel.send(discordTextPayload(chunk));
+        await abortableDiscordRequest(
+          Promise.resolve().then(() => textChannel.send(discordTextPayload(chunk))),
+          signal,
+        );
       }
     }
     logger.info({ jid, length: text.length }, 'Response sent');
     return true;
   } catch (err: any) {
-    logger.error({ jid, err: err.message }, 'Failed to send message');
+    if (err?.name !== 'AbortError') {
+      logger.error({ jid, err: err.message }, 'Failed to send message');
+    }
     return false;
   }
 }
@@ -471,17 +491,34 @@ export function discordTextPayload(content: string): {
   return { content, allowedMentions: { parse: [] } };
 }
 
-export async function setTyping(jid: string): Promise<void> {
+export async function setTyping(jid: string, signal?: AbortSignal): Promise<void> {
   if (!client) return;
   try {
     const channelId = jid.replace(/^dc:/, '');
-    const channel = await client.channels.fetch(channelId);
+    const channel = await abortableDiscordRequest(client.channels.fetch(channelId), signal);
     if (channel && 'sendTyping' in channel) {
-      await (channel as TextChannel).sendTyping();
+      await abortableDiscordRequest((channel as TextChannel).sendTyping(), signal);
     }
   } catch {
     // best-effort
   }
+}
+
+function abortableDiscordRequest<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortError());
+
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(abortError());
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+  });
+}
+
+function abortError(): Error {
+  const error = new Error('Discord request aborted');
+  error.name = 'AbortError';
+  return error;
 }
 
 export function stopDiscord(): void {

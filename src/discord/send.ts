@@ -46,6 +46,21 @@ export function validateSendRequest(
   }
 }
 
+export function buildDiscordSendPayload(
+  text: string | undefined,
+  attachments: AttachmentBuilder[],
+): {
+  content: string | undefined;
+  allowedMentions: { parse: [] };
+  files?: AttachmentBuilder[];
+} {
+  return {
+    content: text || undefined,
+    allowedMentions: { parse: [] },
+    ...(attachments.length > 0 ? { files: attachments } : {}),
+  };
+}
+
 export async function sendFilesToDiscord(request: SendRequest): Promise<{ sentFiles: number }> {
   validateSendRequest(request, {
     maxAttachmentBytes: config.maxAttachmentBytes,
@@ -73,10 +88,7 @@ export async function sendFilesToDiscord(request: SendRequest): Promise<{ sentFi
       throw new Error(`Channel not found or not text-based: ${channelJid}`);
     }
 
-    await channel.send({
-      content: request.text || undefined,
-      ...(attachments.length > 0 ? { files: attachments } : {}),
-    });
+    await channel.send(buildDiscordSendPayload(request.text, attachments));
     return { sentFiles: attachments.length };
   } finally {
     client.destroy();

@@ -488,8 +488,7 @@ export async function invokeAgent(
     void sendCommand({ type: 'prompt', message: prompt })
       .then((response) => {
         if (!response.success) {
-          proc.stdin.end();
-          finish({ ok: false, text: '', error: response.error || 'Pi rejected the prompt' });
+          failRpcOutput(response.error || 'Pi rejected the prompt');
           return;
         }
         if (!settled && !finished && !fatalRpcError) {
@@ -497,8 +496,7 @@ export async function invokeAgent(
         }
       })
       .catch((error: any) => {
-        proc.stdin.end();
-        finish({ ok: false, text: '', error: error.message });
+        failRpcOutput(error.message);
       });
   });
 }

@@ -18,6 +18,10 @@ export interface ChannelWebhookConfig {
   webhook_token: string;
 }
 
+export interface ChannelWebhookReplacement {
+  previous?: ChannelWebhookConfig;
+}
+
 export interface ScheduledTaskRow {
   id: number;
   name: string;
@@ -77,6 +81,18 @@ export function initDb(): void {
       created_at                text not null default (datetime('now')),
       updated_at                text not null default (datetime('now'))
     );
+
+    create table if not exists channel_webhook_cleanup (
+      webhook_id               text primary key,
+      channel_jid              text not null,
+      destination_channel_id   text not null,
+      destination_channel_name text not null,
+      webhook_token            text not null,
+      created_at                text not null default (datetime('now'))
+    );
+
+    create index if not exists idx_webhook_cleanup_channel
+      on channel_webhook_cleanup(channel_jid);
 
     create table if not exists message_log (
       rowid         integer primary key autoincrement,
@@ -164,9 +180,9 @@ export function registerChannel(ch: RegisteredChannel): void {
 
 export function unregisterChannel(jid: string): boolean {
   return db.transaction(() => {
-    if (getChannelWebhook(jid)) {
+    if (getChannelWebhook(jid) || getPendingWebhookCleanup(jid).length > 0) {
       throw new Error(
-        `Channel ${jid} has a managed monitoring webhook. Run /pi webhook-clear in that channel before unregistering it.`,
+        `Channel ${jid} has a managed monitoring webhook or pending cleanup. Run /pi webhook-clear in that channel before unregistering it.`,
       );
     }
     return db.prepare('delete from channels where jid = ?').run(jid).changes > 0;
@@ -233,34 +249,83 @@ export function getChannelWebhook(channelJid: string): ChannelWebhookConfig | un
     .get(channelJid) as ChannelWebhookConfig | undefined;
 }
 
-export function setChannelWebhook(webhook: ChannelWebhookConfig): void {
-  db.prepare(
-    `insert into channel_webhooks (
-       channel_jid, destination_channel_id, destination_channel_name, webhook_id, webhook_token
-     ) values (?, ?, ?, ?, ?)
-     on conflict(channel_jid) do update set
-       destination_channel_id = excluded.destination_channel_id,
-       destination_channel_name = excluded.destination_channel_name,
-       webhook_id = excluded.webhook_id,
-       webhook_token = excluded.webhook_token,
-       updated_at = datetime('now')`,
-  ).run(
-    webhook.channel_jid,
-    webhook.destination_channel_id,
-    webhook.destination_channel_name,
-    webhook.webhook_id,
-    webhook.webhook_token,
-  );
+export function setChannelWebhook(webhook: ChannelWebhookConfig): ChannelWebhookReplacement {
+  const result = db.transaction(() => {
+    if (!getChannel(webhook.channel_jid)) {
+      throw new Error(`Source channel ${webhook.channel_jid} is no longer registered.`);
+    }
+
+    const previous = getChannelWebhook(webhook.channel_jid);
+    db.prepare(
+      `insert into channel_webhooks (
+         channel_jid, destination_channel_id, destination_channel_name, webhook_id, webhook_token
+       ) values (?, ?, ?, ?, ?)
+       on conflict(channel_jid) do update set
+         destination_channel_id = excluded.destination_channel_id,
+         destination_channel_name = excluded.destination_channel_name,
+         webhook_id = excluded.webhook_id,
+         webhook_token = excluded.webhook_token,
+         updated_at = datetime('now')`,
+    ).run(
+      webhook.channel_jid,
+      webhook.destination_channel_id,
+      webhook.destination_channel_name,
+      webhook.webhook_id,
+      webhook.webhook_token,
+    );
+    if (previous && previous.webhook_id !== webhook.webhook_id) {
+      insertPendingWebhookCleanup(previous);
+    }
+    return { previous };
+  })();
   hardenDatabaseFiles();
+  return result;
 }
 
+/** Disable trace routing while retaining credentials until remote deletion succeeds. */
 export function clearChannelWebhook(channelJid: string): ChannelWebhookConfig | undefined {
   return db.transaction(() => {
     const existing = getChannelWebhook(channelJid);
     if (!existing) return undefined;
+    insertPendingWebhookCleanup(existing);
     db.prepare('delete from channel_webhooks where channel_jid = ?').run(channelJid);
     return existing;
   })();
+}
+
+export function getPendingWebhookCleanup(channelJid: string): ChannelWebhookConfig[] {
+  return db
+    .prepare(
+      `select channel_jid, destination_channel_id, destination_channel_name, webhook_id, webhook_token
+       from channel_webhook_cleanup where channel_jid = ? order by created_at, webhook_id`,
+    )
+    .all(channelJid) as ChannelWebhookConfig[];
+}
+
+export function completeWebhookCleanup(webhookId: string): boolean {
+  return (
+    db.prepare('delete from channel_webhook_cleanup where webhook_id = ?').run(webhookId).changes >
+    0
+  );
+}
+
+function insertPendingWebhookCleanup(webhook: ChannelWebhookConfig): void {
+  db.prepare(
+    `insert into channel_webhook_cleanup (
+       webhook_id, channel_jid, destination_channel_id, destination_channel_name, webhook_token
+     ) values (?, ?, ?, ?, ?)
+     on conflict(webhook_id) do update set
+       channel_jid = excluded.channel_jid,
+       destination_channel_id = excluded.destination_channel_id,
+       destination_channel_name = excluded.destination_channel_name,
+       webhook_token = excluded.webhook_token`,
+  ).run(
+    webhook.webhook_id,
+    webhook.channel_jid,
+    webhook.destination_channel_id,
+    webhook.destination_channel_name,
+    webhook.webhook_token,
+  );
 }
 
 function hardenDatabaseFiles(): void {

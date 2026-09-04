@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import { discordTextPayload } from '../src/discord/client.js';
-import { normalizeChannelJid, validateSendRequest, type SendRequest } from '../src/discord/send.js';
+import {
+  buildDiscordSendPayload,
+  normalizeChannelJid,
+  validateSendRequest,
+  type SendRequest,
+} from '../src/discord/send.js';
 
 function request(files: string[], text?: string): SendRequest {
   return {
@@ -14,6 +19,13 @@ describe('Discord text delivery', () => {
   it('disables user, role, and everyone mentions in agent-controlled output', () => {
     expect(discordTextPayload('<@123> <@&456> @everyone')).toEqual({
       content: '<@123> <@&456> @everyone',
+      allowedMentions: { parse: [] },
+    });
+  });
+
+  it('disables mentions in the direct Discord relay payload', () => {
+    expect(buildDiscordSendPayload('@everyone <@123> <@&456>', [])).toEqual({
+      content: '@everyone <@123> <@&456>',
       allowedMentions: { parse: [] },
     });
   });

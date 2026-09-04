@@ -134,7 +134,11 @@ describe('active-run steering', () => {
 
       finishInvocation({ ok: false, text: '', error: 'later failure' });
       await vi.waitFor(() =>
-        expect(sendResponseMock).toHaveBeenCalledWith('dc:123', '⚠️ Agent error: later failure'),
+        expect(sendResponseMock).toHaveBeenCalledWith(
+          'dc:123',
+          '⚠️ Agent error: later failure',
+          expect.any(AbortSignal),
+        ),
       );
 
       const completedDb = new Database(dbPath, { readonly: true });
@@ -593,6 +597,7 @@ describe('active-run steering', () => {
         expect(sendResponseMock).toHaveBeenCalledWith(
           'dc:456',
           '⚠️ One or more intermediate assistant messages could not be delivered.',
+          expect.any(AbortSignal),
         ),
       );
       const inspectDb = new Database(dbPath, { readonly: true });

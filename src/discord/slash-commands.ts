@@ -20,9 +20,11 @@ import {
   clearChannelModelOverride,
   clearChannelWebhook,
   clearPendingMessages,
+  completeWebhookCleanup,
   createDmChannel,
   getChannel,
   getChannelWebhook,
+  getPendingWebhookCleanup,
   registerChannel,
   setChannelModelOverride,
   setChannelThinkingOverride,
@@ -357,7 +359,6 @@ async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promi
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const oldWebhookDeleted = await withWebhookConfigLock(channel.jid, async () => {
-    const existing = getChannelWebhook(channel.jid);
     const webhook = await destinationChannel.createWebhook({
       name: buildWebhookName(channel.name),
       reason: `Pi activity monitoring configured by Discord user ${interaction.user.id}`,
@@ -368,28 +369,31 @@ async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promi
       throw new Error('Discord created a webhook without a usable token.');
     }
 
+    let previous: ReturnType<typeof setChannelWebhook>['previous'];
     try {
       await webhook.send({
         content: `✅ Pi activity monitoring enabled for **${escapeDiscordMarkdown(channel.name)}**.`,
         allowedMentions: { parse: [] },
       });
-      // Switch the mapping synchronously. New trace events now use the new
-      // webhook while the previous delivery epoch is drained and retired.
-      setChannelWebhook({
+      // This transaction verifies that the source still exists, switches trace
+      // routing, and persists the prior credential as pending cleanup.
+      ({ previous } = setChannelWebhook({
         channel_jid: channel.jid,
         destination_channel_id: destination.id,
         destination_channel_name: destination.name,
         webhook_id: webhook.id,
         webhook_token: webhook.token,
-      });
+      }));
     } catch (error) {
       await webhook.delete('Rolling back failed Pi monitoring setup').catch(() => undefined);
       throw error;
     }
 
-    if (!existing || existing.webhook_id === webhook.id) return true;
-    await retireWebhookTrace(channel.jid, existing.webhook_id);
-    return deleteDiscordWebhook(existing, 'Pi monitoring destination replaced');
+    if (!previous || previous.webhook_id === webhook.id) return true;
+    await retireWebhookTrace(channel.jid, previous.webhook_id);
+    const deleted = await deleteDiscordWebhook(previous, 'Pi monitoring destination replaced');
+    if (deleted) completeWebhookCleanup(previous.webhook_id);
+    return deleted;
   });
 
   logger.info(
@@ -422,13 +426,23 @@ async function handleWebhookClear(interaction: ChatInputCommandInteraction): Pro
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const result = await withWebhookConfigLock(channel.jid, async () => {
-    // Remove the mapping first so events arriving during the drain cannot enter
-    // the retired webhook epoch. Use the exact row removed by the transaction.
+    // Remove active routing first, but retain the credential in the cleanup
+    // table until Discord confirms remote deletion. Re-running this command
+    // retries every failed cleanup for the source channel.
     const removed = clearChannelWebhook(channel.jid);
-    if (!removed) return undefined;
-    await retireWebhookTrace(channel.jid, removed.webhook_id);
-    const deleted = await deleteDiscordWebhook(removed, 'Pi activity monitoring disabled');
-    return { removed, deleted };
+    const pending = getPendingWebhookCleanup(channel.jid);
+    if (!removed && pending.length === 0) return undefined;
+
+    for (const webhook of pending) {
+      await retireWebhookTrace(channel.jid, webhook.webhook_id);
+      if (await deleteDiscordWebhook(webhook, 'Pi activity monitoring disabled')) {
+        completeWebhookCleanup(webhook.webhook_id);
+      }
+    }
+    return {
+      removed,
+      remaining: getPendingWebhookCleanup(channel.jid),
+    };
   });
   if (!result) {
     await interaction.editReply({
@@ -438,13 +452,16 @@ async function handleWebhookClear(interaction: ChatInputCommandInteraction): Pro
   }
 
   logger.info(
-    { jid: channel.jid, destinationChannelId: result.removed.destination_channel_id },
+    { jid: channel.jid, pendingCleanup: result.remaining.length },
     'Channel monitoring webhook cleared',
   );
   await interaction.editReply({
-    content: result.deleted
-      ? 'Pi activity monitoring is disabled and the Discord webhook was deleted.'
-      : 'Pi activity monitoring is disabled. ⚠️ Discord did not allow the old webhook to be deleted.',
+    content:
+      result.remaining.length === 0
+        ? 'Pi activity monitoring is disabled and the Discord webhook was deleted.'
+        : `Pi activity monitoring is disabled. ⚠️ ${result.remaining.length} webhook cleanup ${
+            result.remaining.length === 1 ? 'attempt failed' : 'attempts failed'
+          }; run /pi webhook-clear again to retry.`,
   });
 }
 

@@ -49,6 +49,7 @@ interface SteeringTask {
 const steeringTasksByChannel = new Map<string, SteeringTask>();
 
 let running = false;
+let taskResourcesAvailable = true;
 let pollTimer: NodeJS.Timeout | undefined;
 let stopPromise: Promise<void> | null = null;
 
@@ -229,7 +230,7 @@ async function processSteeringMessages(
     if (oversized && isCurrentGeneration(jid, generation)) {
       markMessagesFailed([oversized.rowid]);
       logger.warn({ jid, rowid: oversized.rowid }, 'Steering message exceeds batch limits');
-      await sendResponse(jid, '⚠️ Steer message exceeds the configured batch limits.');
+      await sendResponse(jid, '⚠️ Steer message exceeds the configured batch limits.', signal);
     }
     return;
   }
@@ -243,6 +244,7 @@ async function processSteeringMessages(
       attachments: prepared.attachments,
       signal,
       onConsumed: () => {
+        if (!taskResourcesAvailable || signal.aborted) return;
         markMessagesDone(rowids);
         consumed = true;
         const acceptedRows = acceptedSteeringRows.get(jid);
@@ -277,7 +279,7 @@ async function processSteeringMessages(
     }
     markMessagesFailed(rowids);
     logger.warn({ jid, rowids, err: err.message }, 'Failed to steer message batch into active run');
-    await sendResponse(jid, `⚠️ Steer failed: ${err.message?.slice(0, 250)}`);
+    await sendResponse(jid, `⚠️ Steer failed: ${err.message?.slice(0, 250)}`, signal);
   }
 }
 
@@ -287,6 +289,7 @@ function settleInactiveSteeringBatch(
   rowids: readonly number[],
   parentSignal: AbortSignal,
 ): void {
+  if (!taskResourcesAvailable) return;
   if (parentSignal.aborted || !isCurrentGeneration(jid, generation)) {
     markMessagesFailed(rowids);
   } else {
@@ -421,9 +424,22 @@ async function drainActiveTasks(timeoutMs: number): Promise<void> {
   for (const controller of steeringTaskControllers) controller.abort();
 
   if (activeTaskPromises.size > 0 || steeringTaskPromises.size > 0) {
-    // Aborted Pi children are force-killed by invokeAgent. Keep Discord and the
-    // database open until every continuation has observed that exit and settled.
-    await Promise.allSettled([...activeTaskPromises, ...steeringTaskPromises]);
+    // Pi children are force-killed within 1.5 seconds. Give their close handlers
+    // a separate hard deadline, then quarantine any unexpectedly stuck task so
+    // it cannot touch Discord or SQLite after gateway teardown.
+    const finalDrain = Promise.allSettled([...activeTaskPromises, ...steeringTaskPromises]);
+    const forceDrainMs = Math.max(2000, Math.min(timeoutMs, 5000));
+    if (!(await waitForPromise(finalDrain, forceDrainMs))) {
+      taskResourcesAvailable = false;
+      logger.error(
+        {
+          forceDrainMs,
+          activeTasks: activeTaskPromises.size,
+          steeringTasks: steeringTaskPromises.size,
+        },
+        'Forced shutdown deadline reached; quarantining unfinished task continuations',
+      );
+    }
   }
 }
 
@@ -456,6 +472,7 @@ async function processMessage(
   signal: AbortSignal,
   attachments?: string | null,
 ): Promise<void> {
+  if (!taskResourcesAvailable) return;
   const channel = getChannel(jid);
   if (!channel) {
     logger.warn({ jid }, 'Channel disappeared during processing');
@@ -465,7 +482,7 @@ async function processMessage(
 
   logger.info({ jid, senderName, len: content.length }, 'Processing message');
 
-  const typingLoop = createTypingLoop(jid);
+  const typingLoop = createTypingLoop(jid, signal);
 
   try {
     const prompt = `[Discord user: ${senderName}]\n${content}`;
@@ -485,17 +502,21 @@ async function processMessage(
       attachments,
       onAssistantMessage: async (text) => {
         lastAttemptedText = text;
-        lastDeliverySucceeded = await sendResponse(jid, text);
+        lastDeliverySucceeded = await sendResponse(jid, text, signal);
+        if (!taskResourcesAvailable || signal.aborted) {
+          throw new Error('Discord delivery aborted');
+        }
         if (!lastDeliverySucceeded) {
           hadLiveDeliveryFailure = true;
           throw new Error('Could not deliver live assistant message to Discord');
         }
         logMessage(jid, 'assistant', text);
       },
-      onSupervisorRequest: (request) => promptSupervisorRequest(jid, request),
+      onSupervisorRequest: (request) => promptSupervisorRequest(jid, request, signal),
       onTraceEvent: (text) => enqueueWebhookTrace(jid, text),
     });
 
+    if (!taskResourcesAvailable) return;
     if (signal.aborted) {
       markMessageFailed(rowid);
       finalizeSteeringRows(jid, 'failed');
@@ -517,7 +538,8 @@ async function processMessage(
         return;
       }
       if (lastAttemptedText !== result.text) {
-        const sent = await sendResponse(jid, result.text);
+        const sent = await sendResponse(jid, result.text, signal);
+        if (!taskResourcesAvailable || signal.aborted) return;
         if (!sent) {
           markMessageFailed(rowid);
           logger.warn({ jid }, 'Agent response generated but could not be delivered to Discord');
@@ -531,7 +553,9 @@ async function processMessage(
         await sendResponse(
           jid,
           '⚠️ One or more intermediate assistant messages could not be delivered.',
+          signal,
         );
+        if (!taskResourcesAvailable || signal.aborted) return;
         logger.warn({ jid }, 'Agent completed with missing live Discord messages');
         return;
       }
@@ -543,10 +567,12 @@ async function processMessage(
 
     finalizeSteeringRows(jid, 'pending');
     const errMsg = `⚠️ Agent error: ${result.error?.slice(0, 300) || 'unknown error'}`;
-    await sendResponse(jid, errMsg);
+    await sendResponse(jid, errMsg, signal);
+    if (!taskResourcesAvailable || signal.aborted) return;
     markMessageFailed(rowid);
     logger.warn({ jid, error: result.error }, 'Agent returned error');
   } catch (err: any) {
+    if (!taskResourcesAvailable) return;
     if (signal.aborted) {
       finalizeSteeringRows(jid, 'failed');
       markMessageFailed(rowid);
@@ -558,7 +584,7 @@ async function processMessage(
     finalizeSteeringRows(jid, signal.aborted ? 'failed' : 'pending');
     markMessageFailed(rowid);
     try {
-      await sendResponse(jid, `⚠️ Internal error: ${err.message?.slice(0, 200)}`);
+      await sendResponse(jid, `⚠️ Internal error: ${err.message?.slice(0, 200)}`, signal);
     } catch {
       // Nothing else to do here.
     }
@@ -575,13 +601,13 @@ function finalizeSteeringRows(jid: string, status: 'done' | 'failed' | 'pending'
   acceptedSteeringRows.delete(jid);
 }
 
-function createTypingLoop(jid: string): { stop: () => Promise<void> } {
+function createTypingLoop(jid: string, signal: AbortSignal): { stop: () => Promise<void> } {
   let typingAlive = true;
   let cancelTypingDelay = () => {};
 
   const loop = (async () => {
     while (typingAlive) {
-      await setTyping(jid);
+      await setTyping(jid, signal);
       if (!typingAlive) break;
 
       const delay = cancellableSleep(8000);

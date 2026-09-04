@@ -74,19 +74,27 @@ describe('per-channel webhook configuration', () => {
         webhook_id: 'webhook-3',
         webhook_token: 'secret-3',
       };
-      db.setChannelWebhook(replacement);
+      expect(db.setChannelWebhook(replacement)).toEqual({ previous: first });
       expect(db.getChannelWebhook(first.channel_jid)).toEqual(replacement);
+      expect(db.getPendingWebhookCleanup(first.channel_jid)).toEqual([first]);
       expect(db.getChannelWebhook(second.channel_jid)).toEqual(second);
 
       expect(db.clearChannelWebhook(first.channel_jid)).toEqual(replacement);
       expect(db.getChannelWebhook(first.channel_jid)).toBeUndefined();
+      expect(db.getPendingWebhookCleanup(first.channel_jid)).toEqual([first, replacement]);
       expect(db.clearChannelWebhook(first.channel_jid)).toBeUndefined();
       expect(db.getChannelWebhook(second.channel_jid)).toEqual(second);
 
       expect(() => db.unregisterChannel(second.channel_jid)).toThrow(/webhook-clear/);
       expect(db.getChannelWebhook(second.channel_jid)).toEqual(second);
       db.clearChannelWebhook(second.channel_jid);
+      expect(() => db.unregisterChannel(second.channel_jid)).toThrow(/pending cleanup/);
+      expect(db.completeWebhookCleanup(second.webhook_id)).toBe(true);
       expect(db.unregisterChannel(second.channel_jid)).toBe(true);
+
+      expect(() => db.setChannelWebhook({ ...first, channel_jid: 'dc:missing' })).toThrow(
+        /no longer registered/,
+      );
     } finally {
       db.closeDb();
     }

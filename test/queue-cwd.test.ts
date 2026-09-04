@@ -57,6 +57,51 @@ describe('queue cwd selection', () => {
     expect(call?.cwd).toBe('/global/project');
   });
 
+  it('returns after a hard post-abort deadline when a task never settles', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'pidg-queue-hard-shutdown-'));
+    tempDirs.push(tempDir);
+    process.env.DB_PATH = ':memory:';
+    process.env.SESSIONS_DIR = resolve(tempDir, 'sessions');
+    process.env.POLL_INTERVAL_MS = '1';
+    process.env.MAX_CONCURRENCY = '1';
+
+    invokeAgentMock.mockImplementation(() => new Promise(() => undefined));
+    setTypingMock.mockResolvedValue(undefined);
+
+    vi.resetModules();
+    const db = await import('../src/db.js');
+    const queue = await import('../src/agent/queue.js');
+    db.initDb();
+    db.registerChannel({
+      jid: 'dc:hard-shutdown',
+      name: 'hard shutdown test',
+      folder: 'ch_hard_shutdown',
+      requiresTrigger: false,
+      isMain: false,
+      modelOverride: '',
+      thinkingOverride: '',
+      cwdOverride: '',
+    });
+    db.enqueueMessage({
+      channelJid: 'dc:hard-shutdown',
+      sender: 'u_1',
+      senderName: 'Alice',
+      content: 'wait forever',
+      timestamp: new Date().toISOString(),
+    });
+
+    try {
+      queue.startProcessingLoop();
+      await vi.waitFor(() => expect(invokeAgentMock).toHaveBeenCalledOnce());
+      const started = Date.now();
+      await queue.stopProcessingLoop({ timeoutMs: 1 });
+      expect(Date.now() - started).toBeGreaterThanOrEqual(1900);
+      expect(Date.now() - started).toBeLessThan(3000);
+    } finally {
+      db.closeDb();
+    }
+  });
+
   it('waits for an aborted task continuation before shutdown resolves', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'pidg-queue-shutdown-'));
     tempDirs.push(tempDir);

@@ -144,6 +144,75 @@ describe('webhook slash commands', () => {
       expect(clearEditReply).toHaveBeenCalledWith({
         content: 'Pi activity monitoring is disabled and the Discord webhook was deleted.',
       });
+
+      // A failed replacement cleanup retains the old credential, and clear
+      // retries both that deletion and deletion of the active replacement.
+      await handleChatCommand(setInteraction as any);
+      createWebhook.mockResolvedValueOnce({
+        id: 'replacement-webhook',
+        token: 'replacement-token',
+        send: vi.fn().mockResolvedValue(undefined),
+        delete: vi.fn().mockResolvedValue(undefined),
+      });
+      webhookDeleteMock.mockRejectedValueOnce(new Error('temporary Discord failure'));
+      await handleChatCommand(setInteraction as any);
+      expect(db.getChannelWebhook('dc:source')?.webhook_id).toBe('replacement-webhook');
+      expect(db.getPendingWebhookCleanup('dc:source').map((item) => item.webhook_id)).toEqual([
+        'created-webhook',
+      ]);
+      expect(editReply).toHaveBeenLastCalledWith({
+        content: expect.stringContaining('previous Discord webhook could not be deleted'),
+      });
+
+      const retryEditReply = vi.fn().mockResolvedValue(undefined);
+      await handleChatCommand({
+        ...setInteraction,
+        options: { getSubcommand: () => 'webhook-clear' },
+        editReply: retryEditReply,
+      } as any);
+      expect(db.getChannelWebhook('dc:source')).toBeUndefined();
+      expect(db.getPendingWebhookCleanup('dc:source')).toEqual([]);
+      expect(retryEditReply).toHaveBeenCalledWith({
+        content: 'Pi activity monitoring is disabled and the Discord webhook was deleted.',
+      });
+
+      await handleChatCommand(setInteraction as any);
+      webhookDeleteMock.mockRejectedValueOnce(new Error('temporary Discord failure'));
+      const failedClearReply = vi.fn().mockResolvedValue(undefined);
+      await handleChatCommand({
+        ...setInteraction,
+        options: { getSubcommand: () => 'webhook-clear' },
+        editReply: failedClearReply,
+      } as any);
+      expect(db.getChannelWebhook('dc:source')).toBeUndefined();
+      expect(db.getPendingWebhookCleanup('dc:source')).toHaveLength(1);
+      expect(() => db.unregisterChannel('dc:source')).toThrow(/pending cleanup/);
+      expect(failedClearReply).toHaveBeenCalledWith({
+        content: expect.stringContaining('run /pi webhook-clear again to retry'),
+      });
+
+      await handleChatCommand({
+        ...setInteraction,
+        options: { getSubcommand: () => 'webhook-clear' },
+        editReply: retryEditReply,
+      } as any);
+      expect(db.getPendingWebhookCleanup('dc:source')).toEqual([]);
+
+      const raceDelete = vi.fn().mockResolvedValue(undefined);
+      createWebhook.mockResolvedValueOnce({
+        id: 'racing-webhook',
+        token: 'racing-token',
+        send: vi.fn().mockImplementation(async () => {
+          db.unregisterChannel('dc:source');
+        }),
+        delete: raceDelete,
+      });
+      await handleChatCommand(setInteraction as any);
+      expect(db.getChannelWebhook('dc:source')).toBeUndefined();
+      expect(raceDelete).toHaveBeenCalledWith('Rolling back failed Pi monitoring setup');
+      expect(editReply).toHaveBeenLastCalledWith({
+        content: expect.stringContaining('no longer registered'),
+      });
     } finally {
       db.closeDb();
     }

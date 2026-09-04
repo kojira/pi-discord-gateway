@@ -280,6 +280,29 @@ process.stdin.on('data', (chunk) => {
     expect(result.error!.length).toBeLessThanOrEqual(600);
   });
 
+  it('kills and reaps a Pi child that rejects the initial prompt but ignores EOF', async () => {
+    const root = makeFakePi(`
+process.on('SIGTERM', () => {});
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+let buffer = '';
+process.stdin.on('data', (chunk) => {
+  buffer += chunk.toString('utf8');
+  if (!buffer.includes('\\n')) return;
+  const command = JSON.parse(buffer.slice(0, buffer.indexOf('\\n')));
+  send({ type: 'response', id: command.id, command: 'prompt', success: false, error: 'prompt denied' });
+  setInterval(() => {}, 1000);
+});
+`);
+
+    const result = await Promise.race([
+      invokeAgent('ch_prompt_rejected', 'hello', { cwd: root }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('prompt-rejecting Pi was not reaped')), 3000),
+      ),
+    ]);
+    expect(result).toEqual({ ok: false, text: '', error: 'prompt denied' });
+  });
+
   it('force-kills a Pi child that ignores SIGTERM after shutdown abort', async () => {
     const root = makeFakePi(`
 process.on('SIGTERM', () => {});
