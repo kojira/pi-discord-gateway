@@ -13,6 +13,14 @@ All notable changes to this project will be documented in this file.
 
 - Replace one-shot print-mode agent invocations with the official JSONL RPC protocol.
 
+### Fixed
+
+- Keep legacy Pi automatic retry and compaction recovery alive after `agent_end`.
+- Mark steering queue rows done only after Pi emits the corresponding consumed user message.
+- Requeue only unconsumed steering messages, avoiding duplicate tool side effects after later failures.
+- Reject steering responses that race with invocation settlement instead of dropping the message.
+- Preserve intermediate Discord delivery failures even when later assistant messages send successfully.
+
 ## [1.7.0] - 2026-07-17
 
 ### Changed
