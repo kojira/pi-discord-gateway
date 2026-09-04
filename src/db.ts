@@ -261,21 +261,39 @@ export function claimNextMessage(channelJid: string): QueuedMessage | undefined 
 }
 
 export function markMessageDone(rowid: number): void {
-  db.prepare(
-    "update message_queue set status = 'done', processed_at = datetime('now') where rowid = ?",
-  ).run(rowid);
+  markMessagesDone([rowid]);
+}
+
+export function markMessagesDone(rowids: readonly number[]): void {
+  updateMessageStatuses(rowids, 'done');
 }
 
 export function markMessageFailed(rowid: number): void {
-  db.prepare(
-    "update message_queue set status = 'failed', processed_at = datetime('now') where rowid = ?",
-  ).run(rowid);
+  markMessagesFailed([rowid]);
+}
+
+export function markMessagesFailed(rowids: readonly number[]): void {
+  updateMessageStatuses(rowids, 'failed');
 }
 
 export function requeueMessage(rowid: number): void {
+  requeueMessages([rowid]);
+}
+
+export function requeueMessages(rowids: readonly number[]): void {
+  updateMessageStatuses(rowids, 'pending');
+}
+
+function updateMessageStatuses(
+  rowids: readonly number[],
+  status: 'pending' | 'done' | 'failed',
+): void {
+  if (rowids.length === 0) return;
+  const placeholders = rowids.map(() => '?').join(', ');
+  const processedAt = status === 'pending' ? 'null' : "datetime('now')";
   db.prepare(
-    "update message_queue set status = 'pending', processed_at = null where rowid = ?",
-  ).run(rowid);
+    `update message_queue set status = ?, processed_at = ${processedAt} where rowid in (${placeholders})`,
+  ).run(status, ...rowids);
 }
 
 export function clearPendingMessages(channelJid: string): number {
@@ -292,13 +310,49 @@ export function recoverStuckMessages(): number {
   return result.changes;
 }
 
-export function countPendingMessages(channelJid: string): number {
-  const row = db
+export function pendingMessageSnapshot(channelJid: string): {
+  count: number;
+  latestRowid: number;
+} {
+  return db
     .prepare(
-      "select count(*) as count from message_queue where status = 'pending' and channel_jid = ?",
+      `select count(*) as count, coalesce(max(rowid), 0) as latestRowid
+       from message_queue where status = 'pending' and channel_jid = ?`,
     )
-    .get(channelJid) as { count: number };
-  return row.count;
+    .get(channelJid) as { count: number; latestRowid: number };
+}
+
+export function listPendingMessages(channelJid: string, limit: number): QueuedMessage[] {
+  return db
+    .prepare(
+      `select rowid, channel_jid, sender, sender_name, content, timestamp, status, attachments
+       from message_queue
+       where status = 'pending' and channel_jid = ?
+       order by rowid asc
+       limit ?`,
+    )
+    .all(channelJid, limit) as QueuedMessage[];
+}
+
+export function claimMessages(rowids: readonly number[]): boolean {
+  if (rowids.length === 0) return false;
+  const placeholders = rowids.map(() => '?').join(', ');
+  return db.transaction(() => {
+    const pending = db
+      .prepare(
+        `select count(*) as count from message_queue
+         where status = 'pending' and rowid in (${placeholders})`,
+      )
+      .get(...rowids) as { count: number };
+    if (pending.count !== rowids.length) return false;
+    const result = db
+      .prepare(
+        `update message_queue set status = 'processing'
+         where status = 'pending' and rowid in (${placeholders})`,
+      )
+      .run(...rowids);
+    return result.changes === rowids.length;
+  })();
 }
 
 /** Get channels that have pending messages */
