@@ -134,6 +134,65 @@ describe('webhook activity delivery', () => {
     expect(sendMock.mock.calls[2][0].content).toContain('epoch three');
   });
 
+  it('uses the complete persisted route identity for webhook delivery epochs', async () => {
+    const monitor = await import('../src/discord/webhook-monitor.js');
+    let mapping = webhook;
+    getChannelWebhookMock.mockImplementation(() => mapping);
+
+    monitor.enqueueWebhookTrace('dc:source', 'original route');
+    await monitor.flushWebhookTrace('dc:source');
+
+    mapping = { ...mapping, webhook_token: 'rotated-secret' };
+    monitor.enqueueWebhookTrace('dc:source', 'rotated token');
+    await monitor.flushWebhookTrace('dc:source');
+
+    mapping = {
+      ...mapping,
+      destination_channel_id: 'other-monitor',
+      destination_channel_name: 'other monitoring',
+    };
+    monitor.enqueueWebhookTrace('dc:source', 'changed destination');
+    await monitor.flushWebhookTrace('dc:source');
+
+    expect(WebhookClientMock).toHaveBeenCalledTimes(3);
+    expect(WebhookClientMock).toHaveBeenNthCalledWith(2, {
+      id: 'webhook-id',
+      token: 'rotated-secret',
+    });
+    expect(WebhookClientMock).toHaveBeenNthCalledWith(3, {
+      id: 'webhook-id',
+      token: 'rotated-secret',
+    });
+    expect(destroyMock).toHaveBeenCalledTimes(2);
+    expect(sendMock.mock.calls[1][0].content).toContain('rotated token');
+    expect(sendMock.mock.calls[2][0].content).toContain('changed destination');
+  });
+
+  it('drops queued content when the complete route identity changes before send', async () => {
+    const monitor = await import('../src/discord/webhook-monitor.js');
+    let mapping = webhook;
+    getChannelWebhookMock.mockImplementation(() => mapping);
+
+    monitor.enqueueWebhookTrace('dc:source', 'must stay on old token');
+    mapping = { ...webhook, webhook_token: 'rotated-secret' };
+    await monitor.flushWebhookTrace('dc:source');
+
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(WebhookClientMock).not.toHaveBeenCalled();
+    expect(monitor.webhookMonitorStats('dc:source').states).toBe(0);
+
+    monitor.enqueueWebhookTrace('dc:source', 'new token route');
+    await monitor.flushWebhookTrace('dc:source');
+    expect(WebhookClientMock).toHaveBeenCalledWith({
+      id: 'webhook-id',
+      token: 'rotated-secret',
+    });
+    expect(sendMock).toHaveBeenCalledWith({
+      content: expect.stringContaining('new token route'),
+      allowedMentions: { parse: [] },
+    });
+  });
+
   it('immediately discards queued old-epoch activity after clear', async () => {
     const monitor = await import('../src/discord/webhook-monitor.js');
     let mapping: typeof webhook | undefined = webhook;

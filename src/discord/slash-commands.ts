@@ -471,31 +471,49 @@ async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promi
     return;
   }
 
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  // Acquire the cross-process lease before the first await on the valid setup
+  // path. A concurrent clear can now tombstone this lease even while Discord's
+  // interaction acknowledgement is blocked.
+  let provisioning: ChannelWebhookProvisioning;
+  try {
+    provisioning = beginChannelWebhookProvisioning({
+      channel_jid: channel.jid,
+      destination_channel_id: destination.id,
+      destination_channel_name: destination.name,
+      webhook_name: buildWebhookName(channel.name),
+    });
+  } catch (error) {
+    logger.warn(
+      { jid: channel.jid, ...safeDiscordErrorMetadata(error) },
+      'Monitoring webhook provisioning could not start',
+    );
+    throw webhookCommandError(
+      'Webhook setup could not start. Another setup or cleanup may be active; run /pi webhook-clear to inspect it.',
+    );
+  }
+
+  try {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  } catch {
+    // No Discord create request has been issued, so this lease is safe to
+    // cancel. cancelChannelWebhookProvisioning refuses reconciled tombstones.
+    if (canMutateWebhookDb()) cancelChannelWebhookProvisioning(provisioning.lease_id);
+    throw webhookCommandError('Discord did not acknowledge webhook setup. Try again.');
+  }
   if (!canMutateWebhookDb()) return;
 
-  const oldWebhookDeleted = await (async (): Promise<boolean | undefined> => {
-    // This SQLite lease is the cross-process serialization point. It exists
-    // before Discord creation and prevents unregister/clear from discarding
-    // lifecycle state while the network request is outstanding.
-    let provisioning: ChannelWebhookProvisioning;
-    try {
-      provisioning = beginChannelWebhookProvisioning({
-        channel_jid: channel.jid,
-        destination_channel_id: destination.id,
-        destination_channel_name: destination.name,
-        webhook_name: buildWebhookName(channel.name),
-      });
-    } catch (error) {
-      logger.warn(
-        { jid: channel.jid, ...safeDiscordErrorMetadata(error) },
-        'Monitoring webhook provisioning could not start',
-      );
-      throw webhookCommandError(
-        'Webhook setup could not start. Another setup or cleanup may be active; run /pi webhook-clear to inspect it.',
-      );
-    }
+  const currentProvisioning = getChannelWebhookProvisioning(channel.jid);
+  if (
+    currentProvisioning?.lease_id !== provisioning.lease_id ||
+    currentProvisioning.state !== 'creating' ||
+    currentProvisioning.reconciling !== 0
+  ) {
+    throw webhookCommandError(
+      'Webhook setup was canceled before creation. Monitoring remains disabled.',
+    );
+  }
 
+  const oldWebhookDeleted = await (async (): Promise<boolean | undefined> => {
     let webhook: Awaited<ReturnType<TextChannel['createWebhook']>>;
     try {
       webhook = await destinationChannel.createWebhook({
@@ -815,10 +833,13 @@ async function reconcileWebhookProvisioning(
     return 'retry';
   }
   if (!canMutateWebhookDb()) return 'stopped';
-  const matches = [...webhooks.values()].filter(
-    (webhook) => webhook.name === provisioning.webhook_name,
-  );
   const priorTargets = getChannelWebhookReconciliationTargets(provisioning.lease_id);
+  const priorTargetSet = new Set(priorTargets);
+  const matches = [...webhooks.values()].filter(
+    (webhook) =>
+      webhook.name === provisioning.webhook_name ||
+      (typeof webhook.id === 'string' && priorTargetSet.has(webhook.id)),
+  );
   if (matches.length === 0) {
     if (priorTargets.length > 0) {
       // A prior attempt durably observed these IDs before issuing DELETE. Their

@@ -473,7 +473,7 @@ export function cancelChannelWebhookProvisioning(leaseId: string): boolean {
     db
       .prepare(
         `delete from channel_webhook_provisioning
-         where lease_id = ? and state = 'creating'`,
+         where lease_id = ? and state = 'creating' and reconciling = 0`,
       )
       .run(leaseId).changes > 0
   );

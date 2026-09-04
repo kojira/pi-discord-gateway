@@ -35,7 +35,7 @@ export function enqueueWebhookTrace(jid: string, line: string): void {
   // epoch before creating the current state so each JID retains at most one
   // client and bounded queue in this process.
   for (const state of matchingStates(jid)) {
-    if (!webhook || state.webhook.webhook_id !== webhook.webhook_id) retireState(state);
+    if (!webhook || !isSameWebhookEpoch(state.webhook, webhook)) retireState(state);
   }
   if (!webhook) return;
 
@@ -247,7 +247,8 @@ async function deliver(state: WebhookDeliveryState, chunks: readonly string[]): 
 }
 
 function isCurrentWebhookEpoch(state: WebhookDeliveryState): boolean {
-  return getChannelWebhook(state.jid)?.webhook_id === state.webhook.webhook_id;
+  const current = getChannelWebhook(state.jid);
+  return Boolean(current && isSameWebhookEpoch(state.webhook, current));
 }
 
 function getOrCreateState(webhook: ChannelWebhookConfig): WebhookDeliveryState {
@@ -295,7 +296,22 @@ function countUndelivered(states: readonly WebhookDeliveryState[]): number {
 }
 
 function batchKey(webhook: ChannelWebhookConfig): string {
-  return `${webhook.channel_jid}:${webhook.webhook_id}`;
+  return webhookEpochKey(webhook);
+}
+
+function isSameWebhookEpoch(left: ChannelWebhookConfig, right: ChannelWebhookConfig): boolean {
+  return webhookEpochKey(left) === webhookEpochKey(right);
+}
+
+/** Complete persisted route identity; this value stays in memory and is never logged. */
+function webhookEpochKey(webhook: ChannelWebhookConfig): string {
+  return JSON.stringify([
+    webhook.channel_jid,
+    webhook.webhook_id,
+    webhook.webhook_token,
+    webhook.destination_channel_id,
+    webhook.destination_channel_name,
+  ]);
 }
 
 export function webhookMonitorStats(jid: string): {
