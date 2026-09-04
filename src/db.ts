@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { mkdirSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { config } from './config.js';
 import { logger } from './logger.js';
@@ -9,6 +9,14 @@ let db!: Database.Database;
 let dbOpen = false;
 
 export type ScheduledTaskType = 'once' | 'recurring';
+
+export interface ChannelWebhookConfig {
+  channel_jid: string;
+  destination_channel_id: string;
+  destination_channel_name: string;
+  webhook_id: string;
+  webhook_token: string;
+}
 
 export interface ScheduledTaskRow {
   id: number;
@@ -60,6 +68,16 @@ export function initDb(): void {
 
     create index if not exists idx_queue_status on message_queue(status, channel_jid);
 
+    create table if not exists channel_webhooks (
+      channel_jid              text primary key,
+      destination_channel_id   text not null,
+      destination_channel_name text not null,
+      webhook_id               text not null,
+      webhook_token            text not null,
+      created_at                text not null default (datetime('now')),
+      updated_at                text not null default (datetime('now'))
+    );
+
     create table if not exists message_log (
       rowid         integer primary key autoincrement,
       channel_jid   text not null,
@@ -89,6 +107,7 @@ export function initDb(): void {
   ensureTableColumn('channels', 'thinking_override', "text not null default ''");
   ensureTableColumn('channels', 'cwd_override', "text not null default ''");
   ensureTableColumn('message_queue', 'attachments', 'text');
+  hardenDatabaseFiles();
 
   logger.info({ path: config.dbPath }, 'Database initialized');
 }
@@ -144,8 +163,13 @@ export function registerChannel(ch: RegisteredChannel): void {
 }
 
 export function unregisterChannel(jid: string): boolean {
-  const result = db.prepare('delete from channels where jid = ?').run(jid);
-  return result.changes > 0;
+  return db.transaction(() => {
+    const result = db.prepare('delete from channels where jid = ?').run(jid);
+    if (result.changes > 0) {
+      db.prepare('delete from channel_webhooks where channel_jid = ?').run(jid);
+    }
+    return result.changes > 0;
+  })();
 }
 
 export function getChannel(jid: string): RegisteredChannel | undefined {
@@ -197,6 +221,52 @@ export function setChannelThinkingOverride(jid: string, thinkingOverride: Thinki
 export function clearChannelThinkingOverride(jid: string): boolean {
   const result = db.prepare("update channels set thinking_override = '' where jid = ?").run(jid);
   return result.changes > 0;
+}
+
+export function getChannelWebhook(channelJid: string): ChannelWebhookConfig | undefined {
+  return db
+    .prepare(
+      `select channel_jid, destination_channel_id, destination_channel_name, webhook_id, webhook_token
+       from channel_webhooks where channel_jid = ?`,
+    )
+    .get(channelJid) as ChannelWebhookConfig | undefined;
+}
+
+export function setChannelWebhook(webhook: ChannelWebhookConfig): void {
+  db.prepare(
+    `insert into channel_webhooks (
+       channel_jid, destination_channel_id, destination_channel_name, webhook_id, webhook_token
+     ) values (?, ?, ?, ?, ?)
+     on conflict(channel_jid) do update set
+       destination_channel_id = excluded.destination_channel_id,
+       destination_channel_name = excluded.destination_channel_name,
+       webhook_id = excluded.webhook_id,
+       webhook_token = excluded.webhook_token,
+       updated_at = datetime('now')`,
+  ).run(
+    webhook.channel_jid,
+    webhook.destination_channel_id,
+    webhook.destination_channel_name,
+    webhook.webhook_id,
+    webhook.webhook_token,
+  );
+  hardenDatabaseFiles();
+}
+
+export function clearChannelWebhook(channelJid: string): ChannelWebhookConfig | undefined {
+  return db.transaction(() => {
+    const existing = getChannelWebhook(channelJid);
+    if (!existing) return undefined;
+    db.prepare('delete from channel_webhooks where channel_jid = ?').run(channelJid);
+    return existing;
+  })();
+}
+
+function hardenDatabaseFiles(): void {
+  if (process.platform === 'win32') return;
+  for (const path of [config.dbPath, `${config.dbPath}-wal`, `${config.dbPath}-shm`]) {
+    if (existsSync(path)) chmodSync(path, 0o600);
+  }
 }
 
 function rowToChannel(row: any): RegisteredChannel {

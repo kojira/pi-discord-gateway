@@ -1,10 +1,13 @@
 import {
+  ChannelType,
   MessageFlags,
+  PermissionFlagsBits,
   SlashCommandBuilder,
   type AutocompleteInteraction,
   type ChatInputCommandInteraction,
   type Client,
   type InteractionReplyOptions,
+  type TextChannel,
 } from 'discord.js';
 import {
   getChannelSessionStatus,
@@ -15,12 +18,15 @@ import {
 import { config } from '../config.js';
 import {
   clearChannelModelOverride,
+  clearChannelWebhook,
   clearPendingMessages,
   createDmChannel,
   getChannel,
+  getChannelWebhook,
   registerChannel,
   setChannelModelOverride,
   setChannelThinkingOverride,
+  setChannelWebhook,
 } from '../db.js';
 import { logger } from '../logger.js';
 import {
@@ -43,6 +49,7 @@ import {
 import { abortChannelTask, isChannelProcessing } from '../agent/queue.js';
 import { rotateChannelSessionDir } from '../session/path.js';
 import type { RegisteredChannel } from '../types.js';
+import { deleteDiscordWebhook, flushWebhookTrace } from './webhook-monitor.js';
 
 const PI_COMMAND = new SlashCommandBuilder()
   .setName('pi')
@@ -93,6 +100,23 @@ const PI_COMMAND = new SlashCommandBuilder()
     sub
       .setName('stop')
       .setDescription('Abort the current task and clear the queue for this channel'),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName('webhook')
+      .setDescription('Send this channel’s Pi activity to a monitoring webhook channel')
+      .addChannelOption((option) =>
+        option
+          .setName('channel')
+          .setDescription('Discord channel that will receive the Pi activity trace')
+          .setRequired(true)
+          .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement),
+      ),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName('webhook-clear')
+      .setDescription('Stop sending this channel’s Pi activity to its monitoring webhook'),
   );
 
 export async function registerGlobalCommands(client: Client<true>): Promise<void> {
@@ -177,6 +201,12 @@ export async function handleChatCommand(interaction: ChatInputCommandInteraction
       case 'stop':
         await handleStop(interaction);
         return;
+      case 'webhook':
+        await handleWebhookSet(interaction);
+        return;
+      case 'webhook-clear':
+        await handleWebhookClear(interaction);
+        return;
       default:
         await interaction.reply(reply(`Unknown subcommand: ${subcommand}`, interaction));
     }
@@ -256,6 +286,141 @@ async function handleStop(interaction: ChatInputCommandInteraction): Promise<voi
   await interaction.reply(reply(notes.join(' '), interaction));
 }
 
+async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promise<void> {
+  const channel = ensureManagedChannel(interaction);
+  if (!channel) {
+    await interaction.reply(reply(notRegisteredMessage(), interaction));
+    return;
+  }
+  if (!interaction.inGuild() || !interaction.guildId) {
+    await interaction.reply(
+      reply('Monitoring webhooks can only be configured in a server.', interaction),
+    );
+    return;
+  }
+  if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageWebhooks)) {
+    await interaction.reply(reply('Manage Webhooks permission is required.', interaction));
+    return;
+  }
+
+  const destination = interaction.options.getChannel('channel', true);
+  const destinationGuildId =
+    'guildId' in destination && typeof destination.guildId === 'string'
+      ? destination.guildId
+      : 'guild_id' in destination && typeof destination.guild_id === 'string'
+        ? destination.guild_id
+        : undefined;
+  if (
+    destinationGuildId !== interaction.guildId ||
+    (destination.type !== ChannelType.GuildText &&
+      destination.type !== ChannelType.GuildAnnouncement) ||
+    !('createWebhook' in destination)
+  ) {
+    await interaction.reply(
+      reply('Choose a text or announcement channel in this server.', interaction),
+    );
+    return;
+  }
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const existing = getChannelWebhook(channel.jid);
+  const webhookName = buildWebhookName(channel.name);
+  const webhook = await (destination as TextChannel).createWebhook({
+    name: webhookName,
+    reason: `Pi activity monitoring configured by Discord user ${interaction.user.id}`,
+  });
+
+  if (!webhook.token) {
+    await webhook.delete('Webhook creation returned no usable token').catch(() => undefined);
+    throw new Error('Discord created a webhook without a usable token.');
+  }
+
+  try {
+    await webhook.send({
+      content: `✅ Pi activity monitoring enabled for **${escapeDiscordMarkdown(channel.name)}**.`,
+      allowedMentions: { parse: [] },
+    });
+    await flushWebhookTrace(channel.jid);
+    setChannelWebhook({
+      channel_jid: channel.jid,
+      destination_channel_id: destination.id,
+      destination_channel_name: destination.name,
+      webhook_id: webhook.id,
+      webhook_token: webhook.token,
+    });
+  } catch (error) {
+    await webhook.delete('Rolling back failed Pi monitoring setup').catch(() => undefined);
+    throw error;
+  }
+
+  let oldWebhookDeleted = true;
+  if (existing && existing.webhook_id !== webhook.id) {
+    oldWebhookDeleted = await deleteDiscordWebhook(existing, 'Pi monitoring destination replaced');
+  }
+
+  logger.info(
+    { jid: channel.jid, destinationChannelId: destination.id },
+    'Channel monitoring webhook configured',
+  );
+  await interaction.editReply({
+    content: `Pi activity for this channel will be sent to <#${destination.id}>.${
+      oldWebhookDeleted ? '' : '\n⚠️ The previous Discord webhook could not be deleted.'
+    }`,
+  });
+}
+
+async function handleWebhookClear(interaction: ChatInputCommandInteraction): Promise<void> {
+  const channel = ensureManagedChannel(interaction);
+  if (!channel) {
+    await interaction.reply(reply(notRegisteredMessage(), interaction));
+    return;
+  }
+  if (!interaction.inGuild()) {
+    await interaction.reply(
+      reply('Monitoring webhooks can only be configured in a server.', interaction),
+    );
+    return;
+  }
+  if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageWebhooks)) {
+    await interaction.reply(reply('Manage Webhooks permission is required.', interaction));
+    return;
+  }
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const existing = getChannelWebhook(channel.jid);
+  if (!existing) {
+    await interaction.editReply({
+      content: 'No monitoring webhook is configured for this channel.',
+    });
+    return;
+  }
+
+  await flushWebhookTrace(channel.jid);
+  clearChannelWebhook(channel.jid);
+  const deleted = await deleteDiscordWebhook(existing, 'Pi activity monitoring disabled');
+  logger.info(
+    { jid: channel.jid, destinationChannelId: existing.destination_channel_id },
+    'Channel monitoring webhook cleared',
+  );
+  await interaction.editReply({
+    content: deleted
+      ? 'Pi activity monitoring is disabled and the Discord webhook was deleted.'
+      : 'Pi activity monitoring is disabled. ⚠️ Discord did not allow the old webhook to be deleted.',
+  });
+}
+
+function buildWebhookName(sourceName: string): string {
+  const compact = sourceName.replace(/[\r\n]/gu, ' ').trim() || 'channel';
+  return `ぴーこ monitor · ${compact}`.slice(0, 80);
+}
+
+function escapeDiscordMarkdown(text: string): string {
+  const markdownCharacters = new Set('\\`*_{}[]()<>#+-.!|');
+  return [...text]
+    .map((character) => (markdownCharacters.has(character) ? `\\${character}` : character))
+    .join('');
+}
+
 async function handleStatus(interaction: ChatInputCommandInteraction): Promise<void> {
   const channel = ensureManagedChannel(interaction);
   if (!channel) {
@@ -269,7 +434,9 @@ async function handleStatus(interaction: ChatInputCommandInteraction): Promise<v
 
   const effective = computeEffectiveChannelSettings(channel);
   const sessionStatus = await getChannelSessionStatus(channel.folder, effective.effectiveCwd);
-  await interaction.editReply({ content: buildStatusMessage(effective, sessionStatus) });
+  await interaction.editReply({
+    content: buildStatusMessage(channel.jid, effective, sessionStatus),
+  });
 }
 
 async function handleModelSet(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -409,13 +576,21 @@ function notRegisteredMessage(): string {
 }
 
 function buildStatusMessage(
+  channelJid: string,
   effective: EffectiveChannelSettings,
   sessionStatus: ChannelSessionStatus,
 ): string {
+  const webhook = getChannelWebhook(channelJid);
   const rows: Array<[string, string]> = [
     ['Model', formatModelValue(effective)],
     ['Thinking', formatThinkingValue(effective)],
     ['Working dir', formatWorkingDirValue(effective)],
+    [
+      'Webhook',
+      webhook
+        ? `#${webhook.destination_channel_name} (${webhook.destination_channel_id})`
+        : 'disabled',
+    ],
   ];
 
   if (effective.thinkingAdjusted) {

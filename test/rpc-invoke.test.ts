@@ -82,10 +82,12 @@ setTimeout(finish, 2000);
     });
 
     const messages: string[] = [];
+    const traces: string[] = [];
     let steerAccepted = false;
     let steerConsumed = false;
     const result = await invokeAgent('ch_test', 'initial prompt', {
       cwd: root,
+      onTraceEvent: (text) => traces.push(text),
       onAssistantMessage: async (text) => {
         messages.push(text);
         if (text === 'working update') {
@@ -100,6 +102,14 @@ setTimeout(finish, 2000);
 
     expect(result).toEqual({ ok: true, text: 'final answer' });
     expect(messages).toEqual(['working update', 'final answer']);
+    expect(traces).toEqual([
+      '▶️ agent started',
+      '👤 user: initial prompt',
+      '🤖 assistant: working update\n🛠️ bash {}',
+      '👤 user: [Discord user: Alice]\nchange course',
+      '🤖 assistant: final answer',
+      '⏹️ agent settled',
+    ]);
     expect(steerAccepted).toBe(true);
     expect(steerConsumed).toBe(true);
     expect(await steerActiveAgent('ch_test', 'too late')).toBe(false);

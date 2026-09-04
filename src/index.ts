@@ -7,6 +7,7 @@ import { startMediaCleanup } from './session/media.js';
 import { listAvailableModels } from './agent/model-catalog.js';
 import { startProcessingLoop, stopProcessingLoop } from './agent/queue.js';
 import { startScheduler } from './agent/scheduler.js';
+import { stopWebhookMonitor } from './discord/webhook-monitor.js';
 
 /**
  * pi-discord-gateway - Lightweight Discord gateway for pi coding agent.
@@ -63,6 +64,7 @@ export async function startGateway(): Promise<void> {
         await stopProcessingLoop({ timeoutMs: config.shutdownTimeoutMs });
       }
 
+      await stopWebhookMonitor();
       stopDiscord();
       closeDb();
       logger.info('Gateway stopped');

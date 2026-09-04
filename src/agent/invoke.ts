@@ -13,6 +13,7 @@ import {
 import type { AgentResult } from '../types.js';
 import { resolvePiSpawn } from './pi-spawn.js';
 import { startSupervisorWatcher, type SupervisorRequest } from './supervisor-channel.js';
+import { formatAgentTraceEvent } from './trace.js';
 
 export interface SessionTokenUsage {
   input: number;
@@ -93,6 +94,7 @@ export async function invokeAgent(
     attachments?: string | null;
     onAssistantMessage?: (text: string) => void | Promise<void>;
     onSupervisorRequest?: (request: SupervisorRequest) => void | Promise<void>;
+    onTraceEvent?: (text: string) => void;
   },
 ): Promise<AgentResult> {
   const sessionDir = resolveChannelSessionDir(channelFolder);
@@ -227,6 +229,15 @@ export async function invokeAgent(
           pending.resolve(message as RpcResponse);
         }
         return;
+      }
+
+      const trace = formatAgentTraceEvent(message);
+      if (trace && opts?.onTraceEvent) {
+        try {
+          opts.onTraceEvent(trace);
+        } catch (error: any) {
+          logger.warn({ channelFolder, err: error.message }, 'Failed to enqueue webhook trace');
+        }
       }
 
       if (message?.type === 'message_start' && message.message?.role === 'user') {

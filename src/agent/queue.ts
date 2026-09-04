@@ -27,6 +27,7 @@ import {
 import { invokeAgent, steerActiveAgent } from './invoke.js';
 import { promptSupervisorRequest, sendResponse, setTyping } from '../discord/client.js';
 import { computeEffectiveChannelSettings } from './channel-settings.js';
+import { enqueueWebhookTrace } from '../discord/webhook-monitor.js';
 import type { QueuedMessage } from '../types.js';
 
 /** Channels currently being processed (per-channel serial lock) */
@@ -493,6 +494,7 @@ async function processMessage(
         logMessage(jid, 'assistant', text);
       },
       onSupervisorRequest: (request) => promptSupervisorRequest(jid, request),
+      onTraceEvent: (text) => enqueueWebhookTrace(jid, text),
     });
 
     if (signal.aborted) {

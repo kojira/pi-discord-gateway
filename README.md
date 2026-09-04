@@ -29,7 +29,7 @@ That's it. The setup wizard checks prerequisites, asks for your Discord bot toke
 - **[pi](https://github.com/badlogic/pi-mono)** ≥ 0.74.0 installed and on `PATH`, with login completed (`~/.pi/agent/auth.json`)
 - **Discord bot token** — [create one here](https://discord.com/developers/applications)
   - Enable **Message Content Intent** under Privileged Gateway Intents
-  - Bot permissions: `Send Messages`, `Read Message History`, `View Channels`, `Attach Files`
+  - Bot permissions: `Send Messages`, `Read Message History`, `View Channels`, `Attach Files`, and `Manage Webhooks` when activity monitoring is used
 
 ## Features
 
@@ -98,16 +98,28 @@ Re-running `piscord register` with `--cwd` updates that channel's working direct
 
 The gateway registers a global `/pi` command on Discord:
 
-| Subcommand        | Description                                                        |
-| ----------------- | ------------------------------------------------------------------ |
-| `/pi status`      | Show model, thinking, working directory, session info, token usage |
-| `/pi model`       | Set the channel's model (autocomplete from pi's available models)  |
-| `/pi reset-model` | Clear the channel's model override                                 |
-| `/pi thinking`    | Set thinking level: off / minimal / low / medium / high / xhigh    |
-| `/pi new`         | Start a fresh session for this channel                             |
-| `/pi stop`        | Abort the current task and clear queued messages                   |
+| Subcommand          | Description                                                         |
+| ------------------- | ------------------------------------------------------------------- |
+| `/pi status`        | Show model, thinking, working directory, session info, token usage  |
+| `/pi model`         | Set the channel's model (autocomplete from pi's available models)   |
+| `/pi reset-model`   | Clear the channel's model override                                  |
+| `/pi thinking`      | Set thinking level: off / minimal / low / medium / high / xhigh     |
+| `/pi new`           | Start a fresh session for this channel                              |
+| `/pi stop`          | Abort the current task and clear queued messages                    |
+| `/pi webhook`       | Send this channel's Pi activity trace to a selected Discord channel |
+| `/pi webhook-clear` | Disable monitoring and delete this channel's managed webhook        |
 
 `/pi model` reads the catalog from the configured `PI_BIN`, so it stays in sync when pi adds or removes models. It also honors pi's `enabledModels` setting (configured through `/scoped-models`), including model order and glob patterns. If no scope is configured, it shows all available models.
+
+### Per-channel activity webhooks
+
+Run `/pi webhook channel:#monitoring` in a registered source channel to create a managed Discord webhook in the selected destination channel. Each source channel has an independent mapping. The trace includes consumed user prompts, completed assistant text and thinking, tool starts/results, retry/compaction notices, and run lifecycle events. Streaming token deltas are omitted to avoid webhook spam.
+
+Only members with Discord's **Manage Webhooks** permission can configure or clear monitoring. The bot also needs **Manage Webhooks** in the selected destination. Responses are ephemeral, webhook tokens are stored in the gateway SQLite database and never displayed, and forwarded content disables Discord mentions.
+
+Use `/pi webhook-clear` in the source channel to stop forwarding and delete its managed Discord webhook. `/pi status` shows the configured destination without exposing its token.
+
+> **Privacy:** activity traces can contain user text, model reasoning, tool arguments/results, and local file paths. Select a private destination with an appropriate retention policy.
 
 ## Tools for Pi
 
