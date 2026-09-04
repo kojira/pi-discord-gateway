@@ -24,13 +24,19 @@ interface WebhookDeliveryState {
 }
 
 const deliveryStates = new Map<string, WebhookDeliveryState>();
-const configurationLocks = new Map<string, Promise<void>>();
 let stopping = false;
 
 /** Queue a bounded trace line for the webhook configured for this source channel. */
 export function enqueueWebhookTrace(jid: string, line: string): void {
   if (stopping || !line.trim()) return;
   const webhook = getChannelWebhook(jid);
+
+  // A different process may replace or clear this route. Discard every stale
+  // epoch before creating the current state so each JID retains at most one
+  // client and bounded queue in this process.
+  for (const state of matchingStates(jid)) {
+    if (!webhook || state.webhook.webhook_id !== webhook.webhook_id) retireState(state);
+  }
   if (!webhook) return;
 
   const state = getOrCreateState(webhook);
@@ -50,28 +56,6 @@ export function enqueueWebhookTrace(jid: string, line: string): void {
     void drainState(state);
   } else if (!state.timer) {
     state.timer = setTimeout(() => void drainState(state), FLUSH_INTERVAL_MS);
-  }
-}
-
-/** Serialize webhook lifecycle mutations for one source channel. */
-export async function withWebhookConfigLock<T>(
-  jid: string,
-  operation: () => Promise<T>,
-): Promise<T> {
-  const previous = configurationLocks.get(jid) ?? Promise.resolve();
-  let release!: () => void;
-  const current = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  const tail = previous.catch(() => undefined).then(() => current);
-  configurationLocks.set(jid, tail);
-
-  await previous.catch(() => undefined);
-  try {
-    return await operation();
-  } finally {
-    release();
-    if (configurationLocks.get(jid) === tail) configurationLocks.delete(jid);
   }
 }
 

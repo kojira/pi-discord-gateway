@@ -790,6 +790,19 @@ describe('webhook slash commands', () => {
         content: expect.stringContaining('Pi activity monitoring is disabled'),
       });
 
+      // A second set reaches the durable lease immediately instead of waiting
+      // behind the first process-local create promise.
+      const secondSetReply = vi.fn().mockResolvedValue(undefined);
+      await handleChatCommand({
+        ...common,
+        options: { getSubcommand: () => 'webhook', getChannel: () => destination },
+        editReply: secondSetReply,
+      } as any);
+      expect(createWebhook).toHaveBeenCalledOnce();
+      expect(secondSetReply).toHaveBeenCalledWith({
+        content: expect.stringContaining('Webhook setup could not start'),
+      });
+
       const lateDelete = vi.fn().mockResolvedValue(undefined);
       resolveCreate({
         id: 'late-id',
@@ -803,6 +816,82 @@ describe('webhook slash commands', () => {
     } finally {
       db.closeDb();
     }
+  });
+
+  it('keeps a durable locator and avoids closed DB access when create resolves after shutdown', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'piscord-slash-webhook-shutdown-create-'));
+    tempDirs.push(tempDir);
+    process.env.DB_PATH = join(tempDir, 'gateway.db');
+    process.env.PIDG_CONFIG = resolve(tempDir, 'missing.env');
+
+    const db = await import('../src/db.js');
+    const commands = await import('../src/discord/slash-commands.js');
+    const { ChannelType } = await import('discord.js');
+    db.initDb();
+    db.registerChannel({
+      jid: 'dc:source',
+      name: 'source',
+      folder: 'ch_source',
+      requiresTrigger: false,
+      isMain: false,
+      modelOverride: '',
+      thinkingOverride: '',
+      cwdOverride: '',
+    });
+
+    let resolveCreate!: (webhook: any) => void;
+    const createWebhook = vi.fn(
+      () =>
+        new Promise<any>((resolve) => {
+          resolveCreate = resolve;
+        }),
+    );
+    const send = vi.fn().mockResolvedValue(undefined);
+    const remove = vi.fn().mockResolvedValue(undefined);
+    const editReply = vi.fn().mockResolvedValue(undefined);
+    const setPromise = commands.handleChatCommand({
+      commandName: 'pi',
+      channelId: 'source',
+      guildId: 'guild-1',
+      guild: { members: { me: { id: 'bot' } } },
+      user: { id: 'admin' },
+      memberPermissions: { has: () => true },
+      inGuild: () => true,
+      options: {
+        getSubcommand: () => 'webhook',
+        getChannel: () => ({
+          id: 'monitor',
+          name: 'monitoring',
+          guildId: 'guild-1',
+          type: ChannelType.GuildText,
+          createWebhook,
+          permissionsFor: vi.fn().mockReturnValue({ has: () => true }),
+        }),
+      },
+      deferReply: vi.fn().mockResolvedValue(undefined),
+      editReply,
+      reply: vi.fn().mockResolvedValue(undefined),
+      followUp: vi.fn().mockResolvedValue(undefined),
+      replied: false,
+      deferred: true,
+    } as any);
+    await vi.waitFor(() => expect(createWebhook).toHaveBeenCalledOnce());
+    const locator = db.getChannelWebhookProvisioning('dc:source');
+    expect(locator).toMatchObject({ state: 'creating', destination_channel_id: 'monitor' });
+
+    await commands.stopWebhookLifecycle(0);
+    db.closeDb();
+    resolveCreate({ id: 'late-id', token: 'late-token', send, delete: remove });
+    await expect(setPromise).resolves.toBeUndefined();
+    expect(send).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalled();
+    expect(editReply).not.toHaveBeenCalled();
+
+    // Reopening proves the late continuation did not access closed SQLite and
+    // the unique-name locator remains available for /pi webhook-clear recovery.
+    db.initDb();
+    expect(db.getChannelWebhookProvisioning('dc:source')).toEqual(locator);
+    db.closeDb();
   });
 
   it('retains an uncertain create locator when Discord may have committed before rejection', async () => {

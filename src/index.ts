@@ -2,6 +2,7 @@ import { config } from './config.js';
 import { logger } from './logger.js';
 import { initDb, closeDb, getAllChannels } from './db.js';
 import { startDiscord, stopDiscord, getBotTag } from './discord/client.js';
+import { stopWebhookLifecycle } from './discord/slash-commands.js';
 import { startArchiveCleanup } from './session/archive-cleanup.js';
 import { startMediaCleanup } from './session/media.js';
 import { listAvailableModels } from './agent/model-catalog.js';
@@ -59,6 +60,10 @@ export async function startGateway(): Promise<void> {
       stopScheduler();
       stopArchiveCleanup();
       stopMediaCleanup();
+
+      // Reject new webhook mutations as soon as shutdown starts. SQLite stays
+      // open while the bounded lifecycle drain persists any final state.
+      await stopWebhookLifecycle(config.shutdownTimeoutMs);
 
       if (processingStarted) {
         await stopProcessingLoop({ timeoutMs: config.shutdownTimeoutMs });

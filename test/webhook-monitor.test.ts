@@ -101,30 +101,37 @@ describe('webhook activity delivery', () => {
     expect(WebhookClientMock).toHaveBeenCalledTimes(1);
   });
 
-  it('serializes concurrent set/set and set/clear lifecycle operations per source', async () => {
+  it('retires stale in-memory epochs immediately across repeated external replacements', async () => {
     const monitor = await import('../src/discord/webhook-monitor.js');
-    const order: string[] = [];
-    let releaseFirst!: () => void;
-    const firstGate = new Promise<void>((resolve) => {
-      releaseFirst = resolve;
-    });
+    let mapping = webhook;
+    getChannelWebhookMock.mockImplementation(() => mapping);
 
-    const firstSet = monitor.withWebhookConfigLock('dc:source', async () => {
-      order.push('set-1-start');
-      await firstGate;
-      order.push('set-1-end');
-    });
-    const secondSet = monitor.withWebhookConfigLock('dc:source', async () => {
-      order.push('set-2');
-    });
-    const clear = monitor.withWebhookConfigLock('dc:source', async () => {
-      order.push('clear');
-    });
+    monitor.enqueueWebhookTrace('dc:source', 'epoch one');
+    await monitor.flushWebhookTrace('dc:source');
+    expect(monitor.webhookMonitorStats('dc:source').states).toBe(1);
 
-    await vi.waitFor(() => expect(order).toEqual(['set-1-start']));
-    releaseFirst();
-    await Promise.all([firstSet, secondSet, clear]);
-    expect(order).toEqual(['set-1-start', 'set-1-end', 'set-2', 'clear']);
+    mapping = { ...webhook, webhook_id: 'webhook-id-2', webhook_token: 'secret-2' };
+    monitor.enqueueWebhookTrace('dc:source', 'epoch two');
+    await monitor.flushWebhookTrace('dc:source');
+    expect(monitor.webhookMonitorStats('dc:source').states).toBe(1);
+
+    mapping = { ...webhook, webhook_id: 'webhook-id-3', webhook_token: 'secret-3' };
+    monitor.enqueueWebhookTrace('dc:source', 'epoch three');
+    expect(monitor.webhookMonitorStats('dc:source')).toMatchObject({
+      states: 1,
+      queuedLines: 1,
+    });
+    expect(destroyMock).toHaveBeenCalledTimes(2);
+
+    await monitor.flushWebhookTrace('dc:source');
+    expect(WebhookClientMock).toHaveBeenCalledTimes(3);
+    expect(WebhookClientMock).toHaveBeenLastCalledWith({
+      id: 'webhook-id-3',
+      token: 'secret-3',
+    });
+    expect(sendMock.mock.calls[0][0].content).toContain('epoch one');
+    expect(sendMock.mock.calls[1][0].content).toContain('epoch two');
+    expect(sendMock.mock.calls[2][0].content).toContain('epoch three');
   });
 
   it('immediately discards queued old-epoch activity after clear', async () => {

@@ -71,7 +71,6 @@ import {
   isDiscordUnknownWebhookError,
   retireWebhookTrace,
   safeDiscordErrorMetadata,
-  withWebhookConfigLock,
 } from './webhook-monitor.js';
 
 const PI_COMMAND = new SlashCommandBuilder()
@@ -151,6 +150,52 @@ const catalogRefreshesInFlight = new Set<string>();
 
 class WebhookCommandError extends Error {}
 
+const activeWebhookLifecycles = new Set<Promise<void>>();
+let acceptingWebhookLifecycles = true;
+let webhookDbMutationsAllowed = true;
+
+/**
+ * Stop accepting webhook mutations and wait only up to the shutdown budget.
+ * A timed-out handler leaves its pre-await durable provisioning/cleanup record
+ * for recovery and is forbidden from touching SQLite when it resumes.
+ */
+export async function stopWebhookLifecycle(timeoutMs = config.shutdownTimeoutMs): Promise<void> {
+  acceptingWebhookLifecycles = false;
+  const settling = Promise.allSettled([...activeWebhookLifecycles]);
+  let timedOut = false;
+  let timer: NodeJS.Timeout | undefined;
+
+  if (activeWebhookLifecycles.size > 0) {
+    if (timeoutMs <= 0) {
+      timedOut = true;
+    } else {
+      await Promise.race([
+        settling,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(() => {
+            timedOut = true;
+            resolve();
+          }, timeoutMs);
+        }),
+      ]);
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  // The gateway may close SQLite immediately after this function returns.
+  webhookDbMutationsAllowed = false;
+  if (timedOut) {
+    logger.warn(
+      { active: activeWebhookLifecycles.size, timeoutMs },
+      'Webhook lifecycle shutdown deadline reached; durable cleanup state retained',
+    );
+  }
+}
+
+function canMutateWebhookDb(): boolean {
+  return webhookDbMutationsAllowed;
+}
+
 function webhookCommandError(message: string): WebhookCommandError {
   return new WebhookCommandError(message);
 }
@@ -209,7 +254,27 @@ export async function handleChatCommand(interaction: ChatInputCommandInteraction
   if (interaction.commandName !== 'pi') return;
 
   const subcommand = interaction.options.getSubcommand();
+  const isWebhookCommand = subcommand === 'webhook' || subcommand === 'webhook-clear';
+  if (!isWebhookCommand) {
+    await executeChatCommand(interaction, subcommand, false);
+    return;
+  }
+  if (!acceptingWebhookLifecycles) return;
 
+  const operation = executeChatCommand(interaction, subcommand, true);
+  activeWebhookLifecycles.add(operation);
+  try {
+    await operation;
+  } finally {
+    activeWebhookLifecycles.delete(operation);
+  }
+}
+
+async function executeChatCommand(
+  interaction: ChatInputCommandInteraction,
+  subcommand: string,
+  isWebhookCommand: boolean,
+): Promise<void> {
   try {
     switch (subcommand) {
       case 'status':
@@ -240,7 +305,10 @@ export async function handleChatCommand(interaction: ChatInputCommandInteraction
         await interaction.reply(reply(`Unknown subcommand: ${subcommand}`, interaction));
     }
   } catch (error) {
-    const isWebhookCommand = subcommand === 'webhook' || subcommand === 'webhook-clear';
+    // A timed-out lifecycle continuation must not use the closed Discord client
+    // for command replies. All cleanup state needed by the next process was
+    // persisted before the Discord await that timed out.
+    if (isWebhookCommand && !canMutateWebhookDb()) return;
     if (isWebhookCommand) {
       logger.error(
         {
@@ -404,7 +472,9 @@ async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promi
   }
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-  const oldWebhookDeleted = await withWebhookConfigLock(channel.jid, async () => {
+  if (!canMutateWebhookDb()) return;
+
+  const oldWebhookDeleted = await (async (): Promise<boolean | undefined> => {
     // This SQLite lease is the cross-process serialization point. It exists
     // before Discord creation and prevents unregister/clear from discarding
     // lifecycle state while the network request is outstanding.
@@ -433,6 +503,7 @@ async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promi
         reason: `Pi activity monitoring configured by Discord user ${interaction.user.id}`,
       });
     } catch (error) {
+      if (!canMutateWebhookDb()) return undefined;
       const definitive = isDefinitiveWebhookCreateRejection(error);
       if (definitive) {
         // A concrete Discord 4xx response (other than timeout/rate limiting)
@@ -456,6 +527,7 @@ async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promi
         : cleanupPendingError();
     }
 
+    if (!canMutateWebhookDb()) return undefined;
     if (!webhook.token) {
       // The remote webhook ID is the only durable recovery handle available
       // without a token. Claim reconciliation and persist the ID before DELETE
@@ -483,6 +555,7 @@ async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promi
         channel.jid,
         destination.id,
       );
+      if (!canMutateWebhookDb()) return undefined;
       if (deleted) {
         completeChannelWebhookProvisioningReconciliation(provisioning.lease_id, targets);
       }
@@ -510,8 +583,10 @@ async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promi
         content: `✅ Pi activity monitoring enabled for **${escapeDiscordMarkdown(channel.name)}**.`,
         allowedMentions: { parse: [] },
       });
+      if (!canMutateWebhookDb()) return undefined;
       ({ previous } = activateChannelWebhookProvisioning(provisioning.lease_id));
     } catch (error) {
+      if (!canMutateWebhookDb()) return undefined;
       logger.warn(
         {
           jid: channel.jid,
@@ -526,6 +601,7 @@ async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promi
         channel.jid,
         destination.id,
       );
+      if (!canMutateWebhookDb()) return undefined;
       if (deleted) {
         completeChannelWebhookProvisioningRollback(provisioning.lease_id, createdConfig.webhook_id);
       } else {
@@ -544,11 +620,14 @@ async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promi
     // epoch must not roll back or delete the newly active webhook.
     if (!previous || previous.webhook_id === webhook.id) return true;
     await retireWebhookTrace(channel.jid, previous.webhook_id);
+    if (!canMutateWebhookDb()) return undefined;
     const deleted = await deleteDiscordWebhook(previous, 'Pi monitoring destination replaced');
+    if (!canMutateWebhookDb()) return undefined;
     if (deleted) completeWebhookCleanup(previous.webhook_id);
     return deleted;
-  });
+  })();
 
+  if (oldWebhookDeleted === undefined || !canMutateWebhookDb()) return;
   logger.info(
     { jid: channel.jid, destinationChannelId: destination.id },
     'Channel monitoring webhook configured',
@@ -592,17 +671,19 @@ async function handleWebhookClear(interaction: ChatInputCommandInteraction): Pro
   discardWebhookTrace(channelJid);
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  if (!canMutateWebhookDb()) return;
   const pendingBefore = getPendingWebhookCleanup(channelJid);
 
   // Credential cleanup is independent of name-based provisioning recovery.
   // A failed/empty provisioning scan must never reactivate the old epoch.
   for (const webhook of pendingBefore) {
-    if (await deleteDiscordWebhook(webhook, 'Pi activity monitoring disabled')) {
-      completeWebhookCleanup(webhook.webhook_id);
-    }
+    const deleted = await deleteDiscordWebhook(webhook, 'Pi activity monitoring disabled');
+    if (!canMutateWebhookDb()) return;
+    if (deleted) completeWebhookCleanup(webhook.webhook_id);
   }
 
   const reconciliation = await reconcileWebhookProvisioning(interaction, channelJid);
+  if (!canMutateWebhookDb() || reconciliation === 'stopped') return;
   const remaining = getPendingWebhookCleanup(channelJid);
   const hasLifecycle = Boolean(getChannelWebhookProvisioning(channelJid));
   const result =
@@ -669,7 +750,8 @@ async function handleWebhookClear(interaction: ChatInputCommandInteraction): Pro
   });
 }
 
-type ProvisioningReconciliation = 'none' | 'queued' | 'recovered' | 'uncertain' | 'retry';
+type ProvisioningReconciliation =
+  'none' | 'queued' | 'recovered' | 'uncertain' | 'retry' | 'stopped';
 
 async function reconcileWebhookProvisioning(
   interaction: ChatInputCommandInteraction,
@@ -707,9 +789,11 @@ async function reconcileWebhookProvisioning(
   try {
     destination = await interaction.client.channels.fetch(provisioning.destination_channel_id);
   } catch (error) {
+    if (!canMutateWebhookDb()) return 'stopped';
     logWebhookReconciliationFailure(provisioning, error, 'destination_fetch_failed');
     return 'retry';
   }
+  if (!canMutateWebhookDb()) return 'stopped';
   if (!destination || !('fetchWebhooks' in destination)) {
     logger.warn(
       {
@@ -726,9 +810,11 @@ async function reconcileWebhookProvisioning(
   try {
     webhooks = await destination.fetchWebhooks();
   } catch (error) {
+    if (!canMutateWebhookDb()) return 'stopped';
     logWebhookReconciliationFailure(provisioning, error, 'webhook_fetch_failed');
     return 'retry';
   }
+  if (!canMutateWebhookDb()) return 'stopped';
   const matches = [...webhooks.values()].filter(
     (webhook) => webhook.name === provisioning.webhook_name,
   );
@@ -772,6 +858,7 @@ async function reconcileWebhookProvisioning(
       provisioning.channel_jid,
       provisioning.destination_channel_id,
     );
+    if (!canMutateWebhookDb()) return 'stopped';
     if (!deleted) return 'retry';
   }
 
