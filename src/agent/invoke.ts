@@ -44,8 +44,15 @@ interface RpcResponse {
   error?: string;
 }
 
+interface PendingSteeringMessage {
+  message: string;
+  consumed: boolean;
+  onConsumed?: () => void | Promise<void>;
+}
+
 interface ActiveRpcInvocation {
   sendCommand: (command: Record<string, unknown>) => Promise<RpcResponse>;
+  sendSteer: (message: string, onConsumed?: () => void | Promise<void>) => Promise<boolean>;
 }
 
 const activeRpcInvocations = new Map<string, ActiveRpcInvocation>();
@@ -54,7 +61,11 @@ const activeRpcInvocations = new Map<string, ActiveRpcInvocation>();
 export async function steerActiveAgent(
   channelFolder: string,
   userText: string,
-  opts?: { attachments?: string | null; signal?: AbortSignal },
+  opts?: {
+    attachments?: string | null;
+    signal?: AbortSignal;
+    onConsumed?: () => void | Promise<void>;
+  },
 ): Promise<boolean> {
   const invocation = activeRpcInvocations.get(channelFolder);
   if (!invocation) return false;
@@ -62,18 +73,7 @@ export async function steerActiveAgent(
   const prompt = await buildPromptWithAttachments(channelFolder, userText, opts);
   if (activeRpcInvocations.get(channelFolder) !== invocation) return false;
 
-  try {
-    const response = await invocation.sendCommand({ type: 'steer', message: prompt });
-    if (!response.success) {
-      throw new Error(response.error || 'Pi rejected the steering message');
-    }
-    return true;
-  } catch (error) {
-    // Attachment downloads can outlive the invocation that was captured above.
-    // Treat closure/replacement of that exact process as a retryable inactive race.
-    if (activeRpcInvocations.get(channelFolder) !== invocation) return false;
-    throw error;
-  }
+  return invocation.sendSteer(prompt, opts?.onConsumed);
 }
 
 /**
@@ -131,6 +131,7 @@ export async function invokeAgent(
       string,
       { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }
     >();
+    const pendingSteeringMessages: PendingSteeringMessage[] = [];
     const supervisorWatcher = opts?.onSupervisorRequest
       ? startSupervisorWatcher({ signal: opts.signal, onRequest: opts.onSupervisorRequest })
       : undefined;
@@ -142,8 +143,11 @@ export async function invokeAgent(
     let lastAssistantFailed = false;
     let settled = false;
     let finished = false;
+    let initialPromptObserved = false;
     let forceKillTimer: NodeJS.Timeout | undefined;
+    let legacySettleTimer: NodeJS.Timeout | undefined;
     let deliveryChain = Promise.resolve();
+    let consumptionChain = Promise.resolve();
 
     const sendCommand = (command: Record<string, unknown>): Promise<RpcResponse> => {
       if (!proc.stdin.writable || proc.stdin.destroyed) {
@@ -161,8 +165,42 @@ export async function invokeAgent(
       });
     };
 
+    const removePendingSteering = (request: PendingSteeringMessage) => {
+      const index = pendingSteeringMessages.indexOf(request);
+      if (index !== -1) pendingSteeringMessages.splice(index, 1);
+    };
+
+    const sendSteer = async (
+      message: string,
+      onConsumed?: () => void | Promise<void>,
+    ): Promise<boolean> => {
+      const request: PendingSteeringMessage = { message, consumed: false, onConsumed };
+      pendingSteeringMessages.push(request);
+
+      try {
+        const response = await sendCommand({ type: 'steer', message });
+        if (!response.success) {
+          removePendingSteering(request);
+          throw new Error(response.error || 'Pi rejected the steering message');
+        }
+
+        // Consumption is authoritative even if settlement raced the response.
+        if (request.consumed) return true;
+        if (activeRpcInvocations.get(channelFolder) !== activeInvocation) {
+          removePendingSteering(request);
+          return false;
+        }
+        return true;
+      } catch (error) {
+        removePendingSteering(request);
+        if (activeRpcInvocations.get(channelFolder) !== activeInvocation) return false;
+        throw error;
+      }
+    };
+    const activeInvocation: ActiveRpcInvocation = { sendCommand, sendSteer };
+
     const unregister = () => {
-      if (activeRpcInvocations.get(channelFolder)?.sendCommand === sendCommand) {
+      if (activeRpcInvocations.get(channelFolder) === activeInvocation) {
         activeRpcInvocations.delete(channelFolder);
       }
     };
@@ -171,6 +209,7 @@ export async function invokeAgent(
       if (finished) return;
       finished = true;
       if (forceKillTimer) clearTimeout(forceKillTimer);
+      if (legacySettleTimer) clearTimeout(legacySettleTimer);
       unregister();
       supervisorWatcher?.stop();
       for (const pending of pendingCommands.values()) {
@@ -186,6 +225,31 @@ export async function invokeAgent(
         if (pending) {
           pendingCommands.delete(message.id);
           pending.resolve(message as RpcResponse);
+        }
+        return;
+      }
+
+      if (message?.type === 'message_start' && message.message?.role === 'user') {
+        const userText = extractUserText(message.message.content);
+        if (!initialPromptObserved && userText === prompt) {
+          initialPromptObserved = true;
+          return;
+        }
+
+        const request = pendingSteeringMessages.find((candidate) => candidate.message === userText);
+        if (request) {
+          request.consumed = true;
+          removePendingSteering(request);
+          if (request.onConsumed) {
+            consumptionChain = consumptionChain
+              .then(() => request.onConsumed!())
+              .catch((error: any) => {
+                logger.error(
+                  { channelFolder, err: error.message },
+                  'Failed to record consumed steering message',
+                );
+              });
+          }
         }
         return;
       }
@@ -220,14 +284,49 @@ export async function invokeAgent(
       }
 
       // Pi versions before agent_settled support use agent_end as the terminal
-      // event. Newer versions include willRetry and then emit agent_settled.
+      // event. Debounce it briefly because legacy auto-retry and auto-compaction
+      // continuation events are emitted immediately after agent_end.
       if (message?.type === 'agent_end' && !('willRetry' in message)) {
-        settleInvocation();
+        scheduleLegacySettlement();
+        return;
       }
+
+      if (
+        message?.type === 'agent_start' ||
+        message?.type === 'auto_retry_start' ||
+        message?.type === 'compaction_start'
+      ) {
+        cancelLegacySettlement();
+        return;
+      }
+
+      if (message?.type === 'auto_retry_end' && message.success === false) {
+        scheduleLegacySettlement();
+        return;
+      }
+
+      if (message?.type === 'compaction_end' && message.willRetry === false) {
+        scheduleLegacySettlement();
+      }
+    };
+
+    const cancelLegacySettlement = () => {
+      if (!legacySettleTimer) return;
+      clearTimeout(legacySettleTimer);
+      legacySettleTimer = undefined;
+    };
+
+    const scheduleLegacySettlement = () => {
+      cancelLegacySettlement();
+      legacySettleTimer = setTimeout(() => {
+        legacySettleTimer = undefined;
+        settleInvocation();
+      }, 100);
     };
 
     const settleInvocation = () => {
       if (settled) return;
+      cancelLegacySettlement();
       settled = true;
       unregister();
       proc.stdin.end();
@@ -293,7 +392,7 @@ export async function invokeAgent(
 
     proc.on('close', (code) => {
       const stderr = Buffer.concat(errChunks).toString('utf8').trim();
-      void deliveryChain.then(() => {
+      void Promise.all([deliveryChain, consumptionChain]).then(() => {
         if (!settled || code !== 0) {
           logger.warn(
             { code, stderr: stderr.slice(0, 500), channelFolder },
@@ -340,7 +439,7 @@ export async function invokeAgent(
           return;
         }
         if (!settled && !finished) {
-          activeRpcInvocations.set(channelFolder, { sendCommand });
+          activeRpcInvocations.set(channelFolder, activeInvocation);
         }
       })
       .catch((error: any) => {
@@ -370,6 +469,18 @@ async function buildPromptWithAttachments(
     }
   }
   return attachmentPrompt ? `${userText}\n\n${attachmentPrompt}` : userText;
+}
+
+function extractUserText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter(
+      (block): block is { type: 'text'; text: string } =>
+        block?.type === 'text' && typeof block.text === 'string',
+    )
+    .map((block) => block.text)
+    .join('');
 }
 
 function extractAssistantText(content: unknown): string {

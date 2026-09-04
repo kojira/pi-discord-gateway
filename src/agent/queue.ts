@@ -29,7 +29,7 @@ const activeTaskPromises = new Set<Promise<void>>();
 const steeringTaskPromises = new Set<Promise<void>>();
 const steeringTaskControllers = new Set<AbortController>();
 const steeringChannels = new Set<string>();
-const acceptedSteeringRows = new Map<string, number[]>();
+const acceptedSteeringRows = new Map<string, Set<number>>();
 const activeTaskControllers = new Map<number, AbortController>();
 const activeChannelControllers = new Map<string, AbortController>();
 
@@ -186,7 +186,17 @@ async function processSteeringMessage(
   const prompt = `[Discord user: ${senderName}]\n${content}`;
 
   try {
-    const accepted = await steerActiveAgent(channelFolder, prompt, { attachments, signal });
+    let consumed = false;
+    const accepted = await steerActiveAgent(channelFolder, prompt, {
+      attachments,
+      signal,
+      onConsumed: () => {
+        consumed = true;
+        markMessageDone(rowid);
+        acceptedSteeringRows.get(jid)?.delete(rowid);
+        logger.info({ jid, rowid }, 'Steering message consumed by Pi');
+      },
+    });
     if (!accepted) {
       // The active run may still be starting or may have just settled. Let the
       // normal queue path process this message on the next poll unless the user
@@ -197,9 +207,11 @@ async function processSteeringMessage(
     }
 
     logMessage(jid, 'user', content);
-    const rows = acceptedSteeringRows.get(jid) || [];
-    rows.push(rowid);
-    acceptedSteeringRows.set(jid, rows);
+    if (!consumed) {
+      const rows = acceptedSteeringRows.get(jid) || new Set<number>();
+      rows.add(rowid);
+      acceptedSteeringRows.set(jid, rows);
+    }
     logger.info({ jid, rowid, senderName, len: content.length }, 'Message steered into active run');
   } catch (err: any) {
     if (!activeChannels.has(jid)) {
@@ -289,6 +301,7 @@ async function processMessage(
 
     let lastAttemptedText = '';
     let lastDeliverySucceeded = false;
+    let hadLiveDeliveryFailure = false;
     const result = await invokeAgent(channel.folder, prompt, {
       model: effective.rawModelRef || undefined,
       thinking: effective.hasManagedThinking ? effective.effectiveThinking : undefined,
@@ -299,6 +312,7 @@ async function processMessage(
         lastAttemptedText = text;
         lastDeliverySucceeded = await sendResponse(jid, text);
         if (!lastDeliverySucceeded) {
+          hadLiveDeliveryFailure = true;
           throw new Error('Could not deliver live assistant message to Discord');
         }
         logMessage(jid, 'assistant', text);
@@ -314,7 +328,9 @@ async function processMessage(
     }
 
     if (result.ok) {
-      finalizeSteeringRows(jid, 'done');
+      // Any rows left here were accepted but never observed as user messages.
+      // Requeue them rather than claiming they were processed.
+      finalizeSteeringRows(jid, 'pending');
 
       // Every RPC assistant message is delivered at message_end. Send a fallback
       // only when the callback was never attempted; retrying a partially sent
@@ -334,6 +350,16 @@ async function processMessage(
         logMessage(jid, 'assistant', result.text);
       }
 
+      if (hadLiveDeliveryFailure) {
+        markMessageFailed(rowid);
+        await sendResponse(
+          jid,
+          '⚠️ One or more intermediate assistant messages could not be delivered.',
+        );
+        logger.warn({ jid }, 'Agent completed with missing live Discord messages');
+        return;
+      }
+
       markMessageDone(rowid);
       logger.info({ jid, responseLen: result.text.length }, 'Message processed');
       return;
@@ -346,6 +372,7 @@ async function processMessage(
     logger.warn({ jid, error: result.error }, 'Agent returned error');
   } catch (err: any) {
     if (signal.aborted) {
+      finalizeSteeringRows(jid, 'failed');
       markMessageFailed(rowid);
       logger.info({ jid, rowid }, 'Message abandoned: shutdown interrupted processing');
       return;
@@ -365,7 +392,7 @@ async function processMessage(
 }
 
 function finalizeSteeringRows(jid: string, status: 'done' | 'failed' | 'pending'): void {
-  const rows = acceptedSteeringRows.get(jid) || [];
+  const rows = acceptedSteeringRows.get(jid) || new Set<number>();
   acceptedSteeringRows.delete(jid);
   for (const rowid of rows) {
     if (status === 'done') markMessageDone(rowid);

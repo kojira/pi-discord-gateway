@@ -51,6 +51,7 @@ process.stdin.on('data', (chunk) => {
     if (command.type === 'prompt') {
       send({ type: 'response', id: command.id, command: 'prompt', success: true });
       send({ type: 'agent_start' });
+      send({ type: 'message_start', message: { role: 'user', content: command.message } });
       send({ type: 'message_end', message: { role: 'assistant', content: [
         { type: 'text', text: 'working update' },
         { type: 'toolCall', id: 'tool-1', name: 'bash', arguments: {} }
@@ -58,6 +59,7 @@ process.stdin.on('data', (chunk) => {
     } else if (command.type === 'steer') {
       appendFileSync(${JSON.stringify(steerCapture)}, command.message);
       send({ type: 'response', id: command.id, command: 'steer', success: true });
+      send({ type: 'message_start', message: { role: 'user', content: command.message } });
       setTimeout(finish, 10);
     } else if (command.type === 'abort') {
       send({ type: 'response', id: command.id, command: 'abort', success: true });
@@ -81,12 +83,17 @@ setTimeout(finish, 2000);
 
     const messages: string[] = [];
     let steerAccepted = false;
+    let steerConsumed = false;
     const result = await invokeAgent('ch_test', 'initial prompt', {
       cwd: root,
       onAssistantMessage: async (text) => {
         messages.push(text);
         if (text === 'working update') {
-          steerAccepted = await steerActiveAgent('ch_test', '[Discord user: Alice]\nchange course');
+          steerAccepted = await steerActiveAgent(
+            'ch_test',
+            '[Discord user: Alice]\nchange course',
+            { onConsumed: () => void (steerConsumed = true) },
+          );
         }
       },
     });
@@ -94,6 +101,7 @@ setTimeout(finish, 2000);
     expect(result).toEqual({ ok: true, text: 'final answer' });
     expect(messages).toEqual(['working update', 'final answer']);
     expect(steerAccepted).toBe(true);
+    expect(steerConsumed).toBe(true);
     expect(await steerActiveAgent('ch_test', 'too late')).toBe(false);
     expect(
       await import('node:fs').then(({ readFileSync }) => readFileSync(steerCapture, 'utf8')),
@@ -116,6 +124,62 @@ process.stdin.on('data', (chunk) => {
 
     const result = await invokeAgent('ch_old', 'hello', { cwd: root });
     expect(result).toEqual({ ok: true, text: 'old Pi final' });
+  });
+
+  it('keeps a legacy invocation alive across automatic retry events', async () => {
+    const root = makeFakePi(`
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+let buffer = '';
+process.stdin.on('data', (chunk) => {
+  buffer += chunk.toString('utf8');
+  if (!buffer.includes('\\n')) return;
+  const command = JSON.parse(buffer.slice(0, buffer.indexOf('\\n')));
+  send({ type: 'response', id: command.id, command: 'prompt', success: true });
+  send({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: 'temporary overload' } });
+  send({ type: 'agent_end', messages: [] });
+  send({ type: 'auto_retry_start', attempt: 1, maxAttempts: 3, delayMs: 20 });
+  setTimeout(() => {
+    send({ type: 'agent_start' });
+    send({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'retry succeeded' }], stopReason: 'stop' } });
+    send({ type: 'auto_retry_end', success: true, attempt: 1 });
+    send({ type: 'agent_end', messages: [] });
+  }, 150);
+});
+`);
+
+    const result = await invokeAgent('ch_retry', 'hello', { cwd: root });
+    expect(result).toEqual({ ok: true, text: 'retry succeeded' });
+  });
+
+  it('rejects a steer accepted after its invocation has already settled', async () => {
+    const root = makeFakePi(`
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+let buffer = '';
+process.stdin.on('data', (chunk) => {
+  buffer += chunk.toString('utf8');
+  let index;
+  while ((index = buffer.indexOf('\\n')) !== -1) {
+    const command = JSON.parse(buffer.slice(0, index)); buffer = buffer.slice(index + 1);
+    if (command.type === 'prompt') {
+      send({ type: 'response', id: command.id, command: 'prompt', success: true });
+      send({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'ready' }], stopReason: 'stop' } });
+    } else if (command.type === 'steer') {
+      send({ type: 'agent_settled' });
+      send({ type: 'response', id: command.id, command: 'steer', success: true });
+    }
+  }
+});
+`);
+
+    let accepted = true;
+    const result = await invokeAgent('ch_race', 'hello', {
+      cwd: root,
+      onAssistantMessage: async () => {
+        accepted = await steerActiveAgent('ch_race', 'too late');
+      },
+    });
+    expect(accepted).toBe(false);
+    expect(result).toEqual({ ok: true, text: 'ready' });
   });
 
   it('treats assistant error state as authoritative even when partial text exists', async () => {

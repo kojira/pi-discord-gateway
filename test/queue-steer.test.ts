@@ -46,7 +46,7 @@ afterEach(() => {
 });
 
 describe('active-run steering', () => {
-  it('routes a later channel message to Pi steer instead of starting another invocation', async () => {
+  it('marks steer done only when consumed and does not replay it after a later run error', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'piscord-queue-steer-'));
     tempDirs.push(tempDir);
     const dbPath = join(tempDir, 'gateway.db');
@@ -56,14 +56,18 @@ describe('active-run steering', () => {
     process.env.MAX_CONCURRENCY = '1';
     process.env.PI_CWD = '/global/project';
 
-    let finishInvocation!: (value: { ok: true; text: string }) => void;
+    let finishInvocation!: (value: { ok: boolean; text: string; error?: string }) => void;
     invokeAgentMock.mockImplementation(
       () =>
         new Promise((resolveInvocation) => {
           finishInvocation = resolveInvocation;
         }),
     );
-    steerActiveAgentMock.mockResolvedValue(true);
+    let consumeSteer!: () => void | Promise<void>;
+    steerActiveAgentMock.mockImplementation(async (_folder, _prompt, opts) => {
+      consumeSteer = opts.onConsumed;
+      return true;
+    });
     sendResponseMock.mockResolvedValue(true);
     setTypingMock.mockResolvedValue(undefined);
 
@@ -114,8 +118,18 @@ describe('active-run steering', () => {
       ).toBe('processing');
       inspectDb.close();
 
-      finishInvocation({ ok: true, text: 'done' });
-      await vi.waitFor(() => expect(sendResponseMock).toHaveBeenCalledWith('dc:123', 'done'));
+      await consumeSteer();
+      const consumedDb = new Database(dbPath, { readonly: true });
+      expect(
+        (consumedDb.prepare('select status from message_queue where rowid = 2').get() as any)
+          .status,
+      ).toBe('done');
+      consumedDb.close();
+
+      finishInvocation({ ok: false, text: '', error: 'later failure' });
+      await vi.waitFor(() =>
+        expect(sendResponseMock).toHaveBeenCalledWith('dc:123', '⚠️ Agent error: later failure'),
+      );
 
       const completedDb = new Database(dbPath, { readonly: true });
       expect(
@@ -125,6 +139,71 @@ describe('active-run steering', () => {
       completedDb.close();
     } finally {
       finishInvocation?.({ ok: true, text: 'done' });
+      await queue.stopProcessingLoop({ timeoutMs: 1000 });
+      db.closeDb();
+    }
+  });
+
+  it('keeps an intermediate Discord delivery failure sticky after a later success', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'piscord-queue-delivery-'));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, 'gateway.db');
+    process.env.DB_PATH = dbPath;
+    process.env.SESSIONS_DIR = resolve(tempDir, 'sessions');
+    process.env.POLL_INTERVAL_MS = '1';
+    process.env.MAX_CONCURRENCY = '1';
+
+    invokeAgentMock.mockImplementation(async (_folder, _prompt, opts) => {
+      try {
+        await opts.onAssistantMessage('intermediate');
+      } catch {
+        // invokeAgent logs callback failures and continues delivering later turns.
+      }
+      await opts.onAssistantMessage('final');
+      return { ok: true, text: 'final' };
+    });
+    sendResponseMock
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(true);
+    setTypingMock.mockResolvedValue(undefined);
+
+    vi.resetModules();
+    const db = await import('../src/db.js');
+    const queue = await import('../src/agent/queue.js');
+    db.initDb();
+    db.registerChannel({
+      jid: 'dc:456',
+      name: 'delivery test',
+      folder: 'ch_456',
+      requiresTrigger: false,
+      isMain: false,
+      modelOverride: '',
+      thinkingOverride: '',
+      cwdOverride: '',
+    });
+    db.enqueueMessage({
+      channelJid: 'dc:456',
+      sender: 'u_1',
+      senderName: 'Alice',
+      content: 'run task',
+      timestamp: new Date().toISOString(),
+    });
+
+    queue.startProcessingLoop();
+    try {
+      await vi.waitFor(() =>
+        expect(sendResponseMock).toHaveBeenCalledWith(
+          'dc:456',
+          '⚠️ One or more intermediate assistant messages could not be delivered.',
+        ),
+      );
+      const inspectDb = new Database(dbPath, { readonly: true });
+      expect(
+        (inspectDb.prepare('select status from message_queue where rowid = 1').get() as any).status,
+      ).toBe('failed');
+      inspectDb.close();
+    } finally {
       await queue.stopProcessingLoop({ timeoutMs: 1000 });
       db.closeDb();
     }
