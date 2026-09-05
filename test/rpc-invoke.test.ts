@@ -118,6 +118,33 @@ setTimeout(finish, 2000);
     ).toContain('change course');
   });
 
+  it('forwards bounded subagent tool output through the trace callback', async () => {
+    const root = makeFakePi(`
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+let buffer = '';
+process.stdin.on('data', (chunk) => {
+  buffer += chunk.toString('utf8');
+  if (!buffer.includes('\\n')) return;
+  const command = JSON.parse(buffer.slice(0, buffer.indexOf('\\n')));
+  send({ type: 'response', id: command.id, command: 'prompt', success: true });
+  send({ type: 'tool_execution_start', toolCallId: 'sub-1', toolName: 'subagent', args: { action: 'status', id: 'run-1' } });
+  send({ type: 'tool_execution_end', toolCallId: 'sub-1', toolName: 'subagent', result: { content: [{ type: 'text', text: 'Reviewer complete: no blockers' }] }, isError: false });
+  send({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'done' }], stopReason: 'stop' } });
+  send({ type: 'agent_settled' });
+});
+`);
+
+    const traces: string[] = [];
+    const result = await invokeAgent('ch_subagent_trace', 'review it', {
+      cwd: root,
+      onTraceEvent: (text) => traces.push(text),
+    });
+
+    expect(result).toEqual({ ok: true, text: 'done' });
+    expect(traces).toContain('🛠️ tool subagent: {"action":"status","id":"run-1"}');
+    expect(traces).toContain('🔧 tool-end subagent ok: Reviewer complete: no blockers');
+  });
+
   it('supports pre-agent_settled Pi versions that terminate with agent_end', async () => {
     const root = makeFakePi(`
 const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');

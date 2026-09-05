@@ -543,4 +543,52 @@ describe('per-channel webhook configuration', () => {
       db.closeDb();
     }
   });
+
+  it('lists active monitor routes with one bounded join despite many inactive channels', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'piscord-webhook-routes-'));
+    tempDirs.push(tempDir);
+    process.env.DB_PATH = join(tempDir, 'gateway.db');
+    process.env.PIDG_CONFIG = resolve(tempDir, 'missing.env');
+    process.env.SESSIONS_DIR = resolve(tempDir, 'sessions');
+
+    const db = await import('../src/db.js');
+    db.initDb();
+    try {
+      for (let index = 0; index < 300; index += 1) {
+        const jid = `dc:${String(index).padStart(3, '0')}`;
+        db.registerChannel({
+          jid,
+          name: jid,
+          folder: `channel-${index}`,
+          requiresTrigger: false,
+          isMain: false,
+          modelOverride: '',
+          thinkingOverride: '',
+          cwdOverride: '',
+        });
+        if (index % 100 === 0) {
+          db.setChannelWebhook({
+            channel_jid: jid,
+            destination_channel_id: `destination-${index}`,
+            destination_channel_name: 'monitor',
+            webhook_id: `webhook-${index}`,
+            webhook_token: `token-${index}`,
+          });
+        }
+      }
+
+      expect(db.getMonitoredChannelRoutes(2).map((route) => route.channel_jid)).toEqual([
+        'dc:000',
+        'dc:100',
+      ]);
+      expect(db.getMonitoredChannelRoutes(257).map((route) => route.channel_jid)).toEqual([
+        'dc:000',
+        'dc:100',
+        'dc:200',
+      ]);
+      expect(db.getMonitoredChannelRoutes(0)).toEqual([]);
+    } finally {
+      db.closeDb();
+    }
+  });
 });

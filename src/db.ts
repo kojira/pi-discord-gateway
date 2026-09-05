@@ -23,6 +23,10 @@ export interface ChannelWebhookReplacement {
   previous?: ChannelWebhookConfig;
 }
 
+export interface MonitoredChannelRoute extends ChannelWebhookConfig {
+  folder: string;
+}
+
 export interface ChannelWebhookClearStart {
   removed?: ChannelWebhookConfig;
   provisioning?: ChannelWebhookProvisioning;
@@ -263,6 +267,22 @@ export function getChannel(jid: string): RegisteredChannel | undefined {
 export function getAllChannels(): RegisteredChannel[] {
   const rows = db.prepare('select * from channels order by created_at').all() as any[];
   return rows.map(rowToChannel);
+}
+
+/** Return a bounded snapshot of active monitoring routes in stable JID order. */
+export function getMonitoredChannelRoutes(limit: number): MonitoredChannelRoute[] {
+  const boundedLimit = Math.max(0, Math.min(Math.trunc(limit), 10_000));
+  if (boundedLimit === 0) return [];
+  return db
+    .prepare(
+      `select w.channel_jid, c.folder, w.destination_channel_id,
+              w.destination_channel_name, w.webhook_id, w.webhook_token
+       from channel_webhooks w
+       inner join channels c on c.jid = w.channel_jid
+       order by w.channel_jid
+       limit ?`,
+    )
+    .all(boundedLimit) as MonitoredChannelRoute[];
 }
 
 export function createDmChannel(

@@ -28,6 +28,24 @@ let stopping = false;
 
 /** Queue a bounded trace line for the webhook configured for this source channel. */
 export function enqueueWebhookTrace(jid: string, line: string): void {
+  enqueueWebhookTraceInternal(jid, line);
+}
+
+/**
+ * Queue only if the persisted route still matches the epoch under which a
+ * nested transcript was read. Delivery also revalidates immediately before
+ * each send, closing clear/replace races across gateway processes.
+ */
+export function enqueueWebhookTraceForEpoch(
+  jid: string,
+  expectedEpoch: string | undefined,
+  line: string,
+): void {
+  if (!expectedEpoch) return;
+  enqueueWebhookTraceInternal(jid, line, expectedEpoch);
+}
+
+function enqueueWebhookTraceInternal(jid: string, line: string, expectedEpoch?: string): void {
   if (stopping || !line.trim()) return;
   const webhook = getChannelWebhook(jid);
 
@@ -37,7 +55,7 @@ export function enqueueWebhookTrace(jid: string, line: string): void {
   for (const state of matchingStates(jid)) {
     if (!webhook || !isSameWebhookEpoch(state.webhook, webhook)) retireState(state);
   }
-  if (!webhook) return;
+  if (!webhook || (expectedEpoch && webhookEpoch(webhook) !== expectedEpoch)) return;
 
   const state = getOrCreateState(webhook);
   const timestamp = new Date().toISOString().slice(11, 19);
@@ -296,15 +314,15 @@ function countUndelivered(states: readonly WebhookDeliveryState[]): number {
 }
 
 function batchKey(webhook: ChannelWebhookConfig): string {
-  return webhookEpochKey(webhook);
+  return webhookEpoch(webhook);
 }
 
 function isSameWebhookEpoch(left: ChannelWebhookConfig, right: ChannelWebhookConfig): boolean {
-  return webhookEpochKey(left) === webhookEpochKey(right);
+  return webhookEpoch(left) === webhookEpoch(right);
 }
 
 /** Complete persisted route identity; this value stays in memory and is never logged. */
-function webhookEpochKey(webhook: ChannelWebhookConfig): string {
+export function webhookEpoch(webhook: ChannelWebhookConfig): string {
   return JSON.stringify([
     webhook.channel_jid,
     webhook.webhook_id,

@@ -7,11 +7,13 @@ All notable changes to this project will be documented in this file.
 ### Added
 
 - Add per-channel Pi activity monitoring through managed Discord webhooks, configurable with `/pi webhook` and removable with `/pi webhook-clear`.
+- Forward bounded child/subagent assistant turns from nested session transcripts, including asynchronous output produced after the parent RPC invocation settles.
 - Forward every completed assistant message from Pi's RPC event stream to Discord, including progress text emitted before tool calls.
 - Route new same-channel Discord messages into an active Pi run through Pi's native steering queue.
 
 ### Changed
 
+- Include bounded, best-effort-redacted tool argument and result previews in activity webhooks, matching the practical `peeko-log.sh` session view.
 - Debounce consecutive same-channel messages during an active run and send the queued messages to Pi as one steering batch.
 - Replace one-shot print-mode agent invocations with the official JSONL RPC protocol.
 
