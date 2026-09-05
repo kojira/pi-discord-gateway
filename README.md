@@ -113,7 +113,9 @@ The gateway registers a global `/pi` command on Discord:
 
 ### Per-channel activity webhooks
 
-Run `/pi webhook channel:#monitoring` in a registered source channel to create a managed Discord webhook in the selected destination channel. Each source channel has an independent mapping. The trace includes consumed user prompts, completed assistant text and thinking, tool names/completion status, retry/compaction notices, and run lifecycle events. Tool arguments and results are intentionally omitted to avoid copying credentials into Discord, and streaming token deltas are omitted to avoid webhook spam.
+Run `/pi webhook channel:#monitoring` in a registered source channel to create a managed Discord webhook in the selected destination channel. Each source channel has an independent mapping. The trace includes consumed user prompts, completed assistant text and thinking, tool names/completion status, retry/compaction notices, and run lifecycle events. It also follows nested Pi session transcripts and forwards completed child/subagent assistant turns even when an asynchronous child finishes after the parent RPC invocation has settled. Existing child transcript history is baselined when monitoring starts or is re-enabled and is not replayed.
+
+Unlike the standalone `peeko-log.sh` tail workflow, managed monitoring does not forward raw transcript records. Tool arguments, tool result bodies, arbitrary details, and encrypted thinking signatures are intentionally omitted to avoid copying credentials into Discord. Free-form user/assistant text is bounded and common credential patterns are redacted, and streaming token deltas are omitted to avoid webhook spam.
 
 Only members with Discord's **Manage Webhooks** permission can configure or clear monitoring. To configure it, both the caller and the bot need **View Channel** and **Manage Webhooks** in the selected destination. Responses are ephemeral, webhook tokens are stored in the gateway SQLite database and never displayed, and forwarded content disables Discord mentions.
 

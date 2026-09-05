@@ -9,6 +9,10 @@ import { listAvailableModels } from './agent/model-catalog.js';
 import { startProcessingLoop, stopProcessingLoop } from './agent/queue.js';
 import { startScheduler } from './agent/scheduler.js';
 import { stopWebhookMonitor } from './discord/webhook-monitor.js';
+import {
+  startNestedSessionMonitor,
+  stopNestedSessionMonitor,
+} from './session/nested-session-monitor.js';
 
 /**
  * pi-discord-gateway - Lightweight Discord gateway for pi coding agent.
@@ -24,6 +28,7 @@ export async function startGateway(): Promise<void> {
   }
 
   initDb();
+  startNestedSessionMonitor();
 
   let stopArchiveCleanup = () => {};
   let stopMediaCleanup = () => {};
@@ -69,6 +74,9 @@ export async function startGateway(): Promise<void> {
         await stopProcessingLoop({ timeoutMs: config.shutdownTimeoutMs });
       }
 
+      // Child sessions can outlive their parent RPC process. Stop transcript
+      // discovery before draining webhook delivery so no late trace is queued.
+      await stopNestedSessionMonitor();
       await stopWebhookMonitor();
       stopDiscord();
       closeDb();
