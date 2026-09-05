@@ -1,5 +1,7 @@
 const MAX_TEXT = 1200;
 const MAX_LABEL = 120;
+const MAX_TOOL_ARGUMENTS = 180;
+const MAX_TOOL_RESULT = 1000;
 export const MAX_NESTED_TRACE_LINES_PER_RECORD = 5;
 
 export interface NestedSessionTraceContext {
@@ -16,10 +18,16 @@ export function formatAgentTraceEvent(event: any): string | undefined {
       return `👤 user: ${sanitizeTraceText(formatContent(event.message.content), MAX_TEXT)}`;
     case 'message_end':
       return formatCompletedMessage(event.message);
-    case 'tool_execution_start':
-      return `🛠️ tool ${safeTraceLabel(event.toolName)}`;
-    case 'tool_execution_end':
-      return `🔧 tool-end ${safeTraceLabel(event.toolName)} ${event.isError ? 'error' : 'ok'}`;
+    case 'tool_execution_start': {
+      const preview = formatToolArguments(event.args);
+      return `🛠️ tool ${safeTraceLabel(event.toolName)}${preview ? `: ${preview}` : ''}`;
+    }
+    case 'tool_execution_end': {
+      const preview = formatToolResult(event.result);
+      return `🔧 tool-end ${safeTraceLabel(event.toolName)} ${event.isError ? 'error' : 'ok'}${
+        preview ? `: ${preview}` : ''
+      }`;
+    }
     case 'compaction_start':
       return `🗜️ compaction started${event.reason ? ` (${safeTraceLabel(event.reason)})` : ''}`;
     case 'compaction_end':
@@ -82,11 +90,11 @@ export function sanitizeTraceText(text: string, max = MAX_TEXT): string {
       '$1/[REDACTED]',
     )
     .replace(
-      /(\bauthorization\s*[:=]\s*)(?:bearer\s+)?(?:"[^"]*"|'[^']*'|[^\s,;]+)/giu,
+      /(\bauthorization["']?\s*[:=]\s*)(?:bearer\s+)?(?:"[^"]*"|'[^']*'|[^\s,;]+)/giu,
       '$1[REDACTED]',
     )
     .replace(
-      /(\b[\w.-]*(?:api[_-]?key|token|secret|password)[\w.-]*\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/giu,
+      /(\b[\w.-]*(?:api[_-]?key|token|secret|password)[\w.-]*["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/giu,
       '$1[REDACTED]',
     )
     .replace(/\b(?:ghp_[\w]+|github_pat_[\w]+|sk-[\w-]{16,}|xox[baprs]-[\w-]+)\b/giu, '[REDACTED]');
@@ -100,9 +108,9 @@ export function safeTraceLabel(value: unknown): string {
 }
 
 /**
- * Format a completed record from a nested Pi session. This intentionally omits
- * arguments, result bodies, details, and signatures; child assistant output is
- * the only free-form payload forwarded.
+ * Format a completed record from a nested Pi session using the standalone
+ * peeko-log formatter's practical previews. Arbitrary details and signatures
+ * remain omitted, while arguments/results are redacted and tightly bounded.
  */
 export function formatNestedSessionTraceRecord(
   record: any,
@@ -142,7 +150,10 @@ export function formatNestedSessionTraceRecord(
         Math.max(0, available - (toolCalls.length > available ? 1 : 0)),
       );
       for (const block of visibleTools) {
-        lines.push(`🛠️ ${child} tool ${safeTraceLabel(block.name)}`);
+        const preview = formatToolArguments(block.arguments);
+        lines.push(
+          `🛠️ ${child} tool ${safeTraceLabel(block.name)}${preview ? `: ${preview}` : ''}`,
+        );
       }
       const omitted = toolCalls.length - visibleTools.length;
       if (omitted > 0 && lines.length < MAX_NESTED_TRACE_LINES_PER_RECORD) {
@@ -153,9 +164,12 @@ export function formatNestedSessionTraceRecord(
       return { lines, sourceName };
     }
     if (message?.role === 'toolResult') {
+      const preview = formatToolResult(message);
       return {
         lines: [
-          `🔧 ${child} tool-end ${safeTraceLabel(message.toolName)} ${message.isError ? 'error' : 'ok'}`,
+          `🔧 ${child} tool-end ${safeTraceLabel(message.toolName)} ${message.isError ? 'error' : 'ok'}${
+            preview ? `: ${preview}` : ''
+          }`,
         ],
         sourceName,
       };
@@ -164,15 +178,24 @@ export function formatNestedSessionTraceRecord(
   }
 
   if (record?.recordType === 'tool_start') {
+    const preview = sanitizeTraceText(String(record.argsPreview || ''), MAX_TOOL_ARGUMENTS);
     return {
-      lines: [`🛠️ ${child} tool ${safeTraceLabel(record.toolName)}`],
+      lines: [
+        `🛠️ ${child} tool ${safeTraceLabel(record.toolName)}${preview ? `: ${preview}` : ''}`,
+      ],
       sourceName,
     };
   }
   if (record?.recordType === 'tool_end') {
+    const preview = sanitizeTraceText(
+      String(record.resultPreview || record.outputPreview || ''),
+      MAX_TOOL_RESULT,
+    );
     return {
       lines: [
-        `🔧 ${child} tool-end ${safeTraceLabel(record.toolName)} ${record.isError ? 'error' : 'ok'}`,
+        `🔧 ${child} tool-end ${safeTraceLabel(record.toolName)} ${record.isError ? 'error' : 'ok'}${
+          preview ? `: ${preview}` : ''
+        }`,
       ],
       sourceName,
     };
@@ -194,6 +217,48 @@ export function formatNestedSessionTraceRecord(
     };
   }
   return { lines: [], sourceName };
+}
+
+function formatToolArguments(value: unknown): string {
+  if (value === undefined || value === null) return '';
+  return sanitizeTraceText(safeJson(value), MAX_TOOL_ARGUMENTS);
+}
+
+function formatToolResult(value: unknown): string {
+  const candidate =
+    typeof value === 'object' && value !== null && 'content' in value
+      ? (value as { content: unknown }).content
+      : value;
+  return sanitizeTraceText(contentPreview(candidate), MAX_TOOL_RESULT);
+}
+
+function contentPreview(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) {
+    return value
+      .map((block) => {
+        if (typeof block === 'string') return block;
+        if (typeof block !== 'object' || block === null) return String(block);
+        if ('text' in block && typeof block.text === 'string') return block.text;
+        if ('thinking' in block && typeof block.thinking === 'string') {
+          return `💭 ${block.thinking}`;
+        }
+        if ('type' in block && typeof block.type === 'string') return block.type;
+        return safeJson(block);
+      })
+      .filter(Boolean)
+      .join(' ');
+  }
+  return value === undefined || value === null ? '' : safeJson(value);
+}
+
+function safeJson(value: unknown): string {
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized === undefined ? String(value) : serialized;
+  } catch {
+    return String(value);
+  }
 }
 
 function numberLabel(value: unknown): string {

@@ -83,6 +83,8 @@ interface FileCursor {
   droppingOversizedLine: boolean;
   /** Suppress historical records until an old file's initial EOF is reached. */
   baselineComplete: boolean;
+  /** Apply high-water replay filtering only while rereading a reset/replaced file. */
+  replayFiltering: boolean;
   activationCutoffMs: number;
   highWaterTimestampMs: number;
   highWaterIds: Set<string>;
@@ -545,7 +547,7 @@ export class NestedSessionTraceMonitor {
       const bytesToRead = Math.min(available, byteBudget);
       if (bytesToRead === 0) {
         if (cursor.pending.length === 0 && cursor.offset >= opened.stats.size) {
-          cursor.baselineComplete = true;
+          finishBaseline(cursor);
         }
         return { bytes: 0, missing: false };
       }
@@ -556,7 +558,7 @@ export class NestedSessionTraceMonitor {
       setContinuity(opened.descriptor, cursor);
       this.consume(source, cursor, buffer.subarray(0, bytesRead), budget);
       if (cursor.pending.length === 0 && cursor.offset >= opened.stats.size) {
-        cursor.baselineComplete = true;
+        finishBaseline(cursor);
       }
       return { bytes: bytesRead, missing: false };
     } catch (error) {
@@ -944,6 +946,7 @@ function newCursor(
     pending: Buffer.alloc(0),
     droppingOversizedLine: false,
     baselineComplete,
+    replayFiltering: true,
     activationCutoffMs,
     highWaterTimestampMs: activationCutoffMs,
     highWaterIds: new Set(),
@@ -964,9 +967,10 @@ function resetCursor(
   cursor.pending = Buffer.alloc(0);
   cursor.droppingOversizedLine = false;
   // A new post-activation inode is entirely live. Rewrites of an admitted file
-  // retain their temporal high-water so old records cannot replay.
+  // temporarily use their temporal high-water while the replacement is reread.
+  cursor.baselineComplete = createdAfterActivation;
+  cursor.replayFiltering = true;
   if (createdAfterActivation) {
-    cursor.baselineComplete = true;
     cursor.highWaterTimestampMs = cursor.activationCutoffMs;
     cursor.highWaterIds.clear();
   }
@@ -1003,11 +1007,30 @@ function fileIdentity(stats: Stats): string {
   return `${String(stats.dev)}:${String(stats.ino)}`;
 }
 
+function finishBaseline(cursor: FileCursor): void {
+  cursor.baselineComplete = true;
+  cursor.replayFiltering = false;
+}
+
 function shouldEmitRecord(cursor: FileCursor, record: any): boolean {
   const timestamp = recordTimestampMs(record);
-  if (timestamp === undefined) return cursor.baselineComplete;
   const id = recordIdentity(record);
 
+  // Append position already provides exactly-once ordering during normal
+  // operation. Timestamps are model/session data and may repeat or go backward,
+  // so they must not deduplicate ordinary appended records.
+  if (cursor.baselineComplete && !cursor.replayFiltering) {
+    if (timestamp !== undefined && timestamp > cursor.highWaterTimestampMs) {
+      cursor.highWaterTimestampMs = timestamp;
+      cursor.highWaterIds.clear();
+    }
+    if (timestamp !== undefined && timestamp === cursor.highWaterTimestampMs && id) {
+      cursor.highWaterIds.add(id);
+    }
+    return true;
+  }
+
+  if (timestamp === undefined) return cursor.baselineComplete;
   if (timestamp < cursor.highWaterTimestampMs) return false;
   if (timestamp === cursor.highWaterTimestampMs) {
     if (!id || cursor.highWaterIds.has(id)) return false;

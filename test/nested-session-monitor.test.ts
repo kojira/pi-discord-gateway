@@ -33,7 +33,7 @@ function appendRecord(path: string, record: unknown): void {
   appendFileSync(path, `${JSON.stringify(record)}\n`);
 }
 
-function assistant(text: string, extra: Record<string, unknown> = {}): unknown {
+function assistant(text: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     type: 'message',
     message: {
@@ -112,7 +112,7 @@ describe('nested session trace monitoring', () => {
     ]);
   });
 
-  it('reads a fast-completing newly discovered child from byte zero and omits sensitive tool payloads', () => {
+  it('reads a fast-completing child and forwards redacted, bounded tool previews', () => {
     const root = temporaryRoot();
     const { monitor, lines } = harness(root);
     monitor.pollOnce();
@@ -134,7 +134,7 @@ describe('nested session trace monitoring', () => {
             {
               type: 'toolCall',
               name: 'bash',
-              arguments: { authorization: 'Bearer raw-tool-secret' },
+              arguments: { authorization: 'Bearer raw-tool-secret', command: 'echo complete' },
             },
           ],
         },
@@ -144,7 +144,7 @@ describe('nested session trace monitoring', () => {
         message: {
           role: 'toolResult',
           toolName: 'bash',
-          content: [{ type: 'text', text: 'raw-result-secret' }],
+          content: [{ type: 'text', text: 'API_TOKEN=raw-result-secret completed' }],
           details: { token: 'details-secret' },
           isError: false,
         },
@@ -158,15 +158,41 @@ describe('nested session trace monitoring', () => {
         '🧩 child subagent-worker started',
         expect.stringContaining('👤 child[subagent-worker] user: implement safely'),
         expect.stringContaining('💭 checking the result\ncompleted child output'),
-        '🛠️ child[subagent-worker] tool bash',
-        '🔧 child[subagent-worker] tool-end bash ok',
+        expect.stringContaining('🛠️ child[subagent-worker] tool bash:'),
+        expect.stringContaining('🔧 child[subagent-worker] tool-end bash ok:'),
       ]),
     );
     const output = lines.join('\n');
     expect(output).not.toContain('raw-tool-secret');
     expect(output).not.toContain('raw-result-secret');
+    expect(output).toContain('[REDACTED]');
     expect(output).not.toContain('details-secret');
     expect(output).not.toContain('encrypted-signature-secret');
+  });
+
+  it('emits ordinary ID-less appends even when timestamps repeat or move backward', () => {
+    const root = temporaryRoot();
+    const { monitor, lines } = harness(root);
+    monitor.pollOnce();
+    const child = join(root, 'parent', 'child', 'session.jsonl');
+    const sameTimestamp = '2026-01-01T00:00:01.000Z';
+    writeJsonl(child, [{ type: 'session_info', name: 'timestamp-child' }]);
+    monitor.pollOnce();
+    lines.length = 0;
+
+    appendRecord(child, { ...assistant('first same-time output'), timestamp: sameTimestamp });
+    appendRecord(child, { ...assistant('second same-time output'), timestamp: sameTimestamp });
+    appendRecord(child, {
+      ...assistant('out-of-order output'),
+      timestamp: '2025-12-31T23:59:59.000Z',
+    });
+    monitor.pollOnce();
+
+    expect(lines).toEqual([
+      expect.stringContaining('first same-time output'),
+      expect.stringContaining('second same-time output'),
+      expect.stringContaining('out-of-order output'),
+    ]);
   });
 
   it('buffers partial JSON lines and ignores malformed records', () => {

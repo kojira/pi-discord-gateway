@@ -115,7 +115,7 @@ The gateway registers a global `/pi` command on Discord:
 
 Run `/pi webhook channel:#monitoring` in a registered source channel to create a managed Discord webhook in the selected destination channel. Each source channel has an independent mapping. The trace includes consumed user prompts, completed assistant text and thinking, tool names/completion status, retry/compaction notices, and run lifecycle events. It also follows nested Pi session transcripts and forwards completed child/subagent assistant turns even when an asynchronous child finishes after the parent RPC invocation has settled. Existing child transcript history is baselined when monitoring starts or is re-enabled and is not replayed.
 
-Unlike the standalone `peeko-log.sh` tail workflow, managed monitoring does not forward raw transcript records. Tool arguments, tool result bodies, arbitrary details, and encrypted thinking signatures are intentionally omitted to avoid copying credentials into Discord. Free-form user/assistant text is bounded and common credential patterns are redacted, and streaming token deltas are omitted to avoid webhook spam.
+Managed monitoring follows the practical output of the standalone `peeko-log.sh` session formatter: tool starts include a bounded argument preview and tool completions include a bounded result/output preview, including subagent completion and status text. Arbitrary details, encrypted thinking signatures, and raw transcript records remain omitted. All free-form previews are bounded and common credential patterns are redacted, and streaming token deltas are omitted to avoid webhook spam.
 
 Nested transcript scanning is admission-bounded to 256 monitored source channels and 512 child transcripts per source in one gateway process. Existing admissions remain stable until their route or file disappears, preventing overload from causing history replay; additional routes/files are admitted when capacity becomes available. Polling also uses global and per-channel work budgets with round-robin continuation, so a large session tree or tiny-record flood cannot monopolize one event-loop tick.
 
@@ -123,7 +123,7 @@ Only members with Discord's **Manage Webhooks** permission can configure or clea
 
 Use `/pi webhook-clear` in the source channel to immediately disable forwarding and delete its managed Discord webhook. Clear also tombstones a fresh or hung setup immediately, without waiting for the ten-minute stale-detection window used outside forced clear, and retries failed deletion. If Discord does not list an uncertain creation yet, the command retains its recovery locator and asks you to inspect the destination and retry rather than claiming cleanup succeeded. A channel with monitoring enabled, an active or uncertain setup lease, or pending cleanup cannot be unregistered until cleanup succeeds. `/pi status` shows the configured destination without exposing its token.
 
-> **Privacy:** activity traces can contain user text, model reasoning, and local file paths mentioned by the model. Tool events are metadata-only (name and completion status), but you should still select a private destination with an appropriate retention policy.
+> **Privacy:** activity traces can contain user text, model reasoning, bounded tool argument/result previews, local file paths, and other sensitive content. Redaction is best-effort, so select a private destination with an appropriate retention policy.
 
 ## Tools for Pi
 
