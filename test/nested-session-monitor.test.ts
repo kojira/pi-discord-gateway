@@ -195,6 +195,49 @@ describe('nested session trace monitoring', () => {
     ]);
   });
 
+  it('keeps post-activation records appended before an old file reaches its initial EOF', () => {
+    const root = temporaryRoot();
+    const child = join(root, 'parent', 'child', 'session.jsonl');
+    const cutoff = Date.now() + 10_000;
+    writeJsonl(child, [
+      { type: 'session_info', name: 'delayed-baseline-child' },
+      {
+        ...assistant(`historical-${'x'.repeat(600 * 1024)}`),
+        timestamp: new Date(cutoff - 1_000).toISOString(),
+      },
+    ]);
+    const lines: string[] = [];
+    const monitor = new NestedSessionTraceMonitor({
+      listSources: () => [{ jid: 'dc:source', root }],
+      emit: (_source, line) => lines.push(line),
+      now: () => cutoff,
+    });
+
+    // The first poll consumes only the per-file byte budget, leaving the old
+    // file short of EOF while these live records are appended.
+    monitor.pollOnce();
+    const repeatedTimestamp = new Date(cutoff + 2_000).toISOString();
+    appendRecord(child, { ...assistant('first delayed same-time'), timestamp: repeatedTimestamp });
+    appendRecord(child, { ...assistant('second delayed same-time'), timestamp: repeatedTimestamp });
+    monitor.pollOnce();
+    appendRecord(child, {
+      ...assistant('delayed older timestamp'),
+      timestamp: new Date(cutoff + 1_000).toISOString(),
+    });
+    monitor.pollOnce();
+    monitor.pollOnce();
+
+    const output = lines.join('\n');
+    expect(output).not.toContain('historical-');
+    for (const expected of [
+      'first delayed same-time',
+      'second delayed same-time',
+      'delayed older timestamp',
+    ]) {
+      expect(lines.filter((line) => line.includes(expected))).toHaveLength(1);
+    }
+  });
+
   it('buffers partial JSON lines and ignores malformed records', () => {
     const root = temporaryRoot();
     const { monitor, lines } = harness(root);

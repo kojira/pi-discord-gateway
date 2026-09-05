@@ -81,13 +81,11 @@ interface FileCursor {
   continuity: Buffer;
   pending: Buffer;
   droppingOversizedLine: boolean;
-  /** Suppress historical records until an old file's initial EOF is reached. */
+  /** Whether records without timestamps are known to belong to this activation. */
   baselineComplete: boolean;
-  /** Apply high-water replay filtering only while rereading a reset/replaced file. */
-  replayFiltering: boolean;
+  /** Filter pre-activation timestamps only until the file's initial EOF. */
+  initialScan: boolean;
   activationCutoffMs: number;
-  highWaterTimestampMs: number;
-  highWaterIds: Set<string>;
   sourceName?: string;
 }
 
@@ -525,9 +523,7 @@ export class NestedSessionTraceMonitor {
       const identity = fileIdentity(opened.stats);
       const continuityMatches = fileContinuityMatches(opened.descriptor, cursor);
       if (identity !== cursor.identity || opened.stats.size < cursor.offset || !continuityMatches) {
-        const createdAfterActivation =
-          opened.stats.birthtimeMs > 0 && opened.stats.birthtimeMs > cursor.activationCutoffMs;
-        resetCursor(opened.descriptor, opened.stats, cursor, createdAfterActivation);
+        resetCursor(opened.descriptor, opened.stats, cursor);
       }
 
       // Parse complete lines retained when the previous poll exhausted its
@@ -946,34 +942,23 @@ function newCursor(
     pending: Buffer.alloc(0),
     droppingOversizedLine: false,
     baselineComplete,
-    replayFiltering: true,
+    initialScan: true,
     activationCutoffMs,
-    highWaterTimestampMs: activationCutoffMs,
-    highWaterIds: new Set(),
   };
   setContinuity(descriptor, cursor);
   return cursor;
 }
 
-function resetCursor(
-  descriptor: number,
-  stats: Stats,
-  cursor: FileCursor,
-  createdAfterActivation: boolean,
-): void {
+function resetCursor(descriptor: number, stats: Stats, cursor: FileCursor): void {
   cursor.identity = fileIdentity(stats);
   cursor.offset = 0;
   cursor.continuity = Buffer.alloc(0);
   cursor.pending = Buffer.alloc(0);
   cursor.droppingOversizedLine = false;
-  // A new post-activation inode is entirely live. Rewrites of an admitted file
-  // temporarily use their temporal high-water while the replacement is reread.
-  cursor.baselineComplete = createdAfterActivation;
-  cursor.replayFiltering = true;
-  if (createdAfterActivation) {
-    cursor.highWaterTimestampMs = cursor.activationCutoffMs;
-    cursor.highWaterIds.clear();
-  }
+  // Match tail -F behavior after a detected truncation or replacement: all
+  // content in the rewritten file is live, regardless of its record timestamps.
+  cursor.baselineComplete = true;
+  cursor.initialScan = false;
   cursor.sourceName = undefined;
   setContinuity(descriptor, cursor);
 }
@@ -1009,39 +994,17 @@ function fileIdentity(stats: Stats): string {
 
 function finishBaseline(cursor: FileCursor): void {
   cursor.baselineComplete = true;
-  cursor.replayFiltering = false;
+  cursor.initialScan = false;
 }
 
 function shouldEmitRecord(cursor: FileCursor, record: any): boolean {
+  // Byte offsets establish exactly-once ordering after the initial scan.
+  // During a delayed initial read, suppress only timestamps known to predate
+  // the activation boundary; timestamps may legitimately repeat or go back.
+  if (!cursor.initialScan) return true;
   const timestamp = recordTimestampMs(record);
-  const id = recordIdentity(record);
-
-  // Append position already provides exactly-once ordering during normal
-  // operation. Timestamps are model/session data and may repeat or go backward,
-  // so they must not deduplicate ordinary appended records.
-  if (cursor.baselineComplete && !cursor.replayFiltering) {
-    if (timestamp !== undefined && timestamp > cursor.highWaterTimestampMs) {
-      cursor.highWaterTimestampMs = timestamp;
-      cursor.highWaterIds.clear();
-    }
-    if (timestamp !== undefined && timestamp === cursor.highWaterTimestampMs && id) {
-      cursor.highWaterIds.add(id);
-    }
-    return true;
-  }
-
   if (timestamp === undefined) return cursor.baselineComplete;
-  if (timestamp < cursor.highWaterTimestampMs) return false;
-  if (timestamp === cursor.highWaterTimestampMs) {
-    if (!id || cursor.highWaterIds.has(id)) return false;
-    cursor.highWaterIds.add(id);
-    return cursor.baselineComplete || timestamp > cursor.activationCutoffMs;
-  }
-
-  cursor.highWaterTimestampMs = timestamp;
-  cursor.highWaterIds.clear();
-  if (id) cursor.highWaterIds.add(id);
-  return cursor.baselineComplete || timestamp > cursor.activationCutoffMs;
+  return timestamp > cursor.activationCutoffMs;
 }
 
 function recordTimestampMs(record: any): number | undefined {
@@ -1050,11 +1013,6 @@ function recordTimestampMs(record: any): number | undefined {
   if (typeof raw !== 'string' || !raw) return undefined;
   const parsed = Date.parse(raw);
   return Number.isFinite(parsed) ? parsed : undefined;
-}
-
-function recordIdentity(record: any): string | undefined {
-  const value = record?.id ?? record?.message?.id ?? record?.toolCallId;
-  return typeof value === 'string' && value ? value.slice(0, 256) : undefined;
 }
 
 function isMissingPathError(error: unknown): boolean {
