@@ -2,6 +2,7 @@ import {
   appendFileSync,
   mkdirSync,
   mkdtempSync,
+  renameSync,
   rmSync,
   symlinkSync,
   truncateSync,
@@ -56,7 +57,7 @@ function harness(root: string): {
   const warn = vi.fn();
   const monitor = new NestedSessionTraceMonitor({
     listSources: () => sources,
-    emit: (_jid, line) => lines.push(line),
+    emit: (_source, line) => lines.push(line),
     warn,
   });
   return { monitor, lines, sources, warn };
@@ -274,6 +275,188 @@ describe('nested session trace monitoring', () => {
     expect(lines.join('\n')).toContain('first');
     expect(lines.join('\n')).toContain('after truncate');
     expect(lines.join('\n')).toContain('after replace');
+  });
+
+  it('detects same-inode truncate-and-rewrite with an unchanged prefix and larger final size', () => {
+    const root = temporaryRoot();
+    const { monitor, lines } = harness(root);
+    monitor.pollOnce();
+    const child = join(root, 'parent', 'child', 'session.jsonl');
+    const header = { type: 'session_info', name: `same-prefix-${'h'.repeat(200)}` };
+    writeJsonl(child, [header, assistant('original')]);
+    monitor.pollOnce();
+    lines.length = 0;
+
+    // Keep the first 128+ bytes identical and rewrite the same inode to a size
+    // greater than the previous offset. Prefix-only checks miss this case.
+    truncateSync(child, 0);
+    writeJsonl(child, [
+      header,
+      assistant('rewritten-before-old-offset'),
+      assistant('x'.repeat(800)),
+    ]);
+    monitor.pollOnce();
+
+    const output = lines.join('\n');
+    expect(output).toContain('rewritten-before-old-offset');
+    expect(output).toContain('x'.repeat(100));
+    expect(output).not.toContain('original');
+  });
+
+  it.runIf(process.platform !== 'win32')(
+    'rejects intermediate directory symlinks outside the configured boundary',
+    () => {
+      const boundary = temporaryRoot();
+      const outside = temporaryRoot();
+      const outsideChannel = join(outside, 'channel');
+      const outsideChild = join(outsideChannel, 'parent', 'child', 'session.jsonl');
+      writeJsonl(outsideChild, [assistant('ancestor symlink escape')]);
+      symlinkSync(outside, join(boundary, 'alias'));
+
+      const lines: string[] = [];
+      const monitor = new NestedSessionTraceMonitor({
+        listSources: () => [
+          { jid: 'dc:source', root: join(boundary, 'alias', 'channel'), boundary },
+        ],
+        emit: (_source, line) => lines.push(line),
+      });
+      monitor.pollOnce();
+      monitor.pollOnce();
+
+      expect(lines.join('\n')).not.toContain('ancestor symlink escape');
+      expect(monitor.stats().files).toBe(0);
+    },
+  );
+
+  it.runIf(process.platform !== 'win32')(
+    'rejects file and directory swaps between validation and open',
+    () => {
+      const boundary = temporaryRoot();
+      const root = join(boundary, 'channel');
+      const outside = temporaryRoot();
+      const childDirectory = join(root, 'parent', 'child');
+      const child = join(childDirectory, 'session.jsonl');
+      const outsideFile = join(outside, 'outside.jsonl');
+      writeJsonl(child, [assistant('safe history')]);
+      writeJsonl(outsideFile, [assistant('file swap escape')]);
+
+      let swapFile = false;
+      let swappedFile = false;
+      const lines: string[] = [];
+      const monitor = new NestedSessionTraceMonitor({
+        listSources: () => [{ jid: 'dc:source', root, boundary }],
+        emit: (_source, line) => lines.push(line),
+        beforeFileOpen: (path) => {
+          if (!swapFile || swappedFile || path !== child) return;
+          swappedFile = true;
+          rmSync(child);
+          symlinkSync(outsideFile, child);
+        },
+      });
+      monitor.pollOnce();
+      swapFile = true;
+      appendRecord(child, assistant('safe append before swap'));
+      monitor.pollOnce();
+      expect(lines.join('\n')).not.toContain('file swap escape');
+
+      // Exercise the same validation/open seam for an ancestor directory.
+      rmSync(join(root, 'parent'), { recursive: true, force: true });
+      writeJsonl(child, [assistant('new safe history')]);
+      const outsideDirectory = join(outside, 'external-child');
+      writeJsonl(join(outsideDirectory, 'session.jsonl'), [assistant('directory swap escape')]);
+      let swappedDirectory = false;
+      const directoryMonitor = new NestedSessionTraceMonitor({
+        listSources: () => [{ jid: 'dc:directory', root, boundary }],
+        emit: (_source, line) => lines.push(line),
+        beforeDirectoryOpen: (path) => {
+          if (swappedDirectory || path !== childDirectory) return;
+          swappedDirectory = true;
+          renameSync(childDirectory, `${childDirectory}-old`);
+          symlinkSync(outsideDirectory, childDirectory);
+        },
+      });
+      directoryMonitor.pollOnce();
+      directoryMonitor.pollOnce();
+      expect(lines.join('\n')).not.toContain('directory swap escape');
+    },
+  );
+
+  it('enforces stable channel and file cursor admission bounds without replay', () => {
+    const parent = temporaryRoot();
+    const sources = Array.from({ length: 257 }, (_, index) => ({
+      jid: `dc:${String(index).padStart(3, '0')}`,
+      root: join(parent, `channel-${index}`),
+      boundary: parent,
+      epoch: `epoch-${index}`,
+    }));
+    const lines: string[] = [];
+    const monitor = new NestedSessionTraceMonitor({
+      listSources: () => sources,
+      emit: (_source, line) => lines.push(line),
+    });
+    monitor.pollOnce();
+    expect(monitor.stats().channels).toBe(256);
+
+    // Removing one admitted route creates exactly one admission slot.
+    sources.shift();
+    monitor.pollOnce();
+    expect(monitor.stats().channels).toBe(256);
+    const newlyAdmittedRoot = sources.at(-1)!.root;
+    const child = join(newlyAdmittedRoot, 'parent', 'child', 'session.jsonl');
+    writeJsonl(child, [assistant('newly admitted live output')]);
+    monitor.pollOnce();
+    expect(lines.join('\n')).toContain('newly admitted live output');
+
+    monitor.stop();
+    const boundedRoot = sources[0].root;
+    for (let index = 0; index < 513; index += 1) {
+      writeJsonl(join(boundedRoot, 'parent', String(index), 'session.jsonl'), [
+        assistant('history'),
+      ]);
+    }
+    const fileMonitor = new NestedSessionTraceMonitor({
+      listSources: () => [{ jid: 'dc:files', root: boundedRoot, boundary: parent }],
+      emit: (_source, line) => lines.push(line),
+    });
+    for (let index = 0; index < 3; index += 1) fileMonitor.pollOnce();
+    expect(fileMonitor.stats().files).toBe(512);
+  });
+
+  it('continues incremental directory discovery beyond one bounded poll', () => {
+    const root = temporaryRoot();
+    const { monitor, lines } = harness(root);
+    monitor.pollOnce();
+    const directory = join(root, 'parent');
+    mkdirSync(directory, { recursive: true });
+    for (let index = 0; index < 4200; index += 1) {
+      writeFileSync(join(directory, `junk-${String(index).padStart(5, '0')}`), 'x');
+    }
+    const child = join(directory, 'zzzz-child.jsonl');
+    writeJsonl(child, [assistant('found after bounded discovery continuation')]);
+
+    for (let index = 0; index < 4; index += 1) monitor.pollOnce();
+    expect(lines.join('\n')).toContain('found after bounded discovery continuation');
+  });
+
+  it('carries the snapshotted webhook epoch with every emitted record', () => {
+    const root = temporaryRoot();
+    const sources: NestedSessionSource[] = [{ jid: 'dc:source', root, epoch: 'old-epoch' }];
+    const emitted: Array<{ epoch: string | undefined; line: string }> = [];
+    const monitor = new NestedSessionTraceMonitor({
+      listSources: () => sources,
+      emit: (source, line) => {
+        emitted.push({ epoch: source.epoch, line });
+        sources[0] = { ...sources[0], epoch: 'new-epoch' };
+      },
+    });
+    monitor.pollOnce();
+    const child = join(root, 'parent', 'child', 'session.jsonl');
+    writeJsonl(child, [assistant('old epoch output')]);
+    monitor.pollOnce();
+
+    expect(emitted).toEqual([
+      { epoch: 'old-epoch', line: expect.stringContaining('old epoch output') },
+    ]);
   });
 
   it('bounds oversized lines, ignores symlinks, and releases cursor memory on shutdown', () => {

@@ -101,6 +101,21 @@ describe('webhook activity delivery', () => {
     expect(WebhookClientMock).toHaveBeenCalledTimes(1);
   });
 
+  it('rejects nested-session output read under a stale webhook epoch', async () => {
+    const monitor = await import('../src/discord/webhook-monitor.js');
+    let mapping = webhook;
+    getChannelWebhookMock.mockImplementation(() => mapping);
+    const oldEpoch = monitor.webhookEpoch(webhook);
+
+    mapping = { ...webhook, webhook_id: 'replacement-id', webhook_token: 'replacement-secret' };
+    monitor.enqueueWebhookTraceForEpoch('dc:source', oldEpoch, 'disabled-period child output');
+    await monitor.flushWebhookTrace('dc:source');
+
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(WebhookClientMock).not.toHaveBeenCalled();
+    expect(monitor.webhookMonitorStats('dc:source').states).toBe(0);
+  });
+
   it('retires stale in-memory epochs immediately across repeated external replacements', async () => {
     const monitor = await import('../src/discord/webhook-monitor.js');
     let mapping = webhook;
