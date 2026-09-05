@@ -1,5 +1,6 @@
 const MAX_TEXT = 1200;
 const MAX_LABEL = 120;
+export const MAX_NESTED_TRACE_LINES_PER_RECORD = 5;
 
 export interface NestedSessionTraceContext {
   sourceName?: string;
@@ -132,10 +133,22 @@ export function formatNestedSessionTraceRecord(
           : '';
       if (text || error)
         lines.push(`🤖 ${child} assistant${identity}: ${text || '(no text)'}${error}`);
-      for (const block of Array.isArray(message.content) ? message.content : []) {
-        if (block?.type === 'toolCall') {
-          lines.push(`🛠️ ${child} tool ${safeTraceLabel(block.name)}`);
-        }
+      const toolCalls = (Array.isArray(message.content) ? message.content : []).filter(
+        (block: any) => block?.type === 'toolCall',
+      );
+      const available = MAX_NESTED_TRACE_LINES_PER_RECORD - lines.length;
+      const visibleTools = toolCalls.slice(
+        0,
+        Math.max(0, available - (toolCalls.length > available ? 1 : 0)),
+      );
+      for (const block of visibleTools) {
+        lines.push(`🛠️ ${child} tool ${safeTraceLabel(block.name)}`);
+      }
+      const omitted = toolCalls.length - visibleTools.length;
+      if (omitted > 0 && lines.length < MAX_NESTED_TRACE_LINES_PER_RECORD) {
+        lines.push(
+          `⚠️ ${child} ${omitted} additional tool call${omitted === 1 ? '' : 's'} omitted`,
+        );
       }
       return { lines, sourceName };
     }

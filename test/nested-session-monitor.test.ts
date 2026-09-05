@@ -404,7 +404,7 @@ describe('nested session trace monitoring', () => {
     const newlyAdmittedRoot = sources.at(-1)!.root;
     const child = join(newlyAdmittedRoot, 'parent', 'child', 'session.jsonl');
     writeJsonl(child, [assistant('newly admitted live output')]);
-    monitor.pollOnce();
+    for (let index = 0; index < 20; index += 1) monitor.pollOnce();
     expect(lines.join('\n')).toContain('newly admitted live output');
 
     monitor.stop();
@@ -418,8 +418,9 @@ describe('nested session trace monitoring', () => {
       listSources: () => [{ jid: 'dc:files', root: boundedRoot, boundary: parent }],
       emit: (_source, line) => lines.push(line),
     });
-    for (let index = 0; index < 3; index += 1) fileMonitor.pollOnce();
+    for (let index = 0; index < 12; index += 1) fileMonitor.pollOnce();
     expect(fileMonitor.stats().files).toBe(512);
+    fileMonitor.stop();
   });
 
   it('continues incremental directory discovery beyond one bounded poll', () => {
@@ -434,8 +435,9 @@ describe('nested session trace monitoring', () => {
     const child = join(directory, 'zzzz-child.jsonl');
     writeJsonl(child, [assistant('found after bounded discovery continuation')]);
 
-    for (let index = 0; index < 4; index += 1) monitor.pollOnce();
+    for (let index = 0; index < 12; index += 1) monitor.pollOnce();
     expect(lines.join('\n')).toContain('found after bounded discovery continuation');
+    monitor.stop();
   });
 
   it('carries the snapshotted webhook epoch with every emitted record', () => {
@@ -457,6 +459,127 @@ describe('nested session trace monitoring', () => {
     expect(emitted).toEqual([
       { epoch: 'old-epoch', line: expect.stringContaining('old epoch output') },
     ]);
+  });
+
+  it('does not replay history after transient root, directory, and file-open failures', () => {
+    for (const failure of ['root', 'directory', 'file'] as const) {
+      const root = temporaryRoot();
+      const child = join(root, 'parent', 'child', 'session.jsonl');
+      writeJsonl(child, [
+        { type: 'session_info', name: `${failure}-child`, timestamp: 1_000 },
+        assistant('historical', { timestamp: 1_000 }),
+      ]);
+      let now = 2_000;
+      let failed = false;
+      const lines: string[] = [];
+      const failOnce = () => {
+        if (failed) return;
+        failed = true;
+        throw new Error(`transient ${failure} failure`);
+      };
+      const monitor = new NestedSessionTraceMonitor({
+        listSources: () => [{ jid: `dc:${failure}`, root }],
+        emit: (_source, line) => lines.push(line),
+        now: () => now,
+        ...(failure === 'root' ? { beforeRootOpen: failOnce } : {}),
+        ...(failure === 'directory'
+          ? {
+              beforeDirectoryOpen: (path) => {
+                if (path.endsWith(join('parent', 'child'))) failOnce();
+              },
+            }
+          : {}),
+        ...(failure === 'file' ? { beforeFileOpen: failOnce } : {}),
+      });
+
+      monitor.pollOnce();
+      now = 3_000;
+      appendRecord(child, assistant('live after recovery', { timestamp: 3_000 }));
+      for (let index = 0; index < 4; index += 1) monitor.pollOnce();
+
+      expect(lines.join('\n')).toContain('live after recovery');
+      expect(lines.join('\n')).not.toContain('historical');
+      expect(lines.join('\n')).not.toContain(`${failure}-child started`);
+    }
+  });
+
+  it('captures post-activation appends to an old file discovered after a long initial scan', () => {
+    const root = temporaryRoot();
+    const directory = join(root, 'parent');
+    mkdirSync(directory, { recursive: true });
+    for (let index = 0; index < 700; index += 1) {
+      writeFileSync(join(directory, `junk-${String(index).padStart(5, '0')}`), 'x');
+    }
+    const child = join(directory, 'zzzz-child.jsonl');
+    writeJsonl(child, [
+      { type: 'session_info', name: 'late-discovery', timestamp: 1_000 },
+      assistant('pre-activation history', { timestamp: 1_000 }),
+    ]);
+    let now = 2_000;
+    const lines: string[] = [];
+    const monitor = new NestedSessionTraceMonitor({
+      listSources: () => [{ jid: 'dc:source', root }],
+      emit: (_source, line) => lines.push(line),
+      now: () => now,
+    });
+
+    monitor.pollOnce();
+    now = 3_000;
+    appendRecord(child, assistant('fast child completed', { timestamp: 3_000 }));
+    for (let index = 0; index < 5; index += 1) monitor.pollOnce();
+
+    expect(lines.join('\n')).toContain('fast child completed');
+    expect(lines.join('\n')).not.toContain('pre-activation history');
+  });
+
+  it('applies global per-poll budgets and round-robin progress under tiny-line floods', () => {
+    const parent = temporaryRoot();
+    const sources = ['a', 'b'].map((name) => ({
+      jid: `dc:${name}`,
+      root: join(parent, name),
+      boundary: parent,
+    }));
+    const lines: Array<{ jid: string; line: string }> = [];
+    const monitor = new NestedSessionTraceMonitor({
+      listSources: () => sources,
+      emit: (source, line) => lines.push({ jid: source.jid, line }),
+    });
+    monitor.pollOnce();
+
+    for (const source of sources) {
+      const child = join(source.root, 'parent', 'child', 'session.jsonl');
+      writeJsonl(
+        child,
+        Array.from({ length: 1_000 }, (_, index) => assistant(`${source.jid}-${index}`)),
+      );
+    }
+    monitor.pollOnce();
+
+    expect(lines.some((entry) => entry.jid === 'dc:a')).toBe(true);
+    expect(lines.some((entry) => entry.jid === 'dc:b')).toBe(true);
+    const usage = monitor.lastPollUsage();
+    expect(usage).toMatchObject({
+      channels: 2,
+      discoveryEntries: expect.any(Number),
+      directoryOpens: expect.any(Number),
+      fileOpens: expect.any(Number),
+      bytes: expect.any(Number),
+      lines: expect.any(Number),
+      emittedLines: expect.any(Number),
+    });
+    expect(usage.channels).toBeLessThanOrEqual(16);
+    expect(usage.discoveryEntries).toBeLessThanOrEqual(4096);
+    expect(usage.directoryOpens).toBeLessThanOrEqual(512);
+    expect(usage.fileOpens).toBeLessThanOrEqual(1024);
+    expect(usage.bytes).toBeLessThanOrEqual(4 * 1024 * 1024);
+    expect(usage.lines).toBeLessThanOrEqual(2048);
+    expect(usage.emittedLines).toBeLessThanOrEqual(512);
+
+    // Each file retained its unread continuation; a later tick progresses
+    // instead of replaying the first bounded batch.
+    const firstCount = lines.length;
+    monitor.pollOnce();
+    expect(lines.length).toBeGreaterThan(firstCount);
   });
 
   it('bounds oversized lines, ignores symlinks, and releases cursor memory on shutdown', () => {

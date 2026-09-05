@@ -117,7 +117,7 @@ Run `/pi webhook channel:#monitoring` in a registered source channel to create a
 
 Unlike the standalone `peeko-log.sh` tail workflow, managed monitoring does not forward raw transcript records. Tool arguments, tool result bodies, arbitrary details, and encrypted thinking signatures are intentionally omitted to avoid copying credentials into Discord. Free-form user/assistant text is bounded and common credential patterns are redacted, and streaming token deltas are omitted to avoid webhook spam.
 
-Nested transcript scanning is admission-bounded to 256 monitored source channels and 512 child transcripts per source in one gateway process. Existing admissions remain stable until their route or file disappears, preventing overload from causing history replay; additional routes/files are admitted when capacity becomes available.
+Nested transcript scanning is admission-bounded to 256 monitored source channels and 512 child transcripts per source in one gateway process. Existing admissions remain stable until their route or file disappears, preventing overload from causing history replay; additional routes/files are admitted when capacity becomes available. Polling also uses global and per-channel work budgets with round-robin continuation, so a large session tree or tiny-record flood cannot monopolize one event-loop tick.
 
 Only members with Discord's **Manage Webhooks** permission can configure or clear monitoring. To configure it, both the caller and the bot need **View Channel** and **Manage Webhooks** in the selected destination. Responses are ephemeral, webhook tokens are stored in the gateway SQLite database and never displayed, and forwarded content disables Discord mentions.
 

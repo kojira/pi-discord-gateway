@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { formatAgentTraceEvent } from '../src/agent/trace.js';
+import {
+  formatAgentTraceEvent,
+  formatNestedSessionTraceRecord,
+  MAX_NESTED_TRACE_LINES_PER_RECORD,
+} from '../src/agent/trace.js';
 import { splitWebhookLines } from '../src/discord/webhook-monitor.js';
 
 describe('Pi activity trace formatting', () => {
@@ -88,6 +92,30 @@ describe('Pi activity trace formatting', () => {
     expect(trace!.length).toBeLessThan(150);
     expect(result).toBe('🔧 tool-end bash ok');
     expect(result).not.toContain(secret);
+  });
+
+  it('caps tool-call lines produced by one nested assistant record', () => {
+    const formatted = formatNestedSessionTraceRecord(
+      {
+        type: 'message',
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'child result' },
+            ...Array.from({ length: 10_000 }, (_, index) => ({
+              type: 'toolCall',
+              name: `tool-${index}`,
+              arguments: { token: 'must-not-appear' },
+            })),
+          ],
+        },
+      },
+      { sourceName: 'worker' },
+    );
+
+    expect(formatted.lines).toHaveLength(MAX_NESTED_TRACE_LINES_PER_RECORD);
+    expect(formatted.lines.at(-1)).toContain('additional tool calls omitted');
+    expect(formatted.lines.join('\n')).not.toContain('must-not-appear');
   });
 
   it('formats lifecycle and error events', () => {

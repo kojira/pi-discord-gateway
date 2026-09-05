@@ -11,29 +11,43 @@ import {
   type Stats,
 } from 'node:fs';
 import { dirname, join, relative, resolve, sep } from 'node:path';
-import { formatNestedSessionTraceRecord } from '../agent/trace.js';
+import {
+  formatNestedSessionTraceRecord,
+  MAX_NESTED_TRACE_LINES_PER_RECORD,
+} from '../agent/trace.js';
 import { config } from '../config.js';
-import { getAllChannels, getChannelWebhook } from '../db.js';
+import { getMonitoredChannelRoutes } from '../db.js';
 import { logger } from '../logger.js';
 import { enqueueWebhookTraceForEpoch, webhookEpoch } from '../discord/webhook-monitor.js';
 
 const POLL_INTERVAL_MS = 1000;
 const MAX_CHANNELS = 256;
 const MAX_FILES_PER_CHANNEL = 512;
+const MAX_CHANNELS_VISITED_PER_POLL = 16;
 const MAX_DISCOVERY_ENTRIES_PER_POLL = 4096;
+const MAX_DISCOVERY_ENTRIES_PER_CHANNEL_POLL = 512;
+const MAX_DIRECTORY_OPENS_PER_POLL = 512;
+const MAX_DIRECTORY_OPENS_PER_CHANNEL_POLL = 64;
+const MAX_FILE_OPENS_PER_POLL = 1024;
+const MAX_FILE_ADMISSIONS_PER_CHANNEL_POLL = 128;
+const MAX_FILE_READS_PER_CHANNEL_POLL = 128;
 const MAX_DISCOVERY_DIRECTORIES = 4096;
 const MAX_DIRECTORY_DEPTH = 12;
+const MAX_BYTES_PER_POLL = 4 * 1024 * 1024;
 const MAX_BYTES_PER_CHANNEL_POLL = 1024 * 1024;
 const MAX_BYTES_PER_FILE_POLL = 256 * 1024;
+const MAX_LINES_PER_POLL = 2048;
+const MAX_LINES_PER_CHANNEL_POLL = 256;
+const MAX_EMITTED_LINES_PER_POLL = 512;
+const MAX_EMITTED_LINES_PER_CHANNEL_POLL = 64;
+const MAX_FORMATTED_LINES_PER_RECORD = MAX_NESTED_TRACE_LINES_PER_RECORD;
 // Session records can contain large encrypted reasoning signatures even when
 // the displayable assistant text is short. Keep enough room to parse and then
 // discard those fields, while retaining explicit global/per-channel bounds.
 const MAX_LINE_BYTES = 2 * 1024 * 1024;
 const MAX_PENDING_BYTES_PER_CHANNEL = 4 * 1024 * 1024;
 const MAX_PENDING_BYTES_GLOBAL = 16 * 1024 * 1024;
-const BASELINE_NAME_BYTES = 8 * 1024;
 const CONTINUITY_BYTES = 128;
-const MAX_BASELINE_NAME_BYTES_PER_CHANNEL = 256 * 1024;
 const LOG_THROTTLE_MS = 60_000;
 
 export interface NestedSessionSource {
@@ -50,9 +64,9 @@ export interface NestedSessionMonitorDependencies {
   emit(source: NestedSessionSource, line: string): void;
   warn?(metadata: Record<string, unknown>, message: string): void;
   now?(): number;
-  /** Deterministic security-test seam; production never supplies it. */
+  /** Deterministic security-test seams; production never supplies them. */
+  beforeRootOpen?(path: string): void;
   beforeFileOpen?(path: string): void;
-  /** Deterministic security-test seam; production never supplies it. */
   beforeDirectoryOpen?(path: string): void;
 }
 
@@ -67,6 +81,11 @@ interface FileCursor {
   continuity: Buffer;
   pending: Buffer;
   droppingOversizedLine: boolean;
+  /** Suppress historical records until an old file's initial EOF is reached. */
+  baselineComplete: boolean;
+  activationCutoffMs: number;
+  highWaterTimestampMs: number;
+  highWaterIds: Set<string>;
   sourceName?: string;
 }
 
@@ -87,12 +106,36 @@ interface DiscoveryCursor {
 
 interface ChannelCursor {
   source: NormalizedSource;
+  activatedAtMs: number;
   rootIdentity?: string;
-  initialized: boolean;
+  rootMissingAtActivation: boolean;
+  initialDiscoveryComplete: boolean;
   files: Map<string, FileCursor>;
+  unavailableFiles: Set<string>;
   nextFileIndex: number;
-  baselineNameBudget: number;
   discovery: DiscoveryCursor;
+}
+
+interface PollBudget {
+  channels: number;
+  discoveryEntries: number;
+  directoryOpens: number;
+  fileOpens: number;
+  bytes: number;
+  lines: number;
+  emittedLines: number;
+  channelLines: number;
+  channelEmittedLines: number;
+}
+
+export interface NestedSessionPollUsage {
+  channels: number;
+  discoveryEntries: number;
+  directoryOpens: number;
+  fileOpens: number;
+  bytes: number;
+  lines: number;
+  emittedLines: number;
 }
 
 interface OpenedFile {
@@ -101,7 +144,13 @@ interface OpenedFile {
   stats: Stats;
 }
 
-type OpenFileResult = OpenedFile | { kind: 'missing' | 'unavailable' };
+interface OpenedDirectory {
+  kind: 'opened';
+  dir: Dir;
+}
+
+type OpenFileResult = OpenedFile | { kind: 'missing' } | { kind: 'unavailable' };
+type OpenDirectoryResult = OpenedDirectory | { kind: 'missing' } | { kind: 'unavailable' };
 
 /**
  * Poll append-only nested Pi session transcripts for child-agent activity.
@@ -119,6 +168,8 @@ export class NestedSessionTraceMonitor {
   private timer?: NodeJS.Timeout;
   private stopped = false;
   private polling = false;
+  private nextChannelIndex = 0;
+  private lastUsage: NestedSessionPollUsage = emptyPollUsage();
 
   constructor(private readonly dependencies: NestedSessionMonitorDependencies) {}
 
@@ -161,7 +212,7 @@ export class NestedSessionTraceMonitor {
           continue;
         }
         if (this.channels.size >= MAX_CHANNELS) continue;
-        this.channels.set(source.jid, newChannelCursor(source));
+        this.channels.set(source.jid, newChannelCursor(source, this.now()));
       }
       if (sources.length > MAX_CHANNELS) {
         this.warnThrottled(
@@ -171,13 +222,32 @@ export class NestedSessionTraceMonitor {
         );
       }
 
-      for (const [jid, state] of this.channels) {
-        this.pollSource(jid, state);
+      const budget = newPollBudget();
+      const admitted = [...this.channels.entries()];
+      const ordered = rotate(admitted, this.nextChannelIndex);
+      let visited = 0;
+      for (const [jid, state] of ordered) {
+        if (budget.channels <= 0) break;
+        budget.channels -= 1;
+        budget.channelLines = MAX_LINES_PER_CHANNEL_POLL;
+        budget.channelEmittedLines = MAX_EMITTED_LINES_PER_CHANNEL_POLL;
+        visited += 1;
+        this.pollSource(jid, state, budget);
         this.enforceGlobalPendingLimit();
       }
+      if (admitted.length > 0) {
+        this.nextChannelIndex = (this.nextChannelIndex + Math.max(1, visited)) % admitted.length;
+      } else {
+        this.nextChannelIndex = 0;
+      }
+      this.lastUsage = pollUsage(budget);
     } finally {
       this.polling = false;
     }
+  }
+
+  lastPollUsage(): NestedSessionPollUsage {
+    return { ...this.lastUsage };
   }
 
   stats(): { channels: number; files: number; pendingBytes: number } {
@@ -221,52 +291,85 @@ export class NestedSessionTraceMonitor {
   private resetChannel(state: ChannelCursor, source: NormalizedSource): void {
     disposeChannel(state);
     state.source = source;
+    state.activatedAtMs = this.now();
     state.rootIdentity = undefined;
-    state.initialized = false;
+    state.rootMissingAtActivation = pathIsMissing(source.root);
+    state.initialDiscoveryComplete = false;
     state.files = new Map();
+    state.unavailableFiles = new Set();
     state.nextFileIndex = 0;
-    state.baselineNameBudget = MAX_BASELINE_NAME_BYTES_PER_CHANNEL;
     state.discovery = newDiscoveryCursor();
   }
 
-  private pollSource(jid: string, state: ChannelCursor): void {
-    const root = validateRoot(state.source);
-    if (!root) {
-      // A missing root is a complete empty baseline. If it appears later, its
-      // newly created child files are read from byte zero.
-      if (!pathExists(state.source.root)) state.initialized = true;
+  private pollSource(jid: string, state: ChannelCursor, budget: PollBudget): void {
+    try {
+      this.dependencies.beforeRootOpen?.(state.source.root);
+    } catch (error) {
+      this.warnError(`root:${jid}`, jid, error, 'Could not inspect nested session root');
       return;
     }
+    const root = validateRoot(state.source);
+    if (!root) return;
     const rootIdentity = fileIdentity(root.stats);
     if (state.rootIdentity && state.rootIdentity !== rootIdentity) {
       this.resetChannel(state, state.source);
     }
     state.rootIdentity = rootIdentity;
-
-    const cycleComplete = this.advanceDiscovery(jid, state, root.canonicalPath);
-    if (!state.initialized) {
-      if (cycleComplete) state.initialized = true;
-      return;
+    if (!state.initialDiscoveryComplete && state.rootMissingAtActivation) {
+      // ENOENT/ENOTDIR at activation proves the complete root appeared later,
+      // so every transcript in its first successful scan is live.
+      state.initialDiscoveryComplete = true;
     }
-    this.readFiles(jid, state, root.canonicalPath);
+
+    this.advanceDiscovery(jid, state, root.canonicalPath, budget);
+    this.readFiles(jid, state, root.canonicalPath, budget);
   }
 
-  private advanceDiscovery(jid: string, state: ChannelCursor, canonicalRoot: string): boolean {
-    let entries = 0;
-    let completedCycle = false;
+  private advanceDiscovery(
+    jid: string,
+    state: ChannelCursor,
+    canonicalRoot: string,
+    budget: PollBudget,
+  ): void {
+    let channelEntries = MAX_DISCOVERY_ENTRIES_PER_CHANNEL_POLL;
+    let channelDirectories = MAX_DIRECTORY_OPENS_PER_CHANNEL_POLL;
+    let channelFiles = MAX_FILE_ADMISSIONS_PER_CHANNEL_POLL;
 
-    while (entries < MAX_DISCOVERY_ENTRIES_PER_POLL) {
+    for (const relativePath of [...state.unavailableFiles]) {
+      if (budget.fileOpens <= 0 || channelFiles <= 0) break;
+      budget.fileOpens -= 1;
+      channelFiles -= 1;
+      const admitted = this.admitFile(state, canonicalRoot, relativePath);
+      if (admitted !== 'unavailable') state.unavailableFiles.delete(relativePath);
+    }
+
+    while (budget.discoveryEntries > 0 && channelEntries > 0) {
       if (!state.discovery.current) {
         const work = state.discovery.queue.shift();
         if (!work) {
-          completedCycle = true;
+          if (state.unavailableFiles.size === 0) state.initialDiscoveryComplete = true;
           state.discovery = newDiscoveryCursor();
           break;
         }
         state.discovery.queued.delete(work.relativePath);
-        const dir = this.openVerifiedDirectory(state.source, canonicalRoot, work.relativePath);
-        if (!dir) continue;
-        state.discovery.current = { ...work, dir };
+        if (budget.directoryOpens <= 0 || channelDirectories <= 0) {
+          state.discovery.queue.unshift(work);
+          state.discovery.queued.add(work.relativePath);
+          break;
+        }
+        budget.directoryOpens -= 1;
+        channelDirectories -= 1;
+        const opened = this.openVerifiedDirectory(state.source, canonicalRoot, work.relativePath);
+        if (opened.kind === 'missing') continue;
+        if (opened.kind === 'unavailable') {
+          // Transient failures remain queued. Moving the failed directory to
+          // the tail lets other admitted work progress without declaring a
+          // false empty baseline.
+          state.discovery.queue.push(work);
+          state.discovery.queued.add(work.relativePath);
+          break;
+        }
+        state.discovery.current = { ...work, dir: opened.dir };
       }
 
       const current = state.discovery.current;
@@ -277,14 +380,20 @@ export class NestedSessionTraceMonitor {
         this.warnError(`discover:${jid}`, jid, error, 'Could not scan nested session transcripts');
         closeDirectory(current.dir);
         state.discovery.current = undefined;
-        continue;
+        state.discovery.queue.unshift({
+          relativePath: current.relativePath,
+          depth: current.depth,
+        });
+        state.discovery.queued.add(current.relativePath);
+        break;
       }
       if (!entry) {
         closeDirectory(current.dir);
         state.discovery.current = undefined;
         continue;
       }
-      entries += 1;
+      budget.discoveryEntries -= 1;
+      channelEntries -= 1;
       if (entry.isSymbolicLink()) continue;
 
       const relativePath = join(current.relativePath, entry.name);
@@ -307,7 +416,7 @@ export class NestedSessionTraceMonitor {
       if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
       if (dirname(relativePath) === '.') continue;
       if (state.files.has(relativePath)) continue;
-      if (state.files.size >= MAX_FILES_PER_CHANNEL) {
+      if (state.files.size + state.unavailableFiles.size >= MAX_FILES_PER_CHANNEL) {
         this.warnThrottled(
           `file-limit:${jid}`,
           { jid },
@@ -315,53 +424,83 @@ export class NestedSessionTraceMonitor {
         );
         continue;
       }
-      this.admitFile(state, canonicalRoot, relativePath);
+      if (budget.fileOpens <= 0 || channelFiles <= 0) break;
+      budget.fileOpens -= 1;
+      channelFiles -= 1;
+      const admitted = this.admitFile(state, canonicalRoot, relativePath);
+      if (admitted === 'unavailable') state.unavailableFiles.add(relativePath);
     }
-    return completedCycle;
   }
 
-  private admitFile(state: ChannelCursor, canonicalRoot: string, relativePath: string): void {
+  private admitFile(
+    state: ChannelCursor,
+    canonicalRoot: string,
+    relativePath: string,
+  ): OpenFileResult['kind'] {
     const opened = this.openVerifiedFile(state.source, canonicalRoot, relativePath);
-    if (opened.kind !== 'opened') return;
+    if (opened.kind !== 'opened') return opened.kind;
     try {
-      const offset = state.initialized ? 0 : opened.stats.size;
-      const cursor = newCursor(opened.descriptor, opened.stats, offset);
-      if (!state.initialized && state.baselineNameBudget > 0) {
-        const readLimit = Math.min(
-          BASELINE_NAME_BYTES,
-          state.baselineNameBudget,
-          opened.stats.size,
-        );
-        cursor.sourceName = readBaselineSourceName(opened.descriptor, readLimit);
-        state.baselineNameBudget -= readLimit;
-      }
+      const createdAfterActivation =
+        state.initialDiscoveryComplete ||
+        (opened.stats.birthtimeMs > 0 && opened.stats.birthtimeMs > state.activatedAtMs + 1);
+      // Old files are read incrementally from zero and filtered by record time.
+      // This captures appends made while a long initial scan is still running;
+      // using discovery-time EOF as a baseline would lose them.
+      const cursor = newCursor(
+        opened.descriptor,
+        opened.stats,
+        0,
+        state.activatedAtMs,
+        createdAfterActivation,
+      );
       state.files.set(relativePath, cursor);
     } finally {
       closeSync(opened.descriptor);
     }
+    return 'opened';
   }
 
-  private readFiles(jid: string, state: ChannelCursor, canonicalRoot: string): void {
+  private readFiles(
+    jid: string,
+    state: ChannelCursor,
+    canonicalRoot: string,
+    budget: PollBudget,
+  ): void {
     const paths = [...state.files.keys()];
     if (paths.length === 0) return;
     const ordered = rotate(paths, state.nextFileIndex);
-    let channelBudget = MAX_BYTES_PER_CHANNEL_POLL;
+    let channelBytes = MAX_BYTES_PER_CHANNEL_POLL;
+    let channelFileReads = MAX_FILE_READS_PER_CHANNEL_POLL;
     let visited = 0;
 
     for (const relativePath of ordered) {
-      if (channelBudget <= 0) break;
+      if (
+        channelBytes <= 0 ||
+        budget.bytes <= 0 ||
+        budget.lines <= 0 ||
+        budget.channelLines <= 0 ||
+        budget.emittedLines < MAX_FORMATTED_LINES_PER_RECORD ||
+        budget.channelEmittedLines < MAX_FORMATTED_LINES_PER_RECORD ||
+        budget.fileOpens <= 0 ||
+        channelFileReads <= 0
+      )
+        break;
       const cursor = state.files.get(relativePath);
       if (!cursor) continue;
       visited += 1;
+      budget.fileOpens -= 1;
+      channelFileReads -= 1;
       const result = this.readFile(
         state.source,
         canonicalRoot,
         relativePath,
         cursor,
-        Math.min(channelBudget, MAX_BYTES_PER_FILE_POLL),
+        Math.min(channelBytes, budget.bytes, MAX_BYTES_PER_FILE_POLL),
+        budget,
       );
       if (result.missing) state.files.delete(relativePath);
-      channelBudget -= result.bytes;
+      channelBytes -= result.bytes;
+      budget.bytes -= result.bytes;
       this.enforceChannelPendingLimit(jid, state);
     }
     const divisor = Math.max(1, paths.length);
@@ -373,7 +512,8 @@ export class NestedSessionTraceMonitor {
     canonicalRoot: string,
     relativePath: string,
     cursor: FileCursor,
-    budget: number,
+    byteBudget: number,
+    budget: PollBudget,
   ): { bytes: number; missing: boolean } {
     const opened = this.openVerifiedFile(source, canonicalRoot, relativePath);
     if (opened.kind !== 'opened') {
@@ -383,17 +523,41 @@ export class NestedSessionTraceMonitor {
       const identity = fileIdentity(opened.stats);
       const continuityMatches = fileContinuityMatches(opened.descriptor, cursor);
       if (identity !== cursor.identity || opened.stats.size < cursor.offset || !continuityMatches) {
-        resetCursor(opened.descriptor, opened.stats, cursor);
+        const createdAfterActivation =
+          opened.stats.birthtimeMs > 0 && opened.stats.birthtimeMs > cursor.activationCutoffMs;
+        resetCursor(opened.descriptor, opened.stats, cursor, createdAfterActivation);
       }
+
+      // Parse complete lines retained when the previous poll exhausted its
+      // global line/emit budget before reading more bytes.
+      if (cursor.pending.length > 0) this.consume(source, cursor, Buffer.alloc(0), budget);
+      if (
+        budget.lines <= 0 ||
+        budget.channelLines <= 0 ||
+        budget.emittedLines < MAX_FORMATTED_LINES_PER_RECORD ||
+        budget.channelEmittedLines < MAX_FORMATTED_LINES_PER_RECORD ||
+        cursor.pending.includes(0x0a)
+      ) {
+        return { bytes: 0, missing: false };
+      }
+
       const available = Math.max(0, opened.stats.size - cursor.offset);
-      const bytesToRead = Math.min(available, budget);
-      if (bytesToRead === 0) return { bytes: 0, missing: false };
+      const bytesToRead = Math.min(available, byteBudget);
+      if (bytesToRead === 0) {
+        if (cursor.pending.length === 0 && cursor.offset >= opened.stats.size) {
+          cursor.baselineComplete = true;
+        }
+        return { bytes: 0, missing: false };
+      }
 
       const buffer = Buffer.allocUnsafe(bytesToRead);
       const bytesRead = readSync(opened.descriptor, buffer, 0, bytesToRead, cursor.offset);
       cursor.offset += bytesRead;
       setContinuity(opened.descriptor, cursor);
-      this.consume(source, cursor, buffer.subarray(0, bytesRead));
+      this.consume(source, cursor, buffer.subarray(0, bytesRead), budget);
+      if (cursor.pending.length === 0 && cursor.offset >= opened.stats.size) {
+        cursor.baselineComplete = true;
+      }
       return { bytes: bytesRead, missing: false };
     } catch (error) {
       this.warnError(
@@ -408,40 +572,61 @@ export class NestedSessionTraceMonitor {
     }
   }
 
-  private consume(source: NormalizedSource, cursor: FileCursor, chunk: Buffer): void {
+  private consume(
+    source: NormalizedSource,
+    cursor: FileCursor,
+    chunk: Buffer,
+    budget: PollBudget,
+  ): void {
     const data = cursor.pending.length > 0 ? Buffer.concat([cursor.pending, chunk]) : chunk;
     cursor.pending = Buffer.alloc(0);
     let start = 0;
 
     for (let index = 0; index < data.length; index += 1) {
       if (data[index] !== 0x0a) continue;
+      if (
+        budget.lines <= 0 ||
+        budget.channelLines <= 0 ||
+        budget.emittedLines < MAX_FORMATTED_LINES_PER_RECORD ||
+        budget.channelEmittedLines < MAX_FORMATTED_LINES_PER_RECORD
+      ) {
+        cursor.pending = Buffer.from(data.subarray(start));
+        return;
+      }
       const line = data.subarray(start, index);
       start = index + 1;
+      budget.lines -= 1;
+      budget.channelLines -= 1;
       if (cursor.droppingOversizedLine) {
         cursor.droppingOversizedLine = false;
         continue;
       }
       if (line.length > MAX_LINE_BYTES) {
-        this.dependencies.emit(source, '⚠️ child session record omitted (oversized)');
+        this.emitBounded(source, '⚠️ child session record omitted (oversized)', budget);
         continue;
       }
-      this.consumeLine(source, cursor, line);
+      this.consumeLine(source, cursor, line, budget);
     }
 
     const remainder = data.subarray(start);
     if (cursor.droppingOversizedLine) return;
     if (remainder.length > MAX_LINE_BYTES) {
       cursor.droppingOversizedLine = true;
-      this.dependencies.emit(source, '⚠️ child session record omitted (oversized)');
+      this.emitBounded(source, '⚠️ child session record omitted (oversized)', budget);
       return;
     }
     cursor.pending = Buffer.from(remainder);
   }
 
-  private consumeLine(source: NormalizedSource, cursor: FileCursor, line: Buffer): void {
+  private consumeLine(
+    source: NormalizedSource,
+    cursor: FileCursor,
+    line: Buffer,
+    budget: PollBudget,
+  ): void {
     const text = line.toString('utf8').replace(/\r$/u, '');
     if (!text) return;
-    let record: unknown;
+    let record: any;
     try {
       record = JSON.parse(text);
     } catch {
@@ -449,31 +634,43 @@ export class NestedSessionTraceMonitor {
     }
     const formatted = formatNestedSessionTraceRecord(record, { sourceName: cursor.sourceName });
     cursor.sourceName = formatted.sourceName;
-    for (const output of formatted.lines) this.dependencies.emit(source, output);
+    if (!shouldEmitRecord(cursor, record)) return;
+    for (const output of formatted.lines.slice(0, MAX_FORMATTED_LINES_PER_RECORD)) {
+      this.emitBounded(source, output, budget);
+    }
+  }
+
+  private emitBounded(source: NormalizedSource, line: string, budget: PollBudget): void {
+    if (budget.emittedLines <= 0 || budget.channelEmittedLines <= 0) return;
+    budget.emittedLines -= 1;
+    budget.channelEmittedLines -= 1;
+    this.dependencies.emit(source, line);
   }
 
   private openVerifiedDirectory(
     source: NormalizedSource,
     canonicalRoot: string,
     relativePath: string,
-  ): Dir | undefined {
+  ): OpenDirectoryResult {
     const candidate = resolve(canonicalRoot, relativePath);
-    if (!isWithinOrEqual(canonicalRoot, candidate)) return undefined;
+    if (!isWithinOrEqual(canonicalRoot, candidate)) return { kind: 'unavailable' };
     const before = verifiedCanonicalStats(source, canonicalRoot, candidate, true);
-    if (!before) return undefined;
-    this.dependencies.beforeDirectoryOpen?.(candidate);
+    if (!before) {
+      return pathIsMissing(candidate) ? { kind: 'missing' } : { kind: 'unavailable' };
+    }
     let dir: Dir | undefined;
     try {
+      this.dependencies.beforeDirectoryOpen?.(candidate);
       dir = opendirSync(candidate);
       const after = verifiedCanonicalStats(source, canonicalRoot, candidate, true);
       if (!after || fileIdentity(after.stats) !== fileIdentity(before.stats)) {
         closeDirectory(dir);
-        return undefined;
+        return pathIsMissing(candidate) ? { kind: 'missing' } : { kind: 'unavailable' };
       }
-      return dir;
-    } catch {
+      return { kind: 'opened', dir };
+    } catch (error) {
       if (dir) closeDirectory(dir);
-      return undefined;
+      return isMissingPathError(error) ? { kind: 'missing' } : { kind: 'unavailable' };
     }
   }
 
@@ -486,10 +683,10 @@ export class NestedSessionTraceMonitor {
     if (!isSafeRelativePath(canonicalRoot, candidate)) return { kind: 'unavailable' };
     const before = verifiedCanonicalStats(source, canonicalRoot, candidate, false);
     if (!before) return pathIsMissing(candidate) ? { kind: 'missing' } : { kind: 'unavailable' };
-    this.dependencies.beforeFileOpen?.(candidate);
 
     let descriptor: number | undefined;
     try {
+      this.dependencies.beforeFileOpen?.(candidate);
       descriptor = openSync(candidate, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
       const stats = fstatSync(descriptor);
       if (!stats.isFile() || fileIdentity(stats) !== fileIdentity(before.stats)) {
@@ -542,7 +739,15 @@ export class NestedSessionTraceMonitor {
     if (cursor.pending.length === 0) return;
     cursor.pending = Buffer.alloc(0);
     cursor.droppingOversizedLine = true;
-    this.dependencies.emit(source, '⚠️ child session record omitted (buffer limit)');
+    this.warnThrottled(
+      `buffer-limit:${source.jid}`,
+      { jid: source.jid },
+      'Nested session record omitted after monitor buffer limit',
+    );
+  }
+
+  private now(): number {
+    return this.dependencies.now?.() ?? Date.now();
   }
 
   private warnError(key: string, jid: string | undefined, error: unknown, message: string): void {
@@ -554,7 +759,7 @@ export class NestedSessionTraceMonitor {
   }
 
   private warnThrottled(key: string, metadata: Record<string, unknown>, message: string): void {
-    const now = this.dependencies.now?.() ?? Date.now();
+    const now = this.now();
     const previous = this.lastWarnings.get(key) ?? 0;
     if (now - previous < LOG_THROTTLE_MS) return;
     this.lastWarnings.set(key, now);
@@ -562,13 +767,53 @@ export class NestedSessionTraceMonitor {
   }
 }
 
-function newChannelCursor(source: NormalizedSource): ChannelCursor {
+function emptyPollUsage(): NestedSessionPollUsage {
+  return {
+    channels: 0,
+    discoveryEntries: 0,
+    directoryOpens: 0,
+    fileOpens: 0,
+    bytes: 0,
+    lines: 0,
+    emittedLines: 0,
+  };
+}
+
+function pollUsage(remaining: PollBudget): NestedSessionPollUsage {
+  return {
+    channels: MAX_CHANNELS_VISITED_PER_POLL - remaining.channels,
+    discoveryEntries: MAX_DISCOVERY_ENTRIES_PER_POLL - remaining.discoveryEntries,
+    directoryOpens: MAX_DIRECTORY_OPENS_PER_POLL - remaining.directoryOpens,
+    fileOpens: MAX_FILE_OPENS_PER_POLL - remaining.fileOpens,
+    bytes: MAX_BYTES_PER_POLL - remaining.bytes,
+    lines: MAX_LINES_PER_POLL - remaining.lines,
+    emittedLines: MAX_EMITTED_LINES_PER_POLL - remaining.emittedLines,
+  };
+}
+
+function newPollBudget(): PollBudget {
+  return {
+    channels: MAX_CHANNELS_VISITED_PER_POLL,
+    discoveryEntries: MAX_DISCOVERY_ENTRIES_PER_POLL,
+    directoryOpens: MAX_DIRECTORY_OPENS_PER_POLL,
+    fileOpens: MAX_FILE_OPENS_PER_POLL,
+    bytes: MAX_BYTES_PER_POLL,
+    lines: MAX_LINES_PER_POLL,
+    emittedLines: MAX_EMITTED_LINES_PER_POLL,
+    channelLines: MAX_LINES_PER_CHANNEL_POLL,
+    channelEmittedLines: MAX_EMITTED_LINES_PER_CHANNEL_POLL,
+  };
+}
+
+function newChannelCursor(source: NormalizedSource, activatedAtMs: number): ChannelCursor {
   return {
     source,
-    initialized: false,
+    activatedAtMs,
+    rootMissingAtActivation: pathIsMissing(source.root),
+    initialDiscoveryComplete: false,
     files: new Map(),
+    unavailableFiles: new Set(),
     nextFileIndex: 0,
-    baselineNameBudget: MAX_BASELINE_NAME_BYTES_PER_CHANNEL,
     discovery: newDiscoveryCursor(),
   };
 }
@@ -583,6 +828,7 @@ function disposeChannel(state: ChannelCursor): void {
   state.discovery.queue = [];
   state.discovery.queued.clear();
   state.files.clear();
+  state.unavailableFiles.clear();
 }
 
 function closeDirectory(dir: Dir): void {
@@ -675,15 +921,6 @@ function isSafeRelativePath(root: string, candidate: string): boolean {
   return candidate !== root && isWithinOrEqual(root, candidate);
 }
 
-function pathExists(path: string): boolean {
-  try {
-    lstatSync(path);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function pathIsMissing(path: string): boolean {
   try {
     lstatSync(path);
@@ -693,24 +930,46 @@ function pathIsMissing(path: string): boolean {
   }
 }
 
-function newCursor(descriptor: number, stats: Stats, offset: number): FileCursor {
+function newCursor(
+  descriptor: number,
+  stats: Stats,
+  offset: number,
+  activationCutoffMs: number,
+  baselineComplete: boolean,
+): FileCursor {
   const cursor: FileCursor = {
     identity: fileIdentity(stats),
     offset,
     continuity: Buffer.alloc(0),
     pending: Buffer.alloc(0),
     droppingOversizedLine: false,
+    baselineComplete,
+    activationCutoffMs,
+    highWaterTimestampMs: activationCutoffMs,
+    highWaterIds: new Set(),
   };
   setContinuity(descriptor, cursor);
   return cursor;
 }
 
-function resetCursor(descriptor: number, stats: Stats, cursor: FileCursor): void {
+function resetCursor(
+  descriptor: number,
+  stats: Stats,
+  cursor: FileCursor,
+  createdAfterActivation: boolean,
+): void {
   cursor.identity = fileIdentity(stats);
   cursor.offset = 0;
   cursor.continuity = Buffer.alloc(0);
   cursor.pending = Buffer.alloc(0);
   cursor.droppingOversizedLine = false;
+  // A new post-activation inode is entirely live. Rewrites of an admitted file
+  // retain their temporal high-water so old records cannot replay.
+  if (createdAfterActivation) {
+    cursor.baselineComplete = true;
+    cursor.highWaterTimestampMs = cursor.activationCutoffMs;
+    cursor.highWaterIds.clear();
+  }
   cursor.sourceName = undefined;
   setContinuity(descriptor, cursor);
 }
@@ -744,26 +1003,35 @@ function fileIdentity(stats: Stats): string {
   return `${String(stats.dev)}:${String(stats.ino)}`;
 }
 
-function readBaselineSourceName(descriptor: number, bytes: number): string | undefined {
-  if (bytes <= 0) return undefined;
-  try {
-    const buffer = Buffer.allocUnsafe(bytes);
-    const read = readSync(descriptor, buffer, 0, bytes, 0);
-    for (const line of buffer.subarray(0, read).toString('utf8').split(/\r?\n/u)) {
-      if (!line) continue;
-      try {
-        const record = JSON.parse(line) as { type?: unknown; name?: unknown };
-        if (record.type === 'session_info' && typeof record.name === 'string') {
-          return formatNestedSessionTraceRecord(record).sourceName;
-        }
-      } catch {
-        // A partial baseline line is expected when the bounded read ends.
-      }
-    }
-  } catch {
-    return undefined;
+function shouldEmitRecord(cursor: FileCursor, record: any): boolean {
+  const timestamp = recordTimestampMs(record);
+  if (timestamp === undefined) return cursor.baselineComplete;
+  const id = recordIdentity(record);
+
+  if (timestamp < cursor.highWaterTimestampMs) return false;
+  if (timestamp === cursor.highWaterTimestampMs) {
+    if (!id || cursor.highWaterIds.has(id)) return false;
+    cursor.highWaterIds.add(id);
+    return cursor.baselineComplete || timestamp > cursor.activationCutoffMs;
   }
-  return undefined;
+
+  cursor.highWaterTimestampMs = timestamp;
+  cursor.highWaterIds.clear();
+  if (id) cursor.highWaterIds.add(id);
+  return cursor.baselineComplete || timestamp > cursor.activationCutoffMs;
+}
+
+function recordTimestampMs(record: any): number | undefined {
+  const raw = record?.timestamp ?? record?.ts ?? record?.message?.timestamp;
+  if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+  if (typeof raw !== 'string' || !raw) return undefined;
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function recordIdentity(record: any): string | undefined {
+  const value = record?.id ?? record?.message?.id ?? record?.toolCallId;
+  return typeof value === 'string' && value ? value.slice(0, 256) : undefined;
 }
 
 function isMissingPathError(error: unknown): boolean {
@@ -789,19 +1057,19 @@ function rotate<T>(values: readonly T[], start: number): T[] {
 
 function defaultSources(): NestedSessionSource[] {
   const sessionsRoot = resolve(config.sessionsDir);
-  return getAllChannels().flatMap((channel) => {
-    const webhook = getChannelWebhook(channel.jid);
-    if (!webhook) return [];
-    const root = resolve(sessionsRoot, channel.folder);
+  // Fetch one extra row to make admission overflow observable without ever
+  // materializing all inactive channels or issuing per-channel webhook reads.
+  return getMonitoredChannelRoutes(MAX_CHANNELS + 1).flatMap((route) => {
+    const root = resolve(sessionsRoot, route.folder);
     return isWithinOrEqual(sessionsRoot, root)
       ? [
           {
-            jid: channel.jid,
+            jid: route.channel_jid,
             root,
             boundary: sessionsRoot,
             // Keep credentials out of logs, but include the complete route in
             // the in-memory epoch so clear+re-enable between polls baselines.
-            epoch: webhookEpoch(webhook),
+            epoch: webhookEpoch(route),
           },
         ]
       : [];
