@@ -1102,7 +1102,18 @@ export function enqueueScheduledTask(
   nextRunAt: string | null,
 ): void {
   db.transaction(() => {
-    enqueueMessage(msg);
+    const alreadyQueued = db
+      .prepare(
+        `select 1 from message_queue
+         where channel_jid = ? and sender = ? and content = ?
+           and status in ('pending', 'processing')
+         limit 1`,
+      )
+      .get(msg.channelJid, msg.sender, msg.content);
+
+    // Recurring status checks cannot interrupt a running Pi tool call. Keep at
+    // most one outstanding copy instead of building a stale steer backlog.
+    if (!alreadyQueued) enqueueMessage(msg);
     updateTaskAfterRun(taskId, lastRunAt, nextRunAt);
   })();
 }

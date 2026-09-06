@@ -34,6 +34,56 @@ describe('computeNextRun', () => {
 });
 
 describe('scheduled task db helpers', () => {
+  it('does not overlap identical scheduled messages while one is still running', async () => {
+    process.env.DB_PATH = ':memory:';
+    vi.resetModules();
+
+    const db = await import('../src/db.js');
+    db.initDb();
+
+    try {
+      db.registerChannel({
+        jid: 'dc:heartbeat',
+        name: 'heartbeat',
+        folder: 'ch_heartbeat',
+        requiresTrigger: false,
+        isMain: false,
+        cwdOverride: '',
+      });
+      const taskId = db.addScheduledTask({
+        name: 'Heartbeat',
+        type: 'recurring',
+        schedule: '* * * * *',
+        channelJid: 'dc:heartbeat',
+        prompt: 'report progress',
+        createdBy: 'tester',
+        nextRunAt: new Date(Date.now() + 60_000).toISOString(),
+      });
+      const message = {
+        channelJid: 'dc:heartbeat',
+        sender: 'scheduler',
+        senderName: 'Scheduler',
+        content: 'report progress',
+        timestamp: new Date().toISOString(),
+      };
+
+      db.enqueueScheduledTask(taskId, message, message.timestamp, new Date().toISOString());
+      expect(db.claimNextMessage('dc:heartbeat')).toBeTruthy();
+
+      db.enqueueScheduledTask(taskId, message, message.timestamp, new Date().toISOString());
+      expect(db.pendingMessageSnapshot('dc:heartbeat').count).toBe(0);
+    } finally {
+      db.closeDb();
+      vi.resetModules();
+
+      if (originalDbPath === undefined) {
+        delete process.env.DB_PATH;
+      } else {
+        process.env.DB_PATH = originalDbPath;
+      }
+    }
+  });
+
   it('adds, lists, and removes scheduled tasks in an in-memory database', async () => {
     process.env.DB_PATH = ':memory:';
     vi.resetModules();
