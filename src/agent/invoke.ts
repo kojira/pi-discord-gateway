@@ -485,8 +485,16 @@ export async function invokeAgent(
       });
     });
 
-    void sendCommand({ type: 'prompt', message: prompt })
+    void sendCommand({ type: 'set_steering_mode', mode: 'all' })
       .then((response) => {
+        if (!response.success) {
+          failRpcOutput(response.error || 'Pi rejected all-message steering mode');
+          return undefined;
+        }
+        return sendCommand({ type: 'prompt', message: prompt });
+      })
+      .then((response) => {
+        if (!response) return;
         if (!response.success) {
           failRpcOutput(response.error || 'Pi rejected the prompt');
           return;

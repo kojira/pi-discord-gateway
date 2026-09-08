@@ -70,7 +70,7 @@ The gateway **does not embed or replace `pi`**. It finds and runs your installed
 3. **Model catalog** — the gateway imports the pi SDK to populate slash command autocomplete
 4. **Invocation** — each channel run uses Pi's JSONL RPC mode for live events and steering
 
-While Pi is working in a channel, another Discord message in that channel is sent through Pi's native `steer` queue. Pi receives it after the current assistant turn and its tool calls complete, before the next model turn. Assistant text is posted to Discord at each `message_end` event instead of being reduced to the final print-mode response.
+While Pi is working in a channel, another Discord message in that channel is sent immediately through Pi's native `steer` queue. All messages accepted during the same assistant turn are delivered together before one next model turn, regardless of the interval between their arrival times. Piscord persists Pi's global `steeringMode` as `all`, so interactive Pi sessions use the same grouping behavior. Assistant text is posted to Discord at each `message_end` event instead of being reduced to the final print-mode response.
 
 ## Channel Policy
 
@@ -229,8 +229,6 @@ Most users won't need to edit this file directly — `piscord setup` generates i
 | `MAX_CONCURRENCY`                  | `3`                             | Max parallel pi invocations                                                |
 | `MAX_SCHEDULED_CONCURRENCY`        | `1`                             | Max scheduled tasks enqueued per tick                                      |
 | `POLL_INTERVAL_MS`                 | `1000`                          | Queue poll interval (ms)                                                   |
-| `STEER_DEBOUNCE_MS`                | `750`                           | Quiet window before queued active-run messages are combined into one steer |
-| `STEER_DEBOUNCE_MAX_MS`            | `3000`                          | Maximum batching delay while messages continue arriving                    |
 | `STEER_BATCH_MAX_MESSAGES`         | `10`                            | Maximum Discord messages in one steering batch                             |
 | `STEER_BATCH_MAX_PROMPT_CHARS`     | `16000`                         | Maximum prompt characters in one steering batch                            |
 | `STEER_BATCH_MAX_ATTACHMENT_BYTES` | `52428800`                      | Maximum attachment bytes in one steering batch                             |
