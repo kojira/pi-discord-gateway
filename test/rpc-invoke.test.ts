@@ -21,7 +21,108 @@ afterEach(() => {
 });
 
 describe('Pi RPC invocation', () => {
-  it('delivers intermediate assistant messages and accepts steering during the run', async () => {
+  it('sets persistent all-message steering mode before sending the initial prompt', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'piscord-rpc-mode-'));
+    tempDirs.push(root);
+    const commandCapture = join(root, 'commands.txt');
+    const fakePi = join(root, 'fake-pi.mjs');
+
+    writeFileSync(
+      fakePi,
+      `#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
+let buffer = '';
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+process.stdin.on('data', (chunk) => {
+  buffer += chunk.toString('utf8');
+  let index;
+  while ((index = buffer.indexOf('\\n')) !== -1) {
+    const command = JSON.parse(buffer.slice(0, index)); buffer = buffer.slice(index + 1);
+    appendFileSync(${JSON.stringify(commandCapture)}, JSON.stringify(command) + '\\n');
+    if (command.type === 'set_steering_mode') {
+      send({ type: 'response', id: command.id, command: command.type, success: command.mode === 'all' });
+    } else if (command.type === 'prompt') {
+      send({ type: 'response', id: command.id, command: command.type, success: true });
+      send({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'done' }], stopReason: 'stop' } });
+      send({ type: 'agent_settled' });
+    }
+  }
+});
+`,
+    );
+    chmodSync(fakePi, 0o755);
+
+    const mutable = config as unknown as Record<string, unknown>;
+    Object.assign(mutable, {
+      piBin: fakePi,
+      piModel: '',
+      piThinking: '',
+      piExtraFlags: '',
+      sessionsDir: join(root, 'sessions'),
+    });
+
+    expect(await invokeAgent('ch_mode', 'initial prompt', { cwd: root })).toEqual({
+      ok: true,
+      text: 'done',
+    });
+    const commands = (await import('node:fs'))
+      .readFileSync(commandCapture, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    expect(commands.map(({ type }) => type)).toEqual(['set_steering_mode', 'prompt']);
+    expect(commands[0]).toMatchObject({ type: 'set_steering_mode', mode: 'all' });
+  });
+
+  it('does not prompt when Pi rejects all-message steering mode', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'piscord-rpc-mode-reject-'));
+    tempDirs.push(root);
+    const commandCapture = join(root, 'commands.txt');
+    const fakePi = join(root, 'fake-pi.mjs');
+
+    writeFileSync(
+      fakePi,
+      `#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
+let buffer = '';
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+process.stdin.on('data', (chunk) => {
+  buffer += chunk.toString('utf8');
+  let index;
+  while ((index = buffer.indexOf('\\n')) !== -1) {
+    const command = JSON.parse(buffer.slice(0, index)); buffer = buffer.slice(index + 1);
+    appendFileSync(${JSON.stringify(commandCapture)}, command.type + '\\n');
+    if (command.type === 'set_steering_mode') {
+      send({ type: 'response', id: command.id, command: command.type, success: false, error: 'unsupported mode' });
+    } else if (command.type === 'prompt') {
+      send({ type: 'response', id: command.id, command: command.type, success: true });
+    }
+  }
+});
+`,
+    );
+    chmodSync(fakePi, 0o755);
+
+    const mutable = config as unknown as Record<string, unknown>;
+    Object.assign(mutable, {
+      piBin: fakePi,
+      piModel: '',
+      piThinking: '',
+      piExtraFlags: '',
+      sessionsDir: join(root, 'sessions'),
+    });
+
+    expect(await invokeAgent('ch_mode_reject', 'must not be sent', { cwd: root })).toEqual({
+      ok: false,
+      text: '',
+      error: 'unsupported mode',
+    });
+    expect((await import('node:fs')).readFileSync(commandCapture, 'utf8').trim()).toBe(
+      'set_steering_mode',
+    );
+  });
+
+  it('delivers separated steers from one long turn before one following assistant turn', async () => {
     const root = mkdtempSync(join(tmpdir(), 'piscord-rpc-'));
     tempDirs.push(root);
     const steerCapture = join(root, 'steer.txt');
@@ -33,6 +134,7 @@ describe('Pi RPC invocation', () => {
 import { appendFileSync } from 'node:fs';
 let buffer = '';
 let finished = false;
+const steering = [];
 const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
 const finish = () => {
   if (finished) return;
@@ -48,19 +150,28 @@ process.stdin.on('data', (chunk) => {
     const line = buffer.slice(0, index); buffer = buffer.slice(index + 1);
     if (!line) continue;
     const command = JSON.parse(line);
-    if (command.type === 'prompt') {
+    if (command.type === 'set_steering_mode') {
+      send({ type: 'response', id: command.id, command: command.type, success: command.mode === 'all' });
+    } else if (command.type === 'prompt') {
       send({ type: 'response', id: command.id, command: 'prompt', success: true });
-      send({ type: 'agent_start' });
-      send({ type: 'message_start', message: { role: 'user', content: command.message } });
-      send({ type: 'message_end', message: { role: 'assistant', content: [
-        { type: 'text', text: 'working update' },
-        { type: 'toolCall', id: 'tool-1', name: 'bash', arguments: {} }
-      ] } });
+      setTimeout(() => {
+        send({ type: 'agent_start' });
+        send({ type: 'message_start', message: { role: 'user', content: command.message } });
+        send({ type: 'message_end', message: { role: 'assistant', content: [
+          { type: 'text', text: 'working update' },
+          { type: 'toolCall', id: 'tool-1', name: 'bash', arguments: {} }
+        ] } });
+      }, 20);
     } else if (command.type === 'steer') {
-      appendFileSync(${JSON.stringify(steerCapture)}, command.message);
+      appendFileSync(${JSON.stringify(steerCapture)}, command.message + '\\n');
+      steering.push(command.message);
       send({ type: 'response', id: command.id, command: 'steer', success: true });
-      send({ type: 'message_start', message: { role: 'user', content: command.message } });
-      setTimeout(finish, 10);
+      if (steering.length === 2) {
+        setTimeout(() => {
+          for (const message of steering) send({ type: 'message_start', message: { role: 'user', content: message } });
+          finish();
+        }, 10);
+      }
     } else if (command.type === 'abort') {
       send({ type: 'response', id: command.id, command: 'abort', success: true });
       finish();
@@ -83,18 +194,28 @@ setTimeout(finish, 2000);
 
     const messages: string[] = [];
     const traces: string[] = [];
-    let steerAccepted = false;
-    let steerConsumed = false;
+    const steerAccepted: boolean[] = [];
+    let steerConsumed = 0;
     const result = await invokeAgent('ch_test', 'initial prompt', {
       cwd: root,
       onTraceEvent: (text) => traces.push(text),
       onAssistantMessage: async (text) => {
         messages.push(text);
         if (text === 'working update') {
-          steerAccepted = await steerActiveAgent(
-            'ch_test',
-            '[Discord user: Alice]\nchange course',
-            { onConsumed: () => void (steerConsumed = true) },
+          steerAccepted.push(
+            await steerActiveAgent('ch_test', '[Discord user: Alice]\nchange course', {
+              onConsumed: () => void (steerConsumed += 1),
+            }),
+          );
+          await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+          steerAccepted.push(
+            await steerActiveAgent(
+              'ch_test',
+              '[Discord user: Alice]\nand keep the original files',
+              {
+                onConsumed: () => void (steerConsumed += 1),
+              },
+            ),
           );
         }
       },
@@ -107,15 +228,18 @@ setTimeout(finish, 2000);
       '👤 user: initial prompt',
       '🤖 assistant: working update',
       '👤 user: [Discord user: Alice]\nchange course',
+      '👤 user: [Discord user: Alice]\nand keep the original files',
       '🤖 assistant: final answer',
       '⏹️ agent settled',
     ]);
-    expect(steerAccepted).toBe(true);
-    expect(steerConsumed).toBe(true);
+    expect(steerAccepted).toEqual([true, true]);
+    expect(steerConsumed).toBe(2);
     expect(await steerActiveAgent('ch_test', 'too late')).toBe(false);
     expect(
       await import('node:fs').then(({ readFileSync }) => readFileSync(steerCapture, 'utf8')),
-    ).toContain('change course');
+    ).toBe(
+      '[Discord user: Alice]\nchange course\n[Discord user: Alice]\nand keep the original files\n',
+    );
   });
 
   it('forwards bounded subagent tool output through the trace callback', async () => {
@@ -367,7 +491,29 @@ function makeFakePi(body: string): string {
   const root = mkdtempSync(join(tmpdir(), 'piscord-rpc-'));
   tempDirs.push(root);
   const fakePi = join(root, 'fake-pi.mjs');
-  writeFileSync(fakePi, `#!/usr/bin/env node\n${body}`);
+  const steeringModeShim = `
+const originalStdinOn = process.stdin.on.bind(process.stdin);
+process.stdin.on = (event, listener) => {
+  if (event !== 'data') return originalStdinOn(event, listener);
+  let setupBuffer = '';
+  return originalStdinOn('data', (chunk) => {
+    setupBuffer += chunk.toString('utf8');
+    let setupIndex;
+    while ((setupIndex = setupBuffer.indexOf('\\n')) !== -1) {
+      const setupLine = setupBuffer.slice(0, setupIndex);
+      setupBuffer = setupBuffer.slice(setupIndex + 1);
+      if (!setupLine) continue;
+      const setupCommand = JSON.parse(setupLine);
+      if (setupCommand.type === 'set_steering_mode') {
+        process.stdout.write(JSON.stringify({ type: 'response', id: setupCommand.id, command: setupCommand.type, success: setupCommand.mode === 'all' }) + '\\n');
+      } else {
+        listener(Buffer.from(setupLine + '\\n'));
+      }
+    }
+  });
+};
+`;
+  writeFileSync(fakePi, `#!/usr/bin/env node\n${steeringModeShim}\n${body}`);
   chmodSync(fakePi, 0o755);
 
   const mutable = config as unknown as Record<string, unknown>;

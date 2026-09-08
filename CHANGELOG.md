@@ -14,7 +14,7 @@ All notable changes to this project will be documented in this file.
 ### Changed
 
 - Include bounded, best-effort-redacted tool argument and result previews in activity webhooks, matching the practical `peeko-log.sh` session view.
-- Debounce consecutive same-channel messages during an active run and send the queued messages to Pi as one steering batch.
+- Group all same-channel messages received during one active Pi assistant turn into the next model turn, regardless of their arrival interval.
 - Replace one-shot print-mode agent invocations with the official JSONL RPC protocol.
 
 ### Fixed

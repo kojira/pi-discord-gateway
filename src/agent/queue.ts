@@ -18,7 +18,6 @@ import {
   markMessageFailed,
   markMessagesDone,
   markMessagesFailed,
-  pendingMessageSnapshot,
   recoverStuckMessages,
   requeueMessages,
   logMessage,
@@ -219,8 +218,7 @@ async function processSteeringMessages(
   parentSignal: AbortSignal,
   signal: AbortSignal,
 ): Promise<void> {
-  const ready = await waitForSteeringDebounce(jid, generation, signal);
-  if (!ready || !isCurrentGeneration(jid, generation)) return;
+  if (signal.aborted || !isCurrentGeneration(jid, generation)) return;
 
   const candidates = listPendingMessages(jid, config.steerBatchMaxMessages);
   const prepared = prepareSteeringBatch(candidates);
@@ -297,49 +295,8 @@ function settleInactiveSteeringBatch(
   }
 }
 
-async function waitForSteeringDebounce(
-  jid: string,
-  generation: symbol,
-  signal: AbortSignal,
-): Promise<boolean> {
-  let observed = pendingMessageSnapshot(jid);
-  if (observed.count === 0) return false;
-  const deadline = Date.now() + config.steerDebounceMaxMs;
-
-  while (config.steerDebounceMs > 0) {
-    const remainingMs = deadline - Date.now();
-    if (remainingMs <= 0) break;
-    if (!(await waitForDelay(Math.min(config.steerDebounceMs, remainingMs), signal))) return false;
-    if (!isCurrentGeneration(jid, generation)) return false;
-
-    const current = pendingMessageSnapshot(jid);
-    if (current.count === 0) return false;
-    if (current.latestRowid === observed.latestRowid) break;
-    observed = current;
-  }
-
-  return !signal.aborted && isCurrentGeneration(jid, generation);
-}
-
 function isCurrentGeneration(jid: string, generation: symbol): boolean {
   return activeChannelGenerations.get(jid) === generation;
-}
-
-function waitForDelay(ms: number, signal: AbortSignal): Promise<boolean> {
-  if (signal.aborted) return Promise.resolve(false);
-  return new Promise((resolve) => {
-    let finished = false;
-    const finish = (completed: boolean) => {
-      if (finished) return;
-      finished = true;
-      clearTimeout(timer);
-      signal.removeEventListener('abort', onAbort);
-      resolve(completed);
-    };
-    const onAbort = () => finish(false);
-    const timer = setTimeout(() => finish(true), ms);
-    signal.addEventListener('abort', onAbort, { once: true });
-  });
 }
 
 function prepareSteeringBatch(candidates: QueuedMessage[]): PreparedSteeringBatch | undefined {

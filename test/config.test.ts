@@ -28,8 +28,6 @@ const CONFIG_ENV_KEYS = [
   'STEER_BATCH_MAX_ATTACHMENT_BYTES',
   'STEER_BATCH_MAX_MESSAGES',
   'STEER_BATCH_MAX_PROMPT_CHARS',
-  'STEER_DEBOUNCE_MAX_MS',
-  'STEER_DEBOUNCE_MS',
   'TRIGGER_NAME',
 ];
 
@@ -128,20 +126,16 @@ describe('config loading', () => {
     expect(config.sessionsDir).toBe('/default/sessions');
   });
 
-  it('loads the steering debounce window and accepts zero to disable it', async () => {
+  it('loads steering batch bounds', async () => {
     const workDir = createTempDir();
     process.chdir(workDir);
     process.env.PIDG_CONFIG = resolve(workDir, 'missing.env');
-    process.env.STEER_DEBOUNCE_MS = '0';
-    process.env.STEER_DEBOUNCE_MAX_MS = '40';
     process.env.STEER_BATCH_MAX_MESSAGES = '3';
     process.env.STEER_BATCH_MAX_PROMPT_CHARS = '400';
     process.env.STEER_BATCH_MAX_ATTACHMENT_BYTES = '500';
 
     const { config } = await loadConfigModule();
 
-    expect(config.steerDebounceMs).toBe(0);
-    expect(config.steerDebounceMaxMs).toBe(40);
     expect(config.steerBatchMaxMessages).toBe(3);
     expect(config.steerBatchMaxPromptChars).toBe(400);
     expect(config.steerBatchMaxAttachmentBytes).toBe(500);

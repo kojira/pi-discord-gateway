@@ -154,7 +154,71 @@ describe('active-run steering', () => {
     }
   });
 
-  it('debounces queued messages and steers them as one durable batch', async () => {
+  it('dispatches active-run steering without waiting for the configured quiet window', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'piscord-queue-steer-immediate-'));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, 'gateway.db');
+    process.env.DB_PATH = dbPath;
+    process.env.SESSIONS_DIR = resolve(tempDir, 'sessions');
+    process.env.POLL_INTERVAL_MS = '1';
+    process.env.MAX_CONCURRENCY = '1';
+    process.env.STEER_DEBOUNCE_MS = '5000';
+    process.env.STEER_DEBOUNCE_MAX_MS = '10000';
+
+    let finishInvocation!: (value: { ok: boolean; text: string; error?: string }) => void;
+    invokeAgentMock.mockImplementation(
+      () =>
+        new Promise((resolveInvocation) => {
+          finishInvocation = resolveInvocation;
+        }),
+    );
+    steerActiveAgentMock.mockResolvedValue(true);
+    sendResponseMock.mockResolvedValue(true);
+    setTypingMock.mockResolvedValue(undefined);
+
+    vi.resetModules();
+    const db = await import('../src/db.js');
+    const queue = await import('../src/agent/queue.js');
+    db.initDb();
+    db.registerChannel({
+      jid: 'dc:immediate',
+      name: 'immediate steering test',
+      folder: 'ch_immediate',
+      requiresTrigger: false,
+      isMain: false,
+      modelOverride: '',
+      thinkingOverride: '',
+      cwdOverride: '',
+    });
+    db.enqueueMessage({
+      channelJid: 'dc:immediate',
+      sender: 'u_1',
+      senderName: 'Alice',
+      content: 'initial request',
+      timestamp: new Date().toISOString(),
+    });
+
+    queue.startProcessingLoop();
+    try {
+      await vi.waitFor(() => expect(invokeAgentMock).toHaveBeenCalledTimes(1));
+      db.enqueueMessage({
+        channelJid: 'dc:immediate',
+        sender: 'u_1',
+        senderName: 'Alice',
+        content: 'correction during inference',
+        timestamp: new Date().toISOString(),
+      });
+
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+      expect(steerActiveAgentMock).toHaveBeenCalledTimes(1);
+    } finally {
+      finishInvocation?.({ ok: true, text: 'done' });
+      await queue.stopProcessingLoop({ timeoutMs: 1000 });
+      db.closeDb();
+    }
+  });
+
+  it('claims messages already pending as one durable bounded batch', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'piscord-queue-steer-batch-'));
     tempDirs.push(tempDir);
     const dbPath = join(tempDir, 'gateway.db');
@@ -212,7 +276,6 @@ describe('active-run steering', () => {
         timestamp: new Date().toISOString(),
         attachments: JSON.stringify([{ id: 'a1', name: 'first.png' }]),
       });
-      await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
       db.enqueueMessage({
         channelJid: 'dc:batch',
         sender: 'u_2',
@@ -256,104 +319,6 @@ describe('active-run steering', () => {
       consumedDb.close();
     } finally {
       finishInvocation?.({ ok: true, text: 'done' });
-      await queue.stopProcessingLoop({ timeoutMs: 1000 });
-      db.closeDb();
-    }
-  });
-
-  it('does not let a stale debounce cross active-run generations or resurrect stopped work', async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), 'piscord-queue-steer-generation-'));
-    tempDirs.push(tempDir);
-    const dbPath = join(tempDir, 'gateway.db');
-    process.env.DB_PATH = dbPath;
-    process.env.SESSIONS_DIR = resolve(tempDir, 'sessions');
-    process.env.POLL_INTERVAL_MS = '1';
-    process.env.MAX_CONCURRENCY = '1';
-    process.env.STEER_DEBOUNCE_MS = '100';
-    process.env.STEER_DEBOUNCE_MAX_MS = '200';
-
-    let finishFirst!: (value: { ok: boolean; text: string; error?: string }) => void;
-    invokeAgentMock
-      .mockImplementationOnce(
-        () =>
-          new Promise((resolveInvocation) => {
-            finishFirst = resolveInvocation;
-          }),
-      )
-      .mockImplementationOnce(
-        (_folder, _prompt, opts) =>
-          new Promise((resolveInvocation) => {
-            opts.signal.addEventListener(
-              'abort',
-              () => resolveInvocation({ ok: false, text: '', error: 'aborted' }),
-              { once: true },
-            );
-          }),
-      );
-    sendResponseMock.mockResolvedValue(true);
-    setTypingMock.mockResolvedValue(undefined);
-
-    vi.resetModules();
-    const db = await import('../src/db.js');
-    const queue = await import('../src/agent/queue.js');
-    db.initDb();
-    db.registerChannel({
-      jid: 'dc:generation',
-      name: 'generation test',
-      folder: 'ch_generation',
-      requiresTrigger: false,
-      isMain: false,
-      modelOverride: '',
-      thinkingOverride: '',
-      cwdOverride: '',
-    });
-    db.enqueueMessage({
-      channelJid: 'dc:generation',
-      sender: 'u_1',
-      senderName: 'Alice',
-      content: 'first run',
-      timestamp: new Date().toISOString(),
-    });
-
-    queue.startProcessingLoop();
-    try {
-      await vi.waitFor(() => expect(invokeAgentMock).toHaveBeenCalledTimes(1));
-      db.enqueueMessage({
-        channelJid: 'dc:generation',
-        sender: 'u_1',
-        senderName: 'Alice',
-        content: 'next run',
-        timestamp: new Date().toISOString(),
-      });
-      await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
-      finishFirst({ ok: true, text: 'first done' });
-
-      await vi.waitFor(() => expect(invokeAgentMock).toHaveBeenCalledTimes(2));
-      db.enqueueMessage({
-        channelJid: 'dc:generation',
-        sender: 'u_1',
-        senderName: 'Alice',
-        content: 'must be stopped',
-        timestamp: new Date().toISOString(),
-      });
-      await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
-      expect(queue.abortChannelTask('dc:generation')).toEqual({ aborted: true, cleared: 1 });
-      await vi.waitFor(() => expect(queue.isChannelProcessing('dc:generation')).toBe(false));
-      await new Promise((resolveDelay) => setTimeout(resolveDelay, 150));
-
-      expect(steerActiveAgentMock).not.toHaveBeenCalled();
-      const inspect = new Database(dbPath, { readonly: true });
-      try {
-        expect(
-          inspect
-            .prepare('select rowid from message_queue where content = ?')
-            .get('must be stopped'),
-        ).toBeUndefined();
-      } finally {
-        inspect.close();
-      }
-    } finally {
-      finishFirst?.({ ok: true, text: 'done' });
       await queue.stopProcessingLoop({ timeoutMs: 1000 });
       db.closeDb();
     }
@@ -464,7 +429,7 @@ describe('active-run steering', () => {
     }
   });
 
-  it('flushes a steering batch at the maximum debounce wait under sustained arrivals', async () => {
+  it('dispatches steering while additional messages continue to arrive', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'piscord-queue-steer-max-wait-'));
     tempDirs.push(tempDir);
     process.env.DB_PATH = join(tempDir, 'gateway.db');
