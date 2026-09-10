@@ -491,7 +491,7 @@ export async function invokeAgent(
           failRpcOutput(response.error || 'Pi rejected all-message steering mode');
           return undefined;
         }
-        return sendCommand({ type: 'prompt', message: prompt });
+        return sendCommand({ type: 'prompt', message: prompt, streamingBehavior: 'followUp' });
       })
       .then((response) => {
         if (!response) return;

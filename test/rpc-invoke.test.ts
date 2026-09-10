@@ -72,6 +72,11 @@ process.stdin.on('data', (chunk) => {
       .map((line) => JSON.parse(line));
     expect(commands.map(({ type }) => type)).toEqual(['set_steering_mode', 'prompt']);
     expect(commands[0]).toMatchObject({ type: 'set_steering_mode', mode: 'all' });
+    expect(commands[1]).toMatchObject({
+      type: 'prompt',
+      message: 'initial prompt',
+      streamingBehavior: 'followUp',
+    });
   });
 
   it('does not prompt when Pi rejects all-message steering mode', async () => {
