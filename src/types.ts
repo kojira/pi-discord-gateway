@@ -32,4 +32,5 @@ export interface AgentResult {
   ok: boolean;
   text: string;
   error?: string;
+  workOutcome?: 'completed' | 'cancelled' | 'waiting' | 'blocked';
 }

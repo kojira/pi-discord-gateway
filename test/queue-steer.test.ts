@@ -4,14 +4,19 @@ import { join, resolve } from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-const { invokeAgentMock, steerActiveAgentMock, sendResponseMock, setTypingMock } = vi.hoisted(
-  () => ({
-    invokeAgentMock: vi.fn(),
-    steerActiveAgentMock: vi.fn(),
-    sendResponseMock: vi.fn(),
-    setTypingMock: vi.fn(),
-  }),
-);
+const {
+  invokeAgentMock,
+  steerActiveAgentMock,
+  sendResponseMock,
+  setTypingMock,
+  flushWebhookTraceMock,
+} = vi.hoisted(() => ({
+  invokeAgentMock: vi.fn(),
+  steerActiveAgentMock: vi.fn(),
+  sendResponseMock: vi.fn(),
+  setTypingMock: vi.fn(),
+  flushWebhookTraceMock: vi.fn().mockResolvedValue(undefined),
+}));
 
 vi.mock('../src/agent/invoke.js', () => ({
   invokeAgent: invokeAgentMock,
@@ -22,6 +27,12 @@ vi.mock('../src/discord/client.js', () => ({
   promptSupervisorRequest: vi.fn(),
   sendResponse: sendResponseMock,
   setTyping: setTypingMock,
+}));
+
+vi.mock('../src/discord/webhook-monitor.js', () => ({
+  enqueueWebhookTrace: vi.fn(),
+  enqueueWebhookTerminal: vi.fn(),
+  flushWebhookTrace: flushWebhookTraceMock,
 }));
 
 const originalEnv = { ...process.env };

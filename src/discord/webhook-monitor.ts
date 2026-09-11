@@ -15,6 +15,8 @@ interface WebhookDeliveryState {
   webhook: ChannelWebhookConfig;
   client?: WebhookClient;
   lines: string[];
+  terminalLines: string[];
+  terminalChars: number;
   queuedChars: number;
   droppedEvents: number;
   inFlightEvents: number;
@@ -45,7 +47,17 @@ export function enqueueWebhookTraceForEpoch(
   enqueueWebhookTraceInternal(jid, line, expectedEpoch);
 }
 
-function enqueueWebhookTraceInternal(jid: string, line: string, expectedEpoch?: string): void {
+/** Terminal output has a separate bounded queue that detail activity cannot evict. */
+export function enqueueWebhookTerminal(jid: string, line: string): void {
+  enqueueWebhookTraceInternal(jid, line, undefined, true);
+}
+
+function enqueueWebhookTraceInternal(
+  jid: string,
+  line: string,
+  expectedEpoch?: string,
+  terminal = false,
+): void {
   if (stopping || !line.trim()) return;
   const webhook = getChannelWebhook(jid);
 
@@ -60,16 +72,24 @@ function enqueueWebhookTraceInternal(jid: string, line: string, expectedEpoch?: 
   const state = getOrCreateState(webhook);
   const timestamp = new Date().toISOString().slice(11, 19);
   const entry = `${timestamp} ${line.trim()}`;
-  if (
-    state.lines.length >= MAX_QUEUED_LINES ||
-    state.queuedChars + entry.length + 1 > MAX_QUEUED_CHARS
-  ) {
+  const entryChars = entry.length + 1;
+  if (terminal) {
+    if (state.terminalLines.length >= 8 || state.terminalChars + entryChars > MAX_QUEUED_CHARS) {
+      logger.warn({ jid }, 'Webhook terminal output rejected after terminal queue limit');
+      return;
+    }
+    state.terminalLines.push(entry);
+    state.terminalChars += entryChars;
+    void drainState(state);
+    return;
+  }
+  if (state.lines.length >= MAX_QUEUED_LINES || state.queuedChars + entryChars > MAX_QUEUED_CHARS) {
     state.droppedEvents += 1;
     return;
   }
 
   state.lines.push(entry);
-  state.queuedChars += entry.length + 1;
+  state.queuedChars += entryChars;
   if (state.lines.length >= MAX_LINES_PER_POST || state.queuedChars >= MAX_CONTENT_LENGTH) {
     void drainState(state);
   } else if (!state.timer) {
@@ -77,10 +97,34 @@ function enqueueWebhookTraceInternal(jid: string, line: string, expectedEpoch?: 
   }
 }
 
-/** Flush already queued output for one source channel and optional webhook epoch. */
-export async function flushWebhookTrace(jid: string, webhookId?: string): Promise<void> {
+/** Bound caller latency without cancelling an in-flight send or replaying its chunks. */
+export async function flushWebhookTrace(
+  jid: string,
+  webhookId?: string,
+  timeoutMs = 5000,
+): Promise<void> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+    throw new Error('Webhook flush timeout must be a finite non-negative number');
+  }
   const states = matchingStates(jid, webhookId);
-  await Promise.all(states.map((state) => drainState(state)));
+  if (states.length === 0) return;
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const drained = await Promise.race([
+      Promise.all(states.map((state) => drainState(state))).then(() => true),
+      new Promise<false>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+      }),
+    ]);
+    if (!drained) {
+      logger.warn(
+        { jid, timeoutMs, undelivered: countUndelivered(states) },
+        'Webhook flush deadline reached; delivery remains pending',
+      );
+    }
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /** Immediately drop queued output and destroy clients for a disabled route. */
@@ -205,15 +249,21 @@ export function isDiscordUnknownWebhookError(error: unknown): boolean {
 }
 
 async function drainState(state: WebhookDeliveryState): Promise<void> {
-  if (state.drainPromise) return state.drainPromise;
+  // A timer can fire while a previous send is still pending. Clear its handle
+  // before joining that drain, or later small batches cannot schedule a timer.
   if (state.timer) {
     clearTimeout(state.timer);
     state.timer = undefined;
   }
+  if (state.drainPromise) return state.drainPromise;
 
   const run = async () => {
-    while (!state.retired && (state.lines.length > 0 || state.droppedEvents > 0)) {
-      const lines = state.lines.splice(0);
+    while (
+      !state.retired &&
+      (state.lines.length > 0 || state.terminalLines.length > 0 || state.droppedEvents > 0)
+    ) {
+      const lines = [...state.terminalLines.splice(0), ...state.lines.splice(0)];
+      state.terminalChars = 0;
       state.queuedChars = 0;
       const dropped = state.droppedEvents;
       state.droppedEvents = 0;
@@ -232,7 +282,11 @@ async function drainState(state: WebhookDeliveryState): Promise<void> {
 
   state.drainPromise = run().finally(() => {
     state.drainPromise = undefined;
-    if (!state.retired && state.lines.length > 0 && !state.timer) {
+    if (
+      !state.retired &&
+      (state.lines.length > 0 || state.terminalLines.length > 0) &&
+      !state.timer
+    ) {
       state.timer = setTimeout(() => void drainState(state), FLUSH_INTERVAL_MS);
     }
   });
@@ -240,6 +294,7 @@ async function drainState(state: WebhookDeliveryState): Promise<void> {
 }
 
 async function deliver(state: WebhookDeliveryState, chunks: readonly string[]): Promise<void> {
+  let sentChunks = 0;
   try {
     for (const content of chunks) {
       if (state.retired || !isCurrentWebhookEpoch(state)) {
@@ -251,12 +306,15 @@ async function deliver(state: WebhookDeliveryState, chunks: readonly string[]): 
         token: state.webhook.webhook_token,
       });
       await state.client.send({ content, allowedMentions: { parse: [] } });
+      sentChunks += 1;
     }
   } catch (error) {
     logger.warn(
       {
         jid: state.jid,
         destinationChannelId: state.webhook.destination_channel_id,
+        sentChunks,
+        unconfirmedChunks: chunks.length - sentChunks,
         ...safeDiscordErrorMetadata(error),
       },
       'Failed to deliver Pi trace to monitoring webhook',
@@ -278,6 +336,8 @@ function getOrCreateState(webhook: ChannelWebhookConfig): WebhookDeliveryState {
       jid: webhook.channel_jid,
       webhook,
       lines: [],
+      terminalLines: [],
+      terminalChars: 0,
       queuedChars: 0,
       droppedEvents: 0,
       inFlightEvents: 0,
@@ -299,6 +359,8 @@ function retireState(state: WebhookDeliveryState): void {
   if (state.timer) clearTimeout(state.timer);
   state.timer = undefined;
   state.lines = [];
+  state.terminalLines = [];
+  state.terminalChars = 0;
   state.queuedChars = 0;
   state.droppedEvents = 0;
   state.inFlightEvents = 0;
@@ -308,7 +370,12 @@ function retireState(state: WebhookDeliveryState): void {
 
 function countUndelivered(states: readonly WebhookDeliveryState[]): number {
   return states.reduce(
-    (total, state) => total + state.lines.length + state.droppedEvents + state.inFlightEvents,
+    (total, state) =>
+      total +
+      state.lines.length +
+      state.terminalLines.length +
+      state.droppedEvents +
+      state.inFlightEvents,
     0,
   );
 }
@@ -337,6 +404,8 @@ export function webhookMonitorStats(jid: string): {
   queuedLines: number;
   queuedChars: number;
   droppedEvents: number;
+  terminalLines: number;
+  terminalChars: number;
 } {
   const states = matchingStates(jid);
   return {
@@ -344,6 +413,8 @@ export function webhookMonitorStats(jid: string): {
     queuedLines: states.reduce((total, state) => total + state.lines.length, 0),
     queuedChars: states.reduce((total, state) => total + state.queuedChars, 0),
     droppedEvents: states.reduce((total, state) => total + state.droppedEvents, 0),
+    terminalLines: states.reduce((total, state) => total + state.terminalLines.length, 0),
+    terminalChars: states.reduce((total, state) => total + state.terminalChars, 0),
   };
 }
 

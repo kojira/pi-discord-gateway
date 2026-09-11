@@ -26,7 +26,12 @@ import {
 import { invokeAgent, steerActiveAgent } from './invoke.js';
 import { promptSupervisorRequest, sendResponse, setTyping } from '../discord/client.js';
 import { computeEffectiveChannelSettings } from './channel-settings.js';
-import { enqueueWebhookTrace } from '../discord/webhook-monitor.js';
+import {
+  enqueueWebhookTerminal,
+  enqueueWebhookTrace,
+  flushWebhookTrace,
+} from '../discord/webhook-monitor.js';
+import { sanitizeTraceText } from './trace.js';
 import type { QueuedMessage } from '../types.js';
 
 /** Channels currently being processed (per-channel serial lock) */
@@ -482,6 +487,10 @@ async function processMessage(
     }
 
     if (result.ok) {
+      enqueueWebhookTerminal(
+        jid,
+        `Final response (${result.workOutcome || 'agent idle'}): ${sanitizeTraceText(result.text, 60_000)}`,
+      );
       // Any rows left here were accepted but never observed as user messages.
       // Requeue them rather than claiming they were processed.
       finalizeSteeringRows(jid, 'pending');
@@ -523,6 +532,10 @@ async function processMessage(
     }
 
     finalizeSteeringRows(jid, 'pending');
+    enqueueWebhookTerminal(
+      jid,
+      `Agent interrupted: ${sanitizeTraceText(result.error || 'unknown error')}`,
+    );
     const errMsg = `⚠️ Agent error: ${result.error?.slice(0, 300) || 'unknown error'}`;
     await sendResponse(jid, errMsg, signal);
     if (!taskResourcesAvailable || signal.aborted) return;
@@ -546,6 +559,14 @@ async function processMessage(
       // Nothing else to do here.
     }
   } finally {
+    try {
+      await flushWebhookTrace(jid);
+    } catch (err: any) {
+      logger.warn(
+        { jid, err: err.message },
+        'Failed to flush webhook trace after message processing',
+      );
+    }
     await typingLoop.stop();
   }
 }

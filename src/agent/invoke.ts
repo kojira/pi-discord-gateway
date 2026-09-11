@@ -146,6 +146,7 @@ export async function invokeAgent(
     let pendingDeliveryBytes = 0;
     let commandSequence = 0;
     let lastAssistantText = '';
+    let workOutcome: AgentResult['workOutcome'];
     let lastAssistantError = '';
     let lastAssistantFailed = false;
     let settled = false;
@@ -153,6 +154,8 @@ export async function invokeAgent(
     let initialPromptObserved = false;
     let forceKillTimer: NodeJS.Timeout | undefined;
     let legacySettleTimer: NodeJS.Timeout | undefined;
+    // Only an observed legacy agent_end authorizes the legacy idle fallback.
+    let legacyAgentEndPending = false;
     let deliveryChain = Promise.resolve();
     let consumptionChain = Promise.resolve();
 
@@ -283,6 +286,7 @@ export async function invokeAgent(
       }
 
       if (message?.type === 'message_end' && message.message?.role === 'assistant') {
+        workOutcome = undefined;
         const text = extractAssistantText(message.message.content);
         lastAssistantFailed =
           message.message.stopReason === 'error' ||
@@ -315,6 +319,23 @@ export async function invokeAgent(
         return;
       }
 
+      if (message?.type === 'work_contract') {
+        const record = message.record;
+        if (record?.status === 'resolved' && typeof record.decision?.summary === 'string') {
+          const outcome = record.decision.outcome;
+          workOutcome = ['completed', 'cancelled', 'waiting', 'blocked'].includes(outcome)
+            ? outcome
+            : undefined;
+          lastAssistantText = record.decision.summary;
+          lastAssistantFailed = false;
+          lastAssistantError = '';
+        } else if (record?.status === 'suspended') {
+          lastAssistantFailed = true;
+          lastAssistantError = typeof record.reason === 'string' ? record.reason : 'Work suspended';
+        }
+        return;
+      }
+
       if (message?.type === 'agent_settled') {
         settleInvocation();
         return;
@@ -323,8 +344,10 @@ export async function invokeAgent(
       // Pi versions before agent_settled support use agent_end as the terminal
       // event. Debounce it briefly because legacy auto-retry and auto-compaction
       // continuation events are emitted immediately after agent_end.
-      if (message?.type === 'agent_end' && !('willRetry' in message)) {
-        scheduleLegacySettlement();
+      if (message?.type === 'agent_end') {
+        legacyAgentEndPending = !('willRetry' in message);
+        if (legacyAgentEndPending) scheduleLegacySettlement();
+        else cancelLegacySettlement();
         return;
       }
 
@@ -333,6 +356,7 @@ export async function invokeAgent(
         message?.type === 'auto_retry_start' ||
         message?.type === 'compaction_start'
       ) {
+        if (message.type === 'agent_start') legacyAgentEndPending = false;
         cancelLegacySettlement();
         return;
       }
@@ -354,6 +378,9 @@ export async function invokeAgent(
     };
 
     const scheduleLegacySettlement = () => {
+      // willRetry:false on compaction_end means no overflow retry, not that
+      // an in-loop tool continuation has ended. Modern Pi must emit agent_settled.
+      if (!legacyAgentEndPending) return;
       cancelLegacySettlement();
       legacySettleTimer = setTimeout(() => {
         legacySettleTimer = undefined;
@@ -481,7 +508,7 @@ export async function invokeAgent(
           });
           return;
         }
-        finish({ ok: true, text: lastAssistantText });
+        finish({ ok: true, text: lastAssistantText, ...(workOutcome ? { workOutcome } : {}) });
       });
     });
 
