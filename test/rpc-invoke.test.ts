@@ -274,6 +274,35 @@ process.stdin.on('data', (chunk) => {
     expect(traces).toContain('🔧 tool-end subagent ok: Reviewer complete: no blockers');
   });
 
+  it.each([
+    {
+      record: {
+        status: 'resolved',
+        decision: { outcome: 'completed', summary: 'verified; not deployed' },
+      },
+      expected: { ok: true, text: 'verified; not deployed', workOutcome: 'completed' },
+    },
+    {
+      record: { status: 'suspended', reason: 'explicit finish missing' },
+      expected: { ok: false, text: '', error: 'explicit finish missing' },
+    },
+  ])(
+    'uses the work contract result instead of an earlier progress reply: $record.status',
+    async ({ record, expected }) => {
+      const root = makeFakePi(`
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+process.stdin.on('data', (chunk) => {
+  const command = JSON.parse(chunk.toString('utf8').trim());
+  send({ type: 'response', id: command.id, command: 'prompt', success: true });
+  send({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'working' }], stopReason: 'toolUse' } });
+  send({ type: 'work_contract', record: ${JSON.stringify(record)} });
+  send({ type: 'agent_settled' });
+});
+`);
+      expect(await invokeAgent('ch_contract', 'verify', { cwd: root })).toEqual(expected);
+    },
+  );
+
   it('supports pre-agent_settled Pi versions that terminate with agent_end', async () => {
     const root = makeFakePi(`
 const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
@@ -295,6 +324,49 @@ process.stdin.on('data', (chunk) => {
     });
     expect(result).toEqual({ ok: true, text: 'old Pi final' });
     expect(traces).toContain('⏹️ agent settled');
+  });
+
+  it('does not settle an active tool loop when threshold compaction ends without overflow retry', async () => {
+    const root = makeFakePi(`
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+// Pi RPC treats stdin EOF as shutdown and aborts its active model request.
+process.stdin.on('end', () => process.exit(0));
+process.stdin.on('data', (chunk) => {
+  const command = JSON.parse(chunk.toString('utf8').trim());
+  send({ type: 'response', id: command.id, command: 'prompt', success: true });
+  send({ type: 'agent_start' });
+  send({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'working before compaction' }], stopReason: 'toolUse' } });
+  send({ type: 'compaction_start', reason: 'threshold' });
+  send({ type: 'compaction_end', reason: 'threshold', aborted: false, willRetry: false });
+  setTimeout(() => {
+    send({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'continued after compaction' }], stopReason: 'stop' } });
+    send({ type: 'agent_end', messages: [], willRetry: false });
+    send({ type: 'agent_settled' });
+  }, 300);
+});
+`);
+    expect(await invokeAgent('ch_in_loop_compaction', 'work', { cwd: root })).toEqual({
+      ok: true,
+      text: 'continued after compaction',
+    });
+  });
+
+  it('settles a legacy invocation after post-run compaction finishes', async () => {
+    const root = makeFakePi(`
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+process.stdin.on('data', (chunk) => {
+  const command = JSON.parse(chunk.toString('utf8').trim());
+  send({ type: 'response', id: command.id, command: 'prompt', success: true });
+  send({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'legacy completed' }], stopReason: 'stop' } });
+  send({ type: 'agent_end', messages: [] });
+  send({ type: 'compaction_start', reason: 'threshold' });
+  setTimeout(() => send({ type: 'compaction_end', reason: 'threshold', aborted: false, willRetry: false }), 150);
+});
+`);
+    expect(await invokeAgent('ch_legacy_compaction', 'work', { cwd: root })).toEqual({
+      ok: true,
+      text: 'legacy completed',
+    });
   });
 
   it('keeps a legacy invocation alive across automatic retry events', async () => {

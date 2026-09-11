@@ -101,6 +101,69 @@ describe('webhook activity delivery', () => {
     expect(WebhookClientMock).toHaveBeenCalledTimes(1);
   });
 
+  it('schedules a fresh timer after a timer fires during an in-flight send', async () => {
+    vi.useFakeTimers();
+    const monitor = await import('../src/discord/webhook-monitor.js');
+    getChannelWebhookMock.mockReturnValue(webhook);
+    let releaseSend!: () => void;
+    sendMock.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseSend = resolve;
+        }),
+    );
+    try {
+      for (let index = 0; index < 5; index++)
+        monitor.enqueueWebhookTrace('dc:source', `initial-${index}`);
+      expect(sendMock).toHaveBeenCalledTimes(1);
+      monitor.enqueueWebhookTrace('dc:source', 'user while tool output is sending');
+      await vi.advanceTimersByTimeAsync(1000);
+      releaseSend();
+      await monitor.flushWebhookTrace('dc:source');
+      expect(sendMock).toHaveBeenCalledTimes(2);
+
+      monitor.enqueueWebhookTrace('dc:source', 'final assistant after drain completed');
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(sendMock).toHaveBeenCalledTimes(3);
+      expect(sendMock.mock.calls[2][0].content).toContain('final assistant after drain completed');
+    } finally {
+      await monitor.stopWebhookMonitor(0);
+      vi.useRealTimers();
+    }
+  });
+
+  it('protects terminal output from both earlier and later detail queue overflow', async () => {
+    const monitor = await import('../src/discord/webhook-monitor.js');
+    getChannelWebhookMock.mockReturnValue(webhook);
+    let releaseSend!: () => void;
+    sendMock.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseSend = resolve;
+        }),
+    );
+
+    for (let index = 0; index < 5; index += 1) {
+      monitor.enqueueWebhookTrace('dc:source', `initial-${index}`);
+    }
+    await vi.waitFor(() => expect(sendMock).toHaveBeenCalledTimes(1));
+    for (let index = 0; index < 1000; index += 1) {
+      monitor.enqueueWebhookTrace('dc:source', `old-${index}-${'x'.repeat(1000)}`);
+    }
+    monitor.enqueueWebhookTerminal('dc:source', 'latest-final-output');
+    for (let index = 0; index < 1000; index += 1) {
+      monitor.enqueueWebhookTrace('dc:source', `later-child-${index}-${'x'.repeat(1000)}`);
+    }
+
+    releaseSend();
+    await monitor.flushWebhookTrace('dc:source');
+
+    expect(
+      sendMock.mock.calls.some(([payload]) => payload.content.includes('latest-final-output')),
+    ).toBe(true);
+    expect(monitor.webhookMonitorStats('dc:source').droppedEvents).toBe(0);
+  });
+
   it('rejects nested-session output read under a stale webhook epoch', async () => {
     const monitor = await import('../src/discord/webhook-monitor.js');
     let mapping = webhook;
@@ -235,6 +298,33 @@ describe('webhook activity delivery', () => {
     expect(sendMock).not.toHaveBeenCalled();
     expect(WebhookClientMock).not.toHaveBeenCalled();
     expect(monitor.webhookMonitorStats('dc:source').states).toBe(0);
+  });
+
+  it('bounds flush latency and lets the original send finish without replay', async () => {
+    const monitor = await import('../src/discord/webhook-monitor.js');
+    const { logger } = await import('../src/logger.js');
+    const warn = vi.spyOn(logger, 'warn');
+    getChannelWebhookMock.mockReturnValue(webhook);
+    let releaseSend!: () => void;
+    sendMock.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseSend = resolve;
+        }),
+    );
+    monitor.enqueueWebhookTrace('dc:source', 'final output');
+    const started = Date.now();
+    await monitor.flushWebhookTrace('dc:source', undefined, 20);
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ jid: 'dc:source', undelivered: 1 }),
+      'Webhook flush deadline reached; delivery remains pending',
+    );
+    expect(destroyMock).not.toHaveBeenCalled();
+    releaseSend();
+    await monitor.flushWebhookTrace('dc:source');
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    expect(monitor.webhookMonitorStats('dc:source').queuedLines).toBe(0);
   });
 
   it('bounds retirement of a blocked webhook epoch', async () => {
