@@ -1,6 +1,6 @@
 # Issue #14: 非同期子処理を残したRPC接続の早期終了を防ぐ
 
-状態: 2026-09-11、設計提示後のユーザー「進めよう」で当初の実装範囲を承認。独立レビューで取消契約の不整合が判明し、統合実装を停止。§12の修正案は追加承認待ち。インストール先の直接変更、mainマージ、配備は対象外。
+状態: 当初の実装範囲を承認後、独立レビューで取消契約の不整合を確認。ユーザー「ではそのようにして」により、10秒で停止確認できなければ所有する子プロセスとPiを強制停止する修正を承認。§12に反映済み、統合実装・受入は未完了。インストール先の直接変更、mainマージ、配備は対象外。
 
 対象: https://github.com/kojira/pi-discord-gateway/issues/14
 
@@ -90,7 +90,7 @@ Gatewayにpi-subagentsの内部ファイル走査やrun判定を複製しない�
 ### 中断
 
 - cancelは当該処理の所有者が実装し、親からのabort/shutdown時にのみ呼ぶ。登録順やプロセス名で無関係な処理を止めない。
-- deadline超過も明示的中断。cancel猶予は10秒。成功・確認不能を区別して保存し、Gatewayへ構造化したfailureを返す。
+- deadline超過も明示的中断。通常のcancel猶予は最大10秒。時間切れなら確認を打ち切るだけでなく、所有する子プロセスとPiを強制停止する（§12）。通常停止・強制停止・残存/確認不能を区別して記録し、Gatewayへ構造化したfailureを返す。
 - 中断確認不能を「完了」にしない。外部jobが残り得る場合はjob/run IDを残す。再launchはしない。
 - 主たる結果deliveryを待っている時間もleaseのdeadlineに含める。通知故障で無期限に接続を保持しない。
 
@@ -229,7 +229,7 @@ Pi → `response { id, command:"close_if_quiescent", success:true, data:{closed:
 
 検証準備: Piの新規lease単体テスト10件は成功。最初の `npm run check` は作業ツリーのモデルJSON未生成で型エラーになり、既定の `npm run hydrate:model-data` 実行後は成功。統合・実RPC・依存拡張の受入成功を意味しない。
 
-## 12. 独立レビューによる停止・修正案（追加承認待ち）
+## 12. 独立レビューによる取消契約の修正（ユーザー承認済み）
 
 レビューrun `ebbd92c4-f491-4ef3-a194-bd80c72a7a0f`、workflow `25884e5a-a034-4f10-82d6-c6fe230ecf4c` は完了・結果回収済み。read-onlyソースレビューであり、統合試験は未実施。以下3件を有効なP1として採用した。
 
@@ -237,22 +237,28 @@ Pi → `response { id, command:"close_if_quiescent", success:true, data:{closed:
 
 事実: pi-subagents `src/workflows/scripted-workflow.ts:1749–1776` はchildrenへabortした後、steer/host callを待つが、未完了のlaunch全体は待たずrootをsettleする。`stopAsyncRun()` の「Stop requested」も停止確認ではない。
 
-修正案: 所有者のcancelはrootのterminal状態ではなく、所有launchの終了とprocess/providerの停止確認を待つbarrierとする。証拠が得られなければ10秒で `cancelConfirmed:false`、run/job IDを保持。確認不能は通常のsession切替/reloadを許可する状態にせず、明示shutdownのみ可能にする。別セッションの処理へ取消範囲を広げない。
+採用: 所有者のcancelはrootのterminal状態ではなく、所有launchの終了とprocess/providerの停止確認を待つbarrierとする。最大10秒で確認できなければ、管理下の子プロセス（所有する子孫を含む）へ強制停止を実行し、最後にPiを強制終了する。rootやPiだけを終了させ、子を残して確認を打ち切る方式は採らない。強制停止命令の送信自体を停止確認と同一視しない。run/job IDと強制停止の実行・確認結果を保持する。
+
+対象は当該セッションが起動時から所有を追跡している処理だけ。別セッション、プロセス名の一致だけで見つけた処理、再利用されたPIDへの停止は行わない。Piが応答不能でも所有する子を停止できるよう、強制停止に必要な所有情報はPi終了前に終了制御側へ保持する。外部jobには取消APIを使用し、取消不能・確認不能なら「残存・要対応」とIDを明示する。未確認のまま通常のsession切替/reloadを成功扱いにせず、接続を失敗終了させる。
 
 ### 12.2 取消結果と遅着結果
 
 事実: 作成中のPi `background-work.ts` はcancelling以降のdeliverを拒否してleaseを減らす。pi-subagents executorは取消後に結果を書き、result-watcherは受理失敗を再試行するため、無限再試行やmixed group全体の拒否につながる。現在の単体テスト成功はこの契約を検証していない。
 
-修正案: 取消完了または猶予切れでPiが一度だけ構造化した取消結果を受理・記録し、terminal dispositionを保持する。deliverの戻り値を判別可能な `accepted`（deliveryIdあり）/`terminal`（取消理由・確認状態あり）へ具体化する。terminalへの遅着は再enqueueせず、拡張はartifactを保持して自動再試行と従来sendMessageへのfallbackを止める。grouped通知はterminal handleを除外して未受理のactive分だけをまとめ、受理済み分を再投入しない。shutdown中は親の新runを起こさず、結果記録とRPC failure報告を行う。
+採用: 取消完了または強制停止への移行時に一度だけ構造化した取消結果を受理・記録し、terminal dispositionを保持する。deliverの戻り値を判別可能な `accepted`（deliveryIdあり）/`terminal`（取消理由・確認状態あり）へ具体化する。terminalへの遅着は再enqueueせず、拡張はartifactを保持して自動再試行と従来sendMessageへのfallbackを止める。grouped通知はterminal handleを除外して未受理のactive分だけをまとめ、受理済み分を再投入しない。shutdown中は親の新runを起こさず、結果記録とRPC failure報告を行う。
 
 ### 12.3 明示停止の時間・順序
 
 事実: Gateway `src/agent/invoke.ts:446–459` はabort送信と同時にSIGTERM、その1.5秒後にSIGKILLを送る。Pi RPC shutdownもruntime.disposeより先にsession eventの購読を解除する。このままでは10秒の取消猶予と結果報告を満たせない。
 
-修正案: managed modeだけ、停止の順序を「新規受付停止→owner取消→結果記録・RPC報告→dispose」に変更する。通常の明示停止では取消に最大10秒、報告・終了に最大2秒、合計最大12秒を確保し、それでも終了しなければ強制終了する。外側のshutdown期限が短い場合はその期限を優先し、確認不能として記録してから強制終了する。通信断等でPiから報告できない場合もGatewayは停止確認不能の失敗として扱い、正常完了や再送に置き換えない。managed mode offの停止挙動は変更しない。
+採用: managed modeだけ、通常停止の順序を「新規受付停止→owner取消→停止確認→結果記録・RPC報告→dispose」に変更する。10秒を待たず停止確認できれば、その時点で終了処理へ進む。
+
+取消開始から最大10秒で未停止・確認不能なら、その時点で所有する子プロセスへの強制停止を開始し、Piも終了させる。先の案のように追加2秒を待ってから強制停止するのではない。報告・終了確認に使う最大2秒は強制停止後の処理枠であり、通常取消猶予の延長ではない。強制停止はPi自身からの報告完了に依存させない。Piが報告不能ならGateway側で強制停止・未確認・残存を記録して失敗として通知する。
+
+外側のshutdown期限が短い場合は、その期限までに所有処理の強制停止を行う。通信断等でも正常完了や再送に置き換えず、外部jobが止まらない場合は「残存・要対応」とする。managed mode offの停止挙動は変更しない。
 
 ### 再開条件と追加受入
 
-停止にかかる時間、取消後のsession操作、拡張APIの戻り値を変えるため、「UX影響なし」の自律再開条件を満たさない。**§12.1–12.3の追加承認後に契約を確定し、統合実装を再開する。** 当初承認は撤回せず、mainマージ・配備の別承認も維持する。
+ユーザーが「そのまま確認しないなら強制停止すべき」と指示し、「ではそのようにして」で所有する子プロセスを含む強制停止への修正を承認した。§12.1–12.3の契約はこの指示に合わせて更新した。mainマージ・配備の別承認は維持する。
 
-追加受入: root終了後も子が残る取消、停止確認不能時のsession切替拒否、batch中の取消、terminal/active混在group、取消後の遅着、通常12秒と短い外側期限での終了・失敗報告を検証する。leaseの現在の試作とテストは未コミットで保存し、完成済みとして取り込まない。
+追加受入: root終了後も子が残る取消、通常停止を無視する所有子・孫プロセスが10秒で強制停止されること、Pi応答不能時も所有子が対象から漏れないこと、無関係なプロセスが生存すること、外部job取消不能時の「残存・要対応」報告を検証する。あわせてbatch中の取消、terminal/active混在group、取消後の遅着、短い外側期限での強制停止・失敗報告を検証する。leaseの現在の試作とテストは未コミットで保存し、完成済みとして取り込まない。
