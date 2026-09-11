@@ -1,6 +1,6 @@
 # Issue #14: 非同期子処理を残したRPC接続の早期終了を防ぐ
 
-状態: 設計提案。実装・配備は未着手。§10の承認と依存解消までは実装着手可能と扱わない。
+状態: 2026-09-11、設計提示後のユーザー「進めよう」で当初の実装範囲を承認。独立レビューで取消契約の不整合が判明し、統合実装を停止。§12の修正案は追加承認待ち。インストール先の直接変更、mainマージ、配備は対象外。
 
 対象: https://github.com/kojira/pi-discord-gateway/issues/14
 
@@ -196,10 +196,63 @@ Pi → `response { id, command:"close_if_quiescent", success:true, data:{closed:
 
 ## 10. 実装前の判断・未解消依存
 
-**この提案は設計レビュー・実装承認待ち。現行のままGatewayだけ直せる設計ではない。**
+**ユーザー承認済み。現行のままGatewayだけ直せる設計ではないため、正式ソース側も分離して対応する。**
 
 1. PiとGatewayに上記API/終了確認を追加する範囲の承認。
 2. pi-subagentsの正式ソース側でlease/delivery receiptへ参加する対応が必要。現行運用指示は「pi-subagentsを直接patchしない」なので、勝手に編集しない。正式な上流対応を待つか、管理されたソースでの変更を別途許可するかを決める必要がある。インストール先の直接patchはどちらでも行わない。
 3. 30分既定deadline、子待ち中のslot占有、session切替拒否という利用者に見える仕様を確認する。
 
-上記が決まるまで実装・依存追加・配備は開始しない。設計の独立レビューはまだ実施していない。新しい事実でこの契約が成り立たないと判明した場合、先に本Markdownを改訂してから進める。
+上記は設計提示後の「進めよう」で承認された。pi-subagentsは公開v0.64.0タグの管理されたcloneを基点とし、稼働中のインストール先は触らない。依存差分・実装差分は検証とレビューの対象にする。mainマージ・配備は別承認。新しい事実でこの契約が成り立たないと判明した場合、先に本Markdownを改訂してから進める。
+
+## 11. 実装時の照合記録
+
+### 2026-09-11: idle時の投入・再開境界（レビュー確認済み、統合実装前）
+
+現行ソースで追加確認した事実:
+
+- Pi `AgentSession.sendCustomMessage()` はasyncで、idle時の `triggerTurn` は親run全体をawaitする。Extensionの `sendMessage` wrapperはvoidで失敗を別経路へ流すため、この呼び出しの復帰をqueue受理のreceiptにしてはならない。
+- `AgentSession.steer()` / `_queueSteer()` はqueueへ入れるだけでidleの親を起こさない。Gatewayの既存steerコマンドをそのまま保持するだけでは、背景待ち中のsupervisor対応を即時に開始できない。
+- `_emitAgentSettled()` はextension hookのawait前に `_isAgentRunActive=false` にする。`isIdle` 単独ではhook完了を保証しない。
+- `pendingMessageCount` はuserのsteer/follow-up配列だけを数える。custom結果の未処理判定には `agent.hasQueuedMessages()` も必要。
+- `Agent.continue()` は既に、実際のsteer/follow-upがqueueにある場合だけassistant末尾から再開できる。新しいuser発話やassistant末尾禁止の緩和は不要。
+
+最小修正案:
+
+1. leaseのdeliverは既存Agentのfollow-up queueへcustom messageを同期投入する専用の受理境界を使う。既存のvoid `sendMessage` をreceiptへ読み替えない。
+2. managed modeだけで、実queueあり・親runなし・compactionなし・settlement hook処理なしの境界から一度だけdrainする。run後処理とsettlementは通常のAgentSession経路を共有する。queueなしのcontinue、tool再実行、合成user入力はしない。
+3. managed RPCのidle時steer/follow-upも同じdrain境界を使う。従来modeの挙動は変えない。
+4. quiescentの検査にはcustom queue、drain予約、settlement処理、RPC入力処理も含める。abort/終了時は予約したdrainを無効化する。
+
+受入条件への具体化: §9の1・2・4に、idle時のcustom結果と実user steerが追加入力なしで開始すること、遅いsettlement hook中に第二runやcloseが始まらないことを含める。
+
+独立レビューもこのqueue/drain境界は妥当と確認した。ただし取消契約に別のP1指摘が3件あり、統合実装は§12の解消まで停止する。
+
+検証準備: Piの新規lease単体テスト10件は成功。最初の `npm run check` は作業ツリーのモデルJSON未生成で型エラーになり、既定の `npm run hydrate:model-data` 実行後は成功。統合・実RPC・依存拡張の受入成功を意味しない。
+
+## 12. 独立レビューによる停止・修正案（追加承認待ち）
+
+レビューrun `ebbd92c4-f491-4ef3-a194-bd80c72a7a0f`、workflow `25884e5a-a034-4f10-82d6-c6fe230ecf4c` は完了・結果回収済み。read-onlyソースレビューであり、統合試験は未実施。以下3件を有効なP1として採用した。
+
+### 12.1 取消の確認対象
+
+事実: pi-subagents `src/workflows/scripted-workflow.ts:1749–1776` はchildrenへabortした後、steer/host callを待つが、未完了のlaunch全体は待たずrootをsettleする。`stopAsyncRun()` の「Stop requested」も停止確認ではない。
+
+修正案: 所有者のcancelはrootのterminal状態ではなく、所有launchの終了とprocess/providerの停止確認を待つbarrierとする。証拠が得られなければ10秒で `cancelConfirmed:false`、run/job IDを保持。確認不能は通常のsession切替/reloadを許可する状態にせず、明示shutdownのみ可能にする。別セッションの処理へ取消範囲を広げない。
+
+### 12.2 取消結果と遅着結果
+
+事実: 作成中のPi `background-work.ts` はcancelling以降のdeliverを拒否してleaseを減らす。pi-subagents executorは取消後に結果を書き、result-watcherは受理失敗を再試行するため、無限再試行やmixed group全体の拒否につながる。現在の単体テスト成功はこの契約を検証していない。
+
+修正案: 取消完了または猶予切れでPiが一度だけ構造化した取消結果を受理・記録し、terminal dispositionを保持する。deliverの戻り値を判別可能な `accepted`（deliveryIdあり）/`terminal`（取消理由・確認状態あり）へ具体化する。terminalへの遅着は再enqueueせず、拡張はartifactを保持して自動再試行と従来sendMessageへのfallbackを止める。grouped通知はterminal handleを除外して未受理のactive分だけをまとめ、受理済み分を再投入しない。shutdown中は親の新runを起こさず、結果記録とRPC failure報告を行う。
+
+### 12.3 明示停止の時間・順序
+
+事実: Gateway `src/agent/invoke.ts:446–459` はabort送信と同時にSIGTERM、その1.5秒後にSIGKILLを送る。Pi RPC shutdownもruntime.disposeより先にsession eventの購読を解除する。このままでは10秒の取消猶予と結果報告を満たせない。
+
+修正案: managed modeだけ、停止の順序を「新規受付停止→owner取消→結果記録・RPC報告→dispose」に変更する。通常の明示停止では取消に最大10秒、報告・終了に最大2秒、合計最大12秒を確保し、それでも終了しなければ強制終了する。外側のshutdown期限が短い場合はその期限を優先し、確認不能として記録してから強制終了する。通信断等でPiから報告できない場合もGatewayは停止確認不能の失敗として扱い、正常完了や再送に置き換えない。managed mode offの停止挙動は変更しない。
+
+### 再開条件と追加受入
+
+停止にかかる時間、取消後のsession操作、拡張APIの戻り値を変えるため、「UX影響なし」の自律再開条件を満たさない。**§12.1–12.3の追加承認後に契約を確定し、統合実装を再開する。** 当初承認は撤回せず、mainマージ・配備の別承認も維持する。
+
+追加受入: root終了後も子が残る取消、停止確認不能時のsession切替拒否、batch中の取消、terminal/active混在group、取消後の遅着、通常12秒と短い外側期限での終了・失敗報告を検証する。leaseの現在の試作とテストは未コミットで保存し、完成済みとして取り込まない。
