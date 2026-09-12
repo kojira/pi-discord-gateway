@@ -139,6 +139,9 @@ export const config = {
   /** Pi binary path */
   piBin: env('PI_BIN', 'pi'),
 
+  /** Keep one RPC process per visited channel; no idle eviction */
+  piRpcPersistent: envBool('PI_RPC_PERSISTENT', false),
+
   /** Default model for pi */
   piModel: env('PI_MODEL'),
 

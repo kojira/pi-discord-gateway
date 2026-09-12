@@ -23,7 +23,13 @@ import {
   logMessage,
   getChannel,
 } from '../db.js';
-import { invokeAgent, steerActiveAgent } from './invoke.js';
+import {
+  hasResidentAgent,
+  invokeAgent,
+  shutdownResidentAgents,
+  stopResidentAgent,
+  steerActiveAgent,
+} from './invoke.js';
 import { promptSupervisorRequest, sendResponse, setTyping } from '../discord/client.js';
 import { computeEffectiveChannelSettings } from './channel-settings.js';
 import {
@@ -54,16 +60,20 @@ const steeringTasksByChannel = new Map<string, SteeringTask>();
 
 let running = false;
 let taskResourcesAvailable = true;
+let connectionDeliveryController = new AbortController();
 let pollTimer: NodeJS.Timeout | undefined;
 let stopPromise: Promise<void> | null = null;
 
 export function isChannelProcessing(jid: string): boolean {
-  return activeChannels.has(jid);
+  const channel = getChannel(jid);
+  return activeChannels.has(jid) || Boolean(channel && hasResidentAgent(channel.folder));
 }
 
 export function abortChannelTask(jid: string): { aborted: boolean; cleared: number } {
   const controller = activeChannelControllers.get(jid);
-  const aborted = Boolean(controller);
+  const channel = getChannel(jid);
+  const residentStopped = Boolean(channel && stopResidentAgent(channel.folder));
+  const aborted = Boolean(controller) || residentStopped;
   if (controller) {
     controller.abort();
   }
@@ -75,6 +85,8 @@ export function startProcessingLoop(): void {
   if (running) return;
 
   running = true;
+  taskResourcesAvailable = true;
+  connectionDeliveryController = new AbortController();
   stopPromise = null;
 
   // Recover any messages stuck in 'processing' from a previous crash.
@@ -94,7 +106,11 @@ export function stopProcessingLoop(opts: { timeoutMs?: number } = {}): Promise<v
   running = false;
   clearPollTimer();
 
-  stopPromise = drainActiveTasks(opts.timeoutMs ?? config.shutdownTimeoutMs);
+  stopPromise = drainActiveTasks(opts.timeoutMs ?? config.shutdownTimeoutMs).finally(async () => {
+    connectionDeliveryController.abort();
+    await shutdownResidentAgents();
+    taskResourcesAvailable = false;
+  });
   return stopPromise;
 }
 
@@ -386,7 +402,7 @@ async function drainActiveTasks(timeoutMs: number): Promise<void> {
   for (const controller of steeringTaskControllers) controller.abort();
 
   if (activeTaskPromises.size > 0 || steeringTaskPromises.size > 0) {
-    // Pi children are force-killed within 1.5 seconds. Give their close handlers
+    // Direct Pi processes receive bounded stop escalation (descendants unconfirmed). Give close handlers
     // a separate hard deadline, then quarantine any unexpectedly stuck task so
     // it cannot touch Discord or SQLite after gateway teardown.
     const finalDrain = Promise.allSettled([...activeTaskPromises, ...steeringTaskPromises]);
@@ -462,6 +478,46 @@ async function processMessage(
       cwd: effective.effectiveCwd,
       signal,
       attachments,
+      connectionDelivery: config.piRpcPersistent
+        ? {
+            onAssistantMessage: async (text, connectionSignal) => {
+              connectionSignal = AbortSignal.any([
+                connectionSignal,
+                connectionDeliveryController.signal,
+              ]);
+              if (!taskResourcesAvailable || connectionSignal.aborted) return;
+              const sent = await sendResponse(jid, text, connectionSignal);
+              if (!taskResourcesAvailable || connectionSignal.aborted) return;
+              if (!sent)
+                throw new Error('Could not deliver background assistant message to Discord');
+              logMessage(jid, 'assistant', text);
+            },
+            onSupervisorRequest: async (request, connectionSignal) => {
+              connectionSignal = AbortSignal.any([
+                connectionSignal,
+                connectionDeliveryController.signal,
+              ]);
+              if (!taskResourcesAvailable || connectionSignal.aborted) return;
+              await promptSupervisorRequest(jid, request, connectionSignal);
+            },
+            onTraceEvent: (text) => {
+              if (taskResourcesAvailable) enqueueWebhookTrace(jid, text);
+            },
+            onError: async (error, connectionSignal) => {
+              connectionSignal = AbortSignal.any([
+                connectionSignal,
+                connectionDeliveryController.signal,
+              ]);
+              if (!taskResourcesAvailable || connectionSignal.aborted) return;
+              enqueueWebhookTerminal(jid, `RPC interrupted: ${sanitizeTraceText(error)}`);
+              await sendResponse(
+                jid,
+                `⚠️ Agent connection error: ${error.slice(0, 300)}`,
+                connectionSignal,
+              );
+            },
+          }
+        : undefined,
       onAssistantMessage: async (text) => {
         lastAttemptedText = text;
         lastDeliverySucceeded = await sendResponse(jid, text, signal);
@@ -492,8 +548,9 @@ async function processMessage(
         `Final response (${result.workOutcome || 'agent idle'}): ${sanitizeTraceText(result.text, 60_000)}`,
       );
       // Any rows left here were accepted but never observed as user messages.
-      // Requeue them rather than claiming they were processed.
-      finalizeSteeringRows(jid, 'pending');
+      // A retained Pi may still consume accepted input: do not replay it.
+      // Legacy connections are already closed and retain their requeue policy.
+      finalizeSteeringRows(jid, config.piRpcPersistent ? 'failed' : 'pending');
 
       // Every RPC assistant message is delivered at message_end. Send a fallback
       // only when the callback was never attempted; retrying a partially sent
@@ -531,7 +588,7 @@ async function processMessage(
       return;
     }
 
-    finalizeSteeringRows(jid, 'pending');
+    finalizeSteeringRows(jid, config.piRpcPersistent ? 'failed' : 'pending');
     enqueueWebhookTerminal(
       jid,
       `Agent interrupted: ${sanitizeTraceText(result.error || 'unknown error')}`,
@@ -551,7 +608,7 @@ async function processMessage(
     }
 
     logger.error({ jid, err: err.message }, 'processMessage failed');
-    finalizeSteeringRows(jid, signal.aborted ? 'failed' : 'pending');
+    finalizeSteeringRows(jid, signal.aborted || config.piRpcPersistent ? 'failed' : 'pending');
     markMessageFailed(rowid);
     try {
       await sendResponse(jid, `⚠️ Internal error: ${err.message?.slice(0, 200)}`, signal);
