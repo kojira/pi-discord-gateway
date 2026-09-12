@@ -23,6 +23,7 @@ export interface SupervisorRequest {
   agent: string;
   childIndex: number;
   childTarget?: string;
+  orchestratorSessionId?: string;
   channelDir: string;
   requestFile: string;
   replyFile: string;
@@ -34,6 +35,7 @@ export interface SupervisorWatcher {
 
 export function startSupervisorWatcher(input: {
   signal?: AbortSignal;
+  sessionId?: string;
   onRequest: (request: SupervisorRequest) => void | Promise<void>;
 }): SupervisorWatcher {
   const startedAt = Date.now();
@@ -46,6 +48,8 @@ export function startSupervisorWatcher(input: {
     polling = true;
     try {
       for (const request of listPendingSupervisorRequests()) {
+        if (stopped) break;
+        if (input.sessionId && request.orchestratorSessionId !== input.sessionId) continue;
         if (seen.has(request.id)) continue;
         seen.add(request.id);
         if (request.createdAt + LOOKBACK_MS < startedAt) continue;
@@ -64,8 +68,10 @@ export function startSupervisorWatcher(input: {
   const stop = () => {
     stopped = true;
     clearInterval(timer);
+    input.signal?.removeEventListener('abort', stop);
   };
   input.signal?.addEventListener('abort', stop, { once: true });
+  if (input.signal?.aborted) stop();
 
   return { stop };
 }
@@ -162,6 +168,9 @@ function readSupervisorRequest(
       agent: parsed.agent,
       childIndex: parsed.childIndex,
       ...(typeof parsed.childTarget === 'string' ? { childTarget: parsed.childTarget } : {}),
+      ...(typeof parsed.orchestratorSessionId === 'string'
+        ? { orchestratorSessionId: parsed.orchestratorSessionId }
+        : {}),
       channelDir,
       requestFile,
       replyFile,

@@ -356,7 +356,7 @@ async function handleNew(interaction: ChatInputCommandInteraction): Promise<void
   if (isChannelProcessing(channel.jid)) {
     await interaction.reply(
       reply(
-        'This channel is currently processing a message. Wait for it to finish, then run /new again.',
+        'This channel has an active task or retained Pi connection. Use /stop and wait for it to close before /new.',
         interaction,
       ),
     );
@@ -395,7 +395,7 @@ async function handleStop(interaction: ChatInputCommandInteraction): Promise<voi
 
   const notes: string[] = [];
   if (result.aborted) {
-    notes.push('Aborted the current task.');
+    notes.push('Stop requested. Descendant processes and external jobs are not confirmed stopped.');
   }
   if (result.cleared > 0) {
     notes.push(

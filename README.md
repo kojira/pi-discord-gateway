@@ -222,6 +222,7 @@ Most users won't need to edit this file directly — `piscord setup` generates i
 | `PI_MODEL`                         | _(none)_                        | Default model override                                                     |
 | `PI_THINKING`                      | _(none)_                        | Default thinking level                                                     |
 | `PI_CWD`                           | `$HOME`                         | Default working directory for pi; can be overridden per registered channel |
+| `PI_RPC_PERSISTENT`                | `false`                         | Keep per-channel RPC connections after parent idle                         |
 | `PI_EXTRA_FLAGS`                   | _(none)_                        | Extra flags passed to pi                                                   |
 | `TRIGGER_NAME`                     | `pi`                            | Bot trigger name for @mentions                                             |
 | `CHANNEL_POLICY`                   | `allowlist`                     | Channel access: `open`, `open-trigger`, or `allowlist`                     |
@@ -241,6 +242,28 @@ Most users won't need to edit this file directly — `piscord setup` generates i
 | `SESSIONS_DIR`                     | _(platform default)_/sessions   | Session storage directory (see Data Locations)                             |
 | `DB_PATH`                          | _(platform default)_/gateway.db | SQLite database path (see Data Locations)                                  |
 | `LOG_LEVEL`                        | `info`                          | Log level: debug/info/warn/error                                           |
+
+### Persistent RPC (opt-in)
+
+Set `PI_RPC_PERSISTENT=true` to keep the original Pi process connected after a
+response, so asynchronous children can finish and wake the parent without another
+Discord message. Later responses and supervisor requests still reach the channel;
+subsequent user requests reuse the process. Requires Pi RPC with `get_state` session
+identity, `pendingMessageCount` and normal prompt/settlement events; no new lifetime extension is required.
+
+RPC events have no request IDs: a request is sent only with an empty Pi user queue,
+and the first subsequent user message marks consumption (transformed input is supported).
+The queue snapshot is not atomic. Concurrent extension-injected **user** messages
+are unsupported; asynchronous child notifications must use custom messages.
+
+There is **no idle eviction**: one process can remain per visited channel until
+`/stop` or Gateway shutdown. `MAX_CONCURRENCY` limits Gateway user-request admission,
+not resident processes or autonomous child-triggered turns. Memory grows with the
+number of channels, session context and loaded extensions. Settings/cwd changes
+require `/stop` before the next request; `/new` likewise requires closing the retained
+connection first. Stop is best-effort direct-Pi cleanup, **not confirmation that all
+detached descendants or external jobs stopped**. Disconnects are reported, never
+silently replayed. With the option off, the previous request-scoped behavior remains.
 
 After changing config, restart the service: `piscord daemon stop && piscord daemon start`
 

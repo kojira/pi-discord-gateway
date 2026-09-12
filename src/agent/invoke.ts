@@ -43,6 +43,7 @@ interface RpcResponse {
   command?: string;
   success: boolean;
   error?: string;
+  data?: unknown;
 }
 
 interface PendingSteeringMessage {
@@ -51,12 +52,50 @@ interface PendingSteeringMessage {
   onConsumed?: () => void | Promise<void>;
 }
 
+export interface ConnectionDelivery {
+  onAssistantMessage: (text: string, signal: AbortSignal) => void | Promise<void>;
+  onSupervisorRequest?: (request: SupervisorRequest, signal: AbortSignal) => void | Promise<void>;
+  onTraceEvent?: (text: string) => void;
+  onError: (error: string, signal: AbortSignal) => void | Promise<void>;
+}
+
+interface InvokeOptions {
+  model?: string;
+  thinking?: string;
+  cwd?: string;
+  signal?: AbortSignal;
+  attachments?: string | null;
+  onAssistantMessage?: (text: string) => void | Promise<void>;
+  onSupervisorRequest?: (request: SupervisorRequest) => void | Promise<void>;
+  onTraceEvent?: (text: string) => void;
+  connectionDelivery?: ConnectionDelivery;
+}
+
 interface ActiveRpcInvocation {
+  identity?: string;
+  request?: (prompt: string, opts?: InvokeOptions) => Promise<AgentResult>;
+  stop?: () => Promise<void>;
+  closing?: boolean;
   sendCommand: (command: Record<string, unknown>) => Promise<RpcResponse>;
   sendSteer: (message: string, onConsumed?: () => void | Promise<void>) => Promise<boolean>;
 }
 
 const activeRpcInvocations = new Map<string, ActiveRpcInvocation>();
+export function hasResidentAgent(channelFolder: string): boolean {
+  return Boolean(activeRpcInvocations.get(channelFolder)?.request);
+}
+
+export function stopResidentAgent(channelFolder: string): boolean {
+  const connection = activeRpcInvocations.get(channelFolder);
+  if (!connection?.stop) return false;
+  void connection.stop();
+  return true;
+}
+
+export async function shutdownResidentAgents(): Promise<void> {
+  await Promise.all([...activeRpcInvocations.values()].map((connection) => connection.stop?.()));
+}
+
 const MAX_RPC_EVENT_BYTES = 4 * 1024 * 1024;
 const MAX_STDERR_BYTES = 64 * 1024;
 const MAX_PENDING_DELIVERY_BYTES = 4 * 1024 * 1024;
@@ -89,21 +128,12 @@ export async function steerActiveAgent(
 export async function invokeAgent(
   channelFolder: string,
   userText: string,
-  opts?: {
-    model?: string;
-    thinking?: string;
-    cwd?: string;
-    signal?: AbortSignal;
-    attachments?: string | null;
-    onAssistantMessage?: (text: string) => void | Promise<void>;
-    onSupervisorRequest?: (request: SupervisorRequest) => void | Promise<void>;
-    onTraceEvent?: (text: string) => void;
-  },
+  opts?: InvokeOptions,
 ): Promise<AgentResult> {
   const sessionDir = resolveChannelSessionDir(channelFolder);
   mkdirSync(sessionDir, { recursive: true });
   const effectiveCwd = opts?.cwd || config.piCwd;
-  const prompt = await buildPromptWithAttachments(channelFolder, userText, opts);
+  let prompt = await buildPromptWithAttachments(channelFolder, userText, opts);
 
   if (opts?.signal?.aborted) {
     return { ok: false, text: '', error: 'Agent invocation aborted during shutdown' };
@@ -117,6 +147,29 @@ export async function invokeAgent(
   const thinking = opts?.thinking || config.piThinking;
   if (thinking) args.push('--thinking', thinking);
   if (config.piExtraFlags) args.push(...config.piExtraFlags.split(/\s+/).filter(Boolean));
+
+  const persistent = config.piRpcPersistent;
+  const identity = JSON.stringify([config.piBin, args, effectiveCwd]);
+  const existing = activeRpcInvocations.get(channelFolder);
+  if (existing?.request) {
+    if (existing.closing || existing.identity !== identity) {
+      return {
+        ok: false,
+        text: '',
+        error:
+          'Pi connection is stopping or its settings changed. Use /stop and wait before retrying.',
+      };
+    }
+    return existing.request(prompt, opts);
+  }
+
+  if (persistent && !opts?.connectionDelivery) {
+    return {
+      ok: false,
+      text: '',
+      error: 'Persistent RPC requires connection-scoped delivery callbacks',
+    };
+  }
 
   const { bin: effectiveBin, args: effectiveArgs } = resolvePiSpawn(config.piBin, args);
   logger.debug(
@@ -136,9 +189,19 @@ export async function invokeAgent(
       { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }
     >();
     const pendingSteeringMessages: PendingSteeringMessage[] = [];
-    const supervisorWatcher = opts?.onSupervisorRequest
-      ? startSupervisorWatcher({ signal: opts.signal, onRequest: opts.onSupervisorRequest })
-      : undefined;
+    const connectionController = new AbortController();
+    const connectionDelivery = opts?.connectionDelivery;
+    let supervisorWatcher =
+      !persistent && opts?.onSupervisorRequest
+        ? startSupervisorWatcher({ signal: opts.signal, onRequest: opts.onSupervisorRequest })
+        : undefined;
+    let requestResolve: ((result: AgentResult) => void) | undefined = resolve;
+    let removeRequestAbort = () => {};
+    let closeResolve!: () => void;
+    const closed = new Promise<void>((done) => {
+      closeResolve = done;
+    });
+    let stopPromise: Promise<void> | undefined;
 
     let stdoutBuffer = '';
     let stderr = '';
@@ -146,12 +209,14 @@ export async function invokeAgent(
     let pendingDeliveryBytes = 0;
     let commandSequence = 0;
     let lastAssistantText = '';
+    let lastDeliveredText = '';
     let workOutcome: AgentResult['workOutcome'];
     let lastAssistantError = '';
     let lastAssistantFailed = false;
     let settled = false;
     let finished = false;
     let initialPromptObserved = false;
+    let promptSubmitted = false;
     let forceKillTimer: NodeJS.Timeout | undefined;
     let legacySettleTimer: NodeJS.Timeout | undefined;
     // Only an observed legacy agent_end authorizes the legacy idle fallback.
@@ -166,9 +231,25 @@ export async function invokeAgent(
 
       const id = `piscord-${++commandSequence}`;
       return new Promise<RpcResponse>((resolveCommand, rejectCommand) => {
-        pendingCommands.set(id, { resolve: resolveCommand, reject: rejectCommand });
+        const timer = persistent
+          ? setTimeout(() => {
+              pendingCommands.delete(id);
+              rejectCommand(new Error(`Pi RPC command timed out: ${String(command.type)}`));
+            }, 30_000)
+          : undefined;
+        pendingCommands.set(id, {
+          resolve: (response) => {
+            clearTimeout(timer);
+            resolveCommand(response);
+          },
+          reject: (error) => {
+            clearTimeout(timer);
+            rejectCommand(error);
+          },
+        });
         proc.stdin.write(`${JSON.stringify({ ...command, id })}\n`, (error) => {
           if (!error) return;
+          clearTimeout(timer);
           pendingCommands.delete(id);
           rejectCommand(error);
         });
@@ -184,6 +265,10 @@ export async function invokeAgent(
       message: string,
       onConsumed?: () => void | Promise<void>,
     ): Promise<boolean> => {
+      // Steering has priority over follow-ups in Pi. Do not let it become
+      // the user event that identifies a still-unconsumed initial prompt.
+      if (activeInvocation.closing || (persistent && (!requestResolve || !initialPromptObserved)))
+        return false;
       const request: PendingSteeringMessage = { message, consumed: false, onConsumed };
       pendingSteeringMessages.push(request);
 
@@ -196,18 +281,138 @@ export async function invokeAgent(
 
         // Consumption is authoritative even if settlement raced the response.
         if (request.consumed) return true;
-        if (activeRpcInvocations.get(channelFolder) !== activeInvocation) {
+        if (!persistent && activeRpcInvocations.get(channelFolder) !== activeInvocation) {
           removePendingSteering(request);
           return false;
         }
         return true;
       } catch (error) {
         removePendingSteering(request);
-        if (activeRpcInvocations.get(channelFolder) !== activeInvocation) return false;
+        // In persistent mode false means definitely unsent. A lost response
+        // after writing is uncertain even if the connection has since closed.
+        if (!persistent && activeRpcInvocations.get(channelFolder) !== activeInvocation)
+          return false;
         throw error;
       }
     };
     const activeInvocation: ActiveRpcInvocation = { sendCommand, sendSteer };
+
+    const stop = (): Promise<void> => {
+      if (stopPromise) return stopPromise;
+      activeInvocation.closing = true;
+      connectionController.abort();
+      supervisorWatcher?.stop();
+      if (proc.stdin.writable && !proc.stdin.destroyed) {
+        proc.stdin.end('{"type":"clear_queue"}\n{"type":"abort"}\n');
+      }
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      forceKillTimer = setTimeout(() => {
+        proc.kill('SIGTERM');
+        forceKillTimer = setTimeout(() => proc.kill('SIGKILL'), 1500);
+      }, 500);
+      stopPromise = new Promise<void>((done) => {
+        const deadline = setTimeout(() => {
+          logger.warn(
+            { channelFolder },
+            'Pi stop deadline reached; descendant/external job termination is unconfirmed',
+          );
+          done();
+        }, 3000);
+        void closed.then(() => {
+          clearTimeout(deadline);
+          done();
+        });
+      });
+      return stopPromise;
+    };
+
+    const attachRequestAbort = () => {
+      const signal = opts?.signal;
+      if (!persistent || !signal) return;
+      const abort = () => {
+        void stop();
+      };
+      signal.addEventListener('abort', abort, { once: true });
+      removeRequestAbort = () => signal.removeEventListener('abort', abort);
+      if (signal.aborted) abort();
+    };
+
+    const resetOutput = () => {
+      lastAssistantText = '';
+      lastDeliveredText = '';
+      workOutcome = undefined;
+      lastAssistantError = '';
+      lastAssistantFailed = false;
+    };
+
+    const submitPrompt = async (): Promise<RpcResponse | undefined> => {
+      if (persistent) {
+        const state = await sendCommand({ type: 'get_state' });
+        const data = state.data as { sessionId?: string; pendingMessageCount?: number } | undefined;
+        if (!state.success || typeof data?.pendingMessageCount !== 'number') {
+          throw new Error('Pi did not return pendingMessageCount for request admission');
+        }
+        if (activeInvocation.closing) return undefined;
+        if (!supervisorWatcher && connectionDelivery?.onSupervisorRequest) {
+          if (!data.sessionId)
+            throw new Error('Pi did not return a session ID for supervisor routing');
+          supervisorWatcher = startSupervisorWatcher({
+            signal: connectionController.signal,
+            sessionId: data.sessionId,
+            onRequest: (request) =>
+              connectionDelivery.onSupervisorRequest!(request, connectionController.signal),
+          });
+        }
+        if (data.pendingMessageCount !== 0) {
+          const done = requestResolve;
+          requestResolve = undefined;
+          opts = undefined;
+          removeRequestAbort();
+          done?.({
+            ok: false,
+            text: '',
+            error:
+              'Pi already has pending user messages; request was not sent. Wait before retrying.',
+          });
+          return undefined;
+        }
+      }
+      promptSubmitted = true;
+      return sendCommand({ type: 'prompt', message: prompt, streamingBehavior: 'followUp' });
+    };
+
+    if (persistent) {
+      activeInvocation.identity = identity;
+      activeInvocation.stop = stop;
+      activeInvocation.request = (nextPrompt, nextOpts) => {
+        if (requestResolve || activeInvocation.closing) {
+          return Promise.resolve({
+            ok: false,
+            text: '',
+            error: 'Pi connection already has a request or is stopping',
+          });
+        }
+        prompt = nextPrompt;
+        opts = nextOpts;
+        settled = false;
+        initialPromptObserved = false;
+        promptSubmitted = false;
+        resetOutput();
+        return new Promise<AgentResult>((done) => {
+          requestResolve = done;
+          attachRequestAbort();
+          if (activeInvocation.closing) return;
+          void submitPrompt()
+            .then((response) => {
+              if (response && !response.success)
+                failRpcOutput(response.error || 'Pi rejected the prompt');
+            })
+            .catch((error: Error) => failRpcOutput(error.message));
+        });
+      };
+      activeRpcInvocations.set(channelFolder, activeInvocation);
+      attachRequestAbort();
+    }
 
     const unregister = () => {
       if (activeRpcInvocations.get(channelFolder) === activeInvocation) {
@@ -226,26 +431,59 @@ export async function invokeAgent(
         pending.reject(new Error('Pi RPC process exited before responding'));
       }
       pendingCommands.clear();
-      resolve(result);
+      removeRequestAbort();
+      connectionController.abort();
+      closeResolve();
+      requestResolve?.(result);
+      requestResolve = undefined;
+      opts = undefined;
     };
 
     const emitTrace = (trace: string | undefined) => {
-      if (!trace || !opts?.onTraceEvent) return;
+      const callback = opts?.onTraceEvent || connectionDelivery?.onTraceEvent;
+      if (!trace || !callback || activeInvocation.closing) return;
       try {
-        opts.onTraceEvent(trace);
+        callback(trace);
       } catch (error: any) {
         logger.warn({ channelFolder, err: error.message }, 'Failed to enqueue webhook trace');
       }
     };
 
     const failRpcOutput = (error: string) => {
-      if (fatalRpcError) return;
+      if (fatalRpcError || finished) return;
       fatalRpcError = error;
       stdoutBuffer = '';
+      if (persistent) {
+        void stop();
+        return;
+      }
       unregister();
       proc.stdin.end();
       proc.kill('SIGTERM');
       forceKillTimer = setTimeout(() => proc.kill('SIGKILL'), 1000);
+    };
+
+    const enqueueRpcDelivery = (
+      text: string,
+      deliver: (text: string) => void | Promise<void>,
+      kind: 'assistant' | 'error' = 'assistant',
+    ) => {
+      if (activeInvocation.closing) return;
+      const deliveryBytes = Buffer.byteLength(text);
+      if (pendingDeliveryBytes + deliveryBytes > MAX_PENDING_DELIVERY_BYTES) {
+        failRpcOutput(`Pi RPC pending ${kind} delivery exceeded the 4 MiB safety limit`);
+        return;
+      }
+      if (kind === 'assistant') lastDeliveredText = text;
+      pendingDeliveryBytes += deliveryBytes;
+      deliveryChain = deliveryChain
+        .then(() => deliver(text))
+        .catch((error: Error) => {
+          logger.error({ channelFolder, err: error.message }, 'Failed to deliver live RPC message');
+        })
+        .finally(() => {
+          pendingDeliveryBytes -= deliveryBytes;
+        });
     };
 
     const handleRpcMessage = (message: any) => {
@@ -262,8 +500,11 @@ export async function invokeAgent(
 
       if (message?.type === 'message_start' && message.message?.role === 'user') {
         const userText = extractUserText(message.message.content);
-        if (!initialPromptObserved && userText === prompt) {
+        // RPC events carry no command ID. Admission requires an empty user
+        // queue; concurrent extension sendUserMessage is outside this contract.
+        if (!initialPromptObserved && (persistent ? promptSubmitted : userText === prompt)) {
           initialPromptObserved = true;
+          if (persistent) resetOutput();
           return;
         }
 
@@ -296,25 +537,13 @@ export async function invokeAgent(
           : '';
         if (text) {
           lastAssistantText = text;
-          if (opts?.onAssistantMessage) {
-            const deliveryBytes = Buffer.byteLength(text);
-            if (pendingDeliveryBytes + deliveryBytes > MAX_PENDING_DELIVERY_BYTES) {
-              failRpcOutput('Pi RPC pending assistant delivery exceeded the 4 MiB safety limit');
-              return;
-            }
-            pendingDeliveryBytes += deliveryBytes;
-            deliveryChain = deliveryChain
-              .then(() => opts.onAssistantMessage!(text))
-              .catch((error: any) => {
-                logger.error(
-                  { channelFolder, err: error.message },
-                  'Failed to deliver live assistant message',
-                );
-              })
-              .finally(() => {
-                pendingDeliveryBytes -= deliveryBytes;
-              });
-          }
+          const deliver =
+            (!persistent || initialPromptObserved ? opts?.onAssistantMessage : undefined) ||
+            (connectionDelivery
+              ? (text: string) =>
+                  connectionDelivery.onAssistantMessage(text, connectionController.signal)
+              : undefined);
+          if (deliver) enqueueRpcDelivery(text, deliver);
         }
         return;
       }
@@ -356,7 +585,10 @@ export async function invokeAgent(
         message?.type === 'auto_retry_start' ||
         message?.type === 'compaction_start'
       ) {
-        if (message.type === 'agent_start') legacyAgentEndPending = false;
+        if (message.type === 'agent_start') {
+          legacyAgentEndPending = false;
+          if (persistent && !requestResolve) resetOutput();
+        }
         cancelLegacySettlement();
         return;
       }
@@ -388,7 +620,61 @@ export async function invokeAgent(
       }, 100);
     };
 
+    const currentResult = (): AgentResult => {
+      if (fatalRpcError || lastAssistantFailed || !lastAssistantText) {
+        return {
+          ok: false,
+          text: '',
+          error:
+            fatalRpcError ||
+            lastAssistantError ||
+            readLatestAgentErrorFromSession(channelFolder) ||
+            'Pi completed without producing an assistant text message',
+        };
+      }
+      return { ok: true, text: lastAssistantText, ...(workOutcome ? { workOutcome } : {}) };
+    };
+
     const settleInvocation = () => {
+      if (persistent) {
+        if (activeInvocation.closing || (requestResolve && initialPromptObserved && settled))
+          return;
+        cancelLegacySettlement();
+        const result = currentResult();
+        const requestConsumed = Boolean(requestResolve && initialPromptObserved);
+        if (result.ok && lastAssistantText !== lastDeliveredText) {
+          const deliver =
+            requestConsumed && opts?.onAssistantMessage
+              ? opts.onAssistantMessage
+              : connectionDelivery
+                ? (text: string) =>
+                    connectionDelivery.onAssistantMessage(text, connectionController.signal)
+                : undefined;
+          if (deliver) enqueueRpcDelivery(lastAssistantText, deliver);
+        }
+        if (activeInvocation.closing) return;
+        if (requestConsumed) {
+          settled = true;
+          const done = requestResolve!;
+          // Snapshot output and callback chains at the request boundary. Later
+          // unsolicited events belong to the connection, not this request.
+          opts = undefined;
+          removeRequestAbort();
+          requestResolve = undefined;
+          void Promise.all([deliveryChain, consumptionChain]).then(() => done(result));
+        } else if (connectionDelivery && !result.ok) {
+          enqueueRpcDelivery(
+            result.error || 'Pi failed',
+            (error) => {
+              if (!connectionController.signal.aborted)
+                return connectionDelivery.onError(error, connectionController.signal);
+            },
+            'error',
+          );
+        }
+        emitTrace('⏹️ parent idle (RPC retained; background work may remain)');
+        return;
+      }
       if (settled) return;
       cancelLegacySettlement();
       settled = true;
@@ -418,6 +704,11 @@ export async function invokeAgent(
       }
     };
 
+    if (persistent)
+      proc.stdin.on('error', (error) => {
+        if (!activeInvocation.closing) failRpcOutput(error.message);
+      });
+
     proc.stdout.on('data', (chunk: Buffer) => {
       if (fatalRpcError) return;
       stdoutBuffer += decoder.write(chunk);
@@ -443,7 +734,7 @@ export async function invokeAgent(
       stderr += chunk.subarray(0, available).toString('utf8');
     });
 
-    if (opts?.signal) {
+    if (!persistent && opts?.signal) {
       const onAbort = () => {
         unregister();
         if (proc.stdin.writable && !proc.stdin.destroyed) {
@@ -458,8 +749,9 @@ export async function invokeAgent(
           forceKillTimer = setTimeout(() => proc.kill('SIGKILL'), 1500);
         }
       };
-      opts.signal.addEventListener('abort', onAbort, { once: true });
-      proc.on('close', () => opts.signal!.removeEventListener('abort', onAbort));
+      const signal = opts.signal;
+      signal.addEventListener('abort', onAbort, { once: true });
+      proc.on('close', () => signal.removeEventListener('abort', onAbort));
     }
 
     proc.on('error', (error) => {
@@ -468,6 +760,24 @@ export async function invokeAgent(
     });
 
     proc.on('close', (code) => {
+      if (finished) return;
+      if (persistent) {
+        const error =
+          fatalRpcError ||
+          (activeInvocation.closing
+            ? 'Pi stop requested; descendant/external job termination is unconfirmed'
+            : `Pi RPC connection exited unexpectedly (code ${code ?? 'unknown'}); background work may be interrupted`);
+        if (!requestResolve && (!activeInvocation.closing || fatalRpcError) && connectionDelivery) {
+          // A disconnect report is not cancelled by disposal of the dead connection.
+          void Promise.resolve(
+            connectionDelivery.onError(error, new AbortController().signal),
+          ).catch((err: Error) =>
+            logger.error({ channelFolder, err: err.message }, 'Failed to report RPC disconnect'),
+          );
+        }
+        finish({ ok: false, text: '', error });
+        return;
+      }
       stderr = stderr.trim();
       void Promise.all([deliveryChain, consumptionChain]).then(() => {
         if (fatalRpcError) {
@@ -512,13 +822,17 @@ export async function invokeAgent(
       });
     });
 
-    void sendCommand({ type: 'set_steering_mode', mode: 'all' })
+    const initialize = async () => {
+      if (activeInvocation.closing) throw new Error('Pi connection is stopping');
+      return sendCommand({ type: 'set_steering_mode', mode: 'all' });
+    };
+    void initialize()
       .then((response) => {
         if (!response.success) {
           failRpcOutput(response.error || 'Pi rejected all-message steering mode');
           return undefined;
         }
-        return sendCommand({ type: 'prompt', message: prompt, streamingBehavior: 'followUp' });
+        return submitPrompt();
       })
       .then((response) => {
         if (!response) return;
@@ -526,7 +840,7 @@ export async function invokeAgent(
           failRpcOutput(response.error || 'Pi rejected the prompt');
           return;
         }
-        if (!settled && !finished && !fatalRpcError) {
+        if (!persistent && !settled && !finished && !fatalRpcError) {
           activeRpcInvocations.set(channelFolder, activeInvocation);
         }
       })
@@ -683,7 +997,38 @@ export async function getChannelSessionStatus(
   const createdAt = readSessionCreatedAt(sessionFile);
 
   try {
-    const stats = await getSessionStatsViaRpc(sessionFile, cwd);
+    const live = activeRpcInvocations.get(channelFolder);
+    let stats: { tokens: SessionTokenUsage; contextUsage?: SessionContextUsage };
+    if (live?.request) {
+      const response = (await Promise.race([
+        live.sendCommand({ type: 'get_session_stats' }),
+        new Promise<never>((_, reject) => {
+          const timer = setTimeout(() => reject(new Error('Session stats timed out')), 2500);
+          timer.unref();
+        }),
+      ])) as RpcSessionStatsResponse;
+      if (!response.success || !response.data?.tokens)
+        throw new Error(response.error || 'No live session stats');
+      const tokens = response.data.tokens;
+      stats = {
+        tokens: {
+          input: toNumber(tokens.input),
+          output: toNumber(tokens.output),
+          cacheRead: toNumber(tokens.cacheRead),
+          cacheWrite: toNumber(tokens.cacheWrite),
+          total: toNumber(tokens.total),
+        },
+        contextUsage: response.data.contextUsage
+          ? {
+              tokens: toNullableNumber(response.data.contextUsage.tokens),
+              contextWindow: toNullableNumber(response.data.contextUsage.contextWindow),
+              percent: toNullableNumber(response.data.contextUsage.percent),
+            }
+          : undefined,
+      };
+    } else {
+      stats = await getSessionStatsViaRpc(sessionFile, cwd);
+    }
     return {
       sessionFile,
       createdAt,
