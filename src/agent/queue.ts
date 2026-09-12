@@ -277,7 +277,7 @@ async function processSteeringMessages(
     }
 
     if (!consumed && (!isCurrentGeneration(jid, generation) || signal.aborted)) {
-      settleInactiveSteeringBatch(jid, generation, rowids, parentSignal);
+      settleInactiveSteeringBatch(jid, generation, rowids, parentSignal, true);
       return;
     }
 
@@ -293,7 +293,7 @@ async function processSteeringMessages(
     );
   } catch (err: any) {
     if (signal.aborted || !isCurrentGeneration(jid, generation)) {
-      settleInactiveSteeringBatch(jid, generation, rowids, parentSignal);
+      settleInactiveSteeringBatch(jid, generation, rowids, parentSignal, true);
       return;
     }
     markMessagesFailed(rowids);
@@ -307,9 +307,16 @@ function settleInactiveSteeringBatch(
   generation: symbol,
   rowids: readonly number[],
   parentSignal: AbortSignal,
+  possiblyAccepted = false,
 ): void {
   if (!taskResourcesAvailable) return;
-  if (parentSignal.aborted || !isCurrentGeneration(jid, generation)) {
+  // A retained Pi can consume input after its request slot is released. Only
+  // definitely-unsent batches may return to pending, including late replies.
+  if (
+    (config.piRpcPersistent && possiblyAccepted) ||
+    parentSignal.aborted ||
+    !isCurrentGeneration(jid, generation)
+  ) {
     markMessagesFailed(rowids);
   } else {
     requeueMessages(rowids);

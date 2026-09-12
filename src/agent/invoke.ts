@@ -265,7 +265,10 @@ export async function invokeAgent(
       message: string,
       onConsumed?: () => void | Promise<void>,
     ): Promise<boolean> => {
-      if (activeInvocation.closing || (persistent && !requestResolve)) return false;
+      // Steering has priority over follow-ups in Pi. Do not let it become
+      // the user event that identifies a still-unconsumed initial prompt.
+      if (activeInvocation.closing || (persistent && (!requestResolve || !initialPromptObserved)))
+        return false;
       const request: PendingSteeringMessage = { message, consumed: false, onConsumed };
       pendingSteeringMessages.push(request);
 
@@ -278,14 +281,17 @@ export async function invokeAgent(
 
         // Consumption is authoritative even if settlement raced the response.
         if (request.consumed) return true;
-        if (activeRpcInvocations.get(channelFolder) !== activeInvocation) {
+        if (!persistent && activeRpcInvocations.get(channelFolder) !== activeInvocation) {
           removePendingSteering(request);
           return false;
         }
         return true;
       } catch (error) {
         removePendingSteering(request);
-        if (activeRpcInvocations.get(channelFolder) !== activeInvocation) return false;
+        // In persistent mode false means definitely unsent. A lost response
+        // after writing is uncertain even if the connection has since closed.
+        if (!persistent && activeRpcInvocations.get(channelFolder) !== activeInvocation)
+          return false;
         throw error;
       }
     };
@@ -457,25 +463,23 @@ export async function invokeAgent(
       forceKillTimer = setTimeout(() => proc.kill('SIGKILL'), 1000);
     };
 
-    const enqueueAssistantDelivery = (
+    const enqueueRpcDelivery = (
       text: string,
       deliver: (text: string) => void | Promise<void>,
+      kind: 'assistant' | 'error' = 'assistant',
     ) => {
       if (activeInvocation.closing) return;
       const deliveryBytes = Buffer.byteLength(text);
       if (pendingDeliveryBytes + deliveryBytes > MAX_PENDING_DELIVERY_BYTES) {
-        failRpcOutput('Pi RPC pending assistant delivery exceeded the 4 MiB safety limit');
+        failRpcOutput(`Pi RPC pending ${kind} delivery exceeded the 4 MiB safety limit`);
         return;
       }
-      lastDeliveredText = text;
+      if (kind === 'assistant') lastDeliveredText = text;
       pendingDeliveryBytes += deliveryBytes;
       deliveryChain = deliveryChain
         .then(() => deliver(text))
         .catch((error: Error) => {
-          logger.error(
-            { channelFolder, err: error.message },
-            'Failed to deliver live assistant message',
-          );
+          logger.error({ channelFolder, err: error.message }, 'Failed to deliver live RPC message');
         })
         .finally(() => {
           pendingDeliveryBytes -= deliveryBytes;
@@ -539,7 +543,7 @@ export async function invokeAgent(
               ? (text: string) =>
                   connectionDelivery.onAssistantMessage(text, connectionController.signal)
               : undefined);
-          if (deliver) enqueueAssistantDelivery(text, deliver);
+          if (deliver) enqueueRpcDelivery(text, deliver);
         }
         return;
       }
@@ -646,7 +650,7 @@ export async function invokeAgent(
                 ? (text: string) =>
                     connectionDelivery.onAssistantMessage(text, connectionController.signal)
                 : undefined;
-          if (deliver) enqueueAssistantDelivery(lastAssistantText, deliver);
+          if (deliver) enqueueRpcDelivery(lastAssistantText, deliver);
         }
         if (activeInvocation.closing) return;
         if (requestConsumed) {
@@ -658,22 +662,15 @@ export async function invokeAgent(
           removeRequestAbort();
           requestResolve = undefined;
           void Promise.all([deliveryChain, consumptionChain]).then(() => done(result));
-        } else if (connectionDelivery) {
-          deliveryChain = deliveryChain
-            .then(async () => {
-              if (connectionController.signal.aborted) return;
-              if (!result.ok)
-                await connectionDelivery.onError(
-                  result.error || 'Pi failed',
-                  connectionController.signal,
-                );
-            })
-            .catch((error: Error) =>
-              logger.error(
-                { channelFolder, err: error.message },
-                'Failed to deliver background settlement',
-              ),
-            );
+        } else if (connectionDelivery && !result.ok) {
+          enqueueRpcDelivery(
+            result.error || 'Pi failed',
+            (error) => {
+              if (!connectionController.signal.aborted)
+                return connectionDelivery.onError(error, connectionController.signal);
+            },
+            'error',
+          );
         }
         emitTrace('⏹️ parent idle (RPC retained; background work may remain)');
         return;

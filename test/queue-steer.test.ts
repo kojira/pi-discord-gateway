@@ -44,6 +44,7 @@ const CONFIG_ENV_KEYS = [
   'DB_PATH',
   'MAX_CONCURRENCY',
   'PI_CWD',
+  'PI_RPC_PERSISTENT',
   'POLL_INTERVAL_MS',
   'SESSIONS_DIR',
   'STEER_BATCH_MAX_ATTACHMENT_BYTES',
@@ -167,6 +168,101 @@ describe('active-run steering', () => {
       db.closeDb();
     }
   });
+
+  it.each(['accepted', 'uncertain'] as const)(
+    'never replays persistent steering with a late %s response after request cleanup',
+    async (outcome) => {
+      const root = mkdtempSync(join(tmpdir(), 'piscord-late-steer-'));
+      tempDirs.push(root);
+      Object.assign(process.env, {
+        DB_PATH: join(root, 'gateway.db'),
+        SESSIONS_DIR: join(root, 'sessions'),
+        PI_RPC_PERSISTENT: 'true',
+        POLL_INTERVAL_MS: '1',
+        MAX_CONCURRENCY: '1',
+      });
+      let finish!: (result: { ok: boolean; text: string }) => void;
+      invokeAgentMock.mockResolvedValue({ ok: true, text: 'control complete' });
+      invokeAgentMock.mockImplementationOnce(
+        () =>
+          new Promise((done) => {
+            finish = done;
+          }),
+      );
+      let acknowledge!: (accepted: boolean) => void;
+      let failAcknowledgement!: (error: Error) => void;
+      let steeringSignal!: AbortSignal;
+      steerActiveAgentMock.mockImplementation((_folder, _prompt, opts) => {
+        steeringSignal = opts.signal;
+        return new Promise((done, fail) => {
+          acknowledge = done;
+          failAcknowledgement = fail;
+        });
+      });
+      sendResponseMock.mockResolvedValue(true);
+      setTypingMock.mockResolvedValue(undefined);
+      vi.resetModules();
+      const db = await import('../src/db.js');
+      const queue = await import('../src/agent/queue.js');
+      db.initDb();
+      const reader = new Database(join(root, 'gateway.db'), { readonly: true });
+      const enqueue = (content: string) =>
+        db.enqueueMessage({
+          channelJid: 'dc:late',
+          sender: 'user',
+          senderName: 'User',
+          content,
+          timestamp: new Date().toISOString(),
+        });
+      try {
+        db.registerChannel({
+          jid: 'dc:late',
+          name: 'late',
+          folder: 'late',
+          requiresTrigger: false,
+          isMain: false,
+          modelOverride: '',
+          thinkingOverride: '',
+          cwdOverride: '',
+        });
+        enqueue('initial');
+        queue.startProcessingLoop();
+        await vi.waitFor(() => expect(invokeAgentMock).toHaveBeenCalledTimes(1));
+        enqueue('already sent steer');
+        await vi.waitFor(() => expect(steerActiveAgentMock).toHaveBeenCalledTimes(1));
+        finish({ ok: true, text: 'initial complete' });
+        await vi.waitFor(() => expect(steeringSignal.aborted).toBe(true));
+        expect(reader.prepare('select status from message_queue where rowid = 2').get()).toEqual({
+          status: 'processing',
+        });
+        if (outcome === 'accepted') acknowledge(true);
+        else failAcknowledgement(new Error('RPC exited before responding'));
+        await vi.waitFor(() =>
+          expect(reader.prepare('select status from message_queue where rowid = 2').get()).toEqual({
+            status: 'failed',
+          }),
+        );
+        enqueue('control');
+        await vi.waitFor(() =>
+          expect(reader.prepare('select status from message_queue where rowid = 3').get()).toEqual({
+            status: 'done',
+          }),
+        );
+        expect(invokeAgentMock).toHaveBeenCalledTimes(2);
+        expect(invokeAgentMock.mock.calls[1][1]).toContain('control');
+        expect(steerActiveAgentMock).toHaveBeenCalledTimes(1);
+        expect(reader.prepare('select status from message_queue where rowid = 2').get()).toEqual({
+          status: 'failed',
+        });
+      } finally {
+        finish?.({ ok: true, text: 'cleanup' });
+        acknowledge?.(false);
+        await queue.stopProcessingLoop({ timeoutMs: 1000 });
+        reader.close();
+        db.closeDb();
+      }
+    },
+  );
 
   it('dispatches active-run steering without waiting for the configured quiet window', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'piscord-queue-steer-immediate-'));

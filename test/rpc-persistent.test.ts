@@ -7,6 +7,7 @@ import {
   hasResidentAgent,
   invokeAgent,
   shutdownResidentAgents,
+  steerActiveAgent,
   stopResidentAgent,
 } from '../src/agent/invoke.js';
 
@@ -51,8 +52,23 @@ process.stdin.on('data', chunk => {
  while ((i = buffer.indexOf('\\n')) !== -1) {
   const c = JSON.parse(buffer.slice(0,i)); buffer = buffer.slice(i+1);
   appendFileSync(join(root,'commands'), JSON.stringify(c) + '\\n');
+  if(c.type === 'steer' && c.message === 'disconnect-steer') { process.exit(9); return; }
   send({type:'response',id:c.id,command:c.type,success:true,data:{sessionId:'owned-session',pendingMessageCount:existsSync(join(root,'pending')) ? 1 : 0}});
+  if(c.type === 'steer') {
+   send({type:'message_start',message:{role:'user',content:c.message}});
+   text('steering consumed'); settle();
+  }
   if(c.type !== 'prompt') continue;
+  if(c.message === 'queued-steering') {
+   text('previous autonomous result'); settle();
+   const poll = setInterval(() => {
+    if(!existsSync(join(root,'release-initial'))) return;
+    clearInterval(poll);
+    send({type:'agent_start'});
+    send({type:'message_start',message:{role:'user',content:'transformed queued prompt'}});
+   },10);
+   continue;
+  }
   if(c.message === 'hold') continue;
   if(c.message === 'crash') { setTimeout(() => process.exit(7), 50); continue; }
   if(c.message === 'queued') {
@@ -73,6 +89,12 @@ process.stdin.on('data', chunk => {
     }
    });
   }
+  if(c.message === 'error-flood') setTimeout(() => {
+   for(let n=0;n<6;n++) {
+    send({type:'work_contract',record:{status:'suspended',reason:'e'.repeat(1024*1024)}});
+    settle();
+   }
+  },100);
   if(c.message === 'disconnect') setTimeout(() => process.exit(8), 150);
  }
 });
@@ -163,6 +185,75 @@ describe('persistent RPC connection', () => {
       'previous autonomous result',
       expect.any(AbortSignal),
     );
+  });
+
+  it('defers steering behind an unconsumed follow-up, then observes its consumption without stealing initial correlation', async () => {
+    const root = fixture();
+    await invokeAgent('channel', 'first', { cwd: root, connectionDelivery: sinks() });
+    const next = invokeAgent('channel', 'queued-steering', { cwd: root });
+    await vi.waitFor(() =>
+      expect(readFileSync(join(root, 'commands'), 'utf8')).toContain('queued-steering'),
+    );
+    const onConsumed = vi.fn();
+    expect(await steerActiveAgent('channel', 'consume steer', { onConsumed })).toBe(false);
+    expect(readFileSync(join(root, 'commands'), 'utf8')).not.toContain('consume steer');
+    writeFileSync(join(root, 'release-initial'), '1');
+    await vi.waitFor(async () =>
+      expect(await steerActiveAgent('channel', 'consume steer', { onConsumed })).toBe(true),
+    );
+    expect(await next).toEqual({ ok: true, text: 'steering consumed' });
+    expect(onConsumed).toHaveBeenCalledTimes(1);
+    expect(readFileSync(join(root, 'commands'), 'utf8').match(/consume steer/g)).toHaveLength(1);
+  });
+
+  it('rejects a sent steer with a lost acknowledgement instead of reporting it definitely unsent', async () => {
+    const root = fixture();
+    const request = invokeAgent('channel', 'queued-steering', {
+      cwd: root,
+      connectionDelivery: sinks(),
+    });
+    writeFileSync(join(root, 'release-initial'), '1');
+    let rejection: unknown;
+    await vi.waitFor(async () => {
+      try {
+        expect(await steerActiveAgent('channel', 'disconnect-steer')).toBe(false);
+      } catch (error) {
+        rejection = error;
+      }
+      expect(String(rejection)).toContain('exited before responding');
+    });
+    expect((await request).ok).toBe(false);
+    expect(readFileSync(join(root, 'commands'), 'utf8').match(/disconnect-steer/g)).toHaveLength(1);
+  });
+
+  it('bounds aggregate background errors behind a blocked delivery sink', async () => {
+    const root = fixture();
+    let release!: () => void;
+    const blocked = new Promise<void>((done) => {
+      release = done;
+    });
+    const errors: string[] = [];
+    const connectionDelivery = {
+      ...sinks(),
+      onError: async (error: string) => {
+        errors.push(error);
+        if (error.length > 1000) await blocked;
+      },
+    };
+    try {
+      expect(
+        (await invokeAgent('channel', 'error-flood', { cwd: root, connectionDelivery })).ok,
+      ).toBe(true);
+      await vi.waitFor(
+        () =>
+          expect(errors).toContain('Pi RPC pending error delivery exceeded the 4 MiB safety limit'),
+        { timeout: 3000 },
+      );
+      expect(hasResidentAgent('channel')).toBe(false);
+      expect(errors.filter((error) => error.length > 1000)).toHaveLength(1);
+    } finally {
+      release();
+    }
   });
 
   it('rejects changed launch settings without closing unknown background work, and reports idle crashes without replay', async () => {
