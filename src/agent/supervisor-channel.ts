@@ -35,6 +35,11 @@ export interface SupervisorWatcher {
 
 export function startSupervisorWatcher(input: {
   signal?: AbortSignal;
+  /**
+   * Restrict polling to one Pi invocation's subagent temp root. Without this, concurrent Discord
+   * sessions can race and deliver supervisor prompts to the wrong channel.
+   */
+  tempRoot?: string;
   sessionId?: string;
   onRequest: (request: SupervisorRequest) => void | Promise<void>;
 }): SupervisorWatcher {
@@ -47,7 +52,7 @@ export function startSupervisorWatcher(input: {
     if (stopped || polling) return;
     polling = true;
     try {
-      for (const request of listPendingSupervisorRequests()) {
+      for (const request of listPendingSupervisorRequests(input.tempRoot)) {
         if (stopped) break;
         if (input.sessionId && request.orchestratorSessionId !== input.sessionId) continue;
         if (seen.has(request.id)) continue;
@@ -93,9 +98,9 @@ export async function writeSupervisorReply(
   });
 }
 
-function listPendingSupervisorRequests(): SupervisorRequest[] {
+function listPendingSupervisorRequests(tempRoot?: string): SupervisorRequest[] {
   const requests: SupervisorRequest[] = [];
-  for (const root of candidateSupervisorRoots()) {
+  for (const root of candidateSupervisorRoots(tempRoot)) {
     let channels;
     try {
       channels = readdirSync(root, { withFileTypes: true });
@@ -125,9 +130,9 @@ function listPendingSupervisorRequests(): SupervisorRequest[] {
   return requests.sort((a, b) => a.createdAt - b.createdAt);
 }
 
-function candidateSupervisorRoots(): string[] {
-  const configured = process.env.PI_SUBAGENTS_TEMP_ROOT?.trim();
-  if (configured) return [join(resolve(configured), 'supervisor-channels')];
+function candidateSupervisorRoots(tempRoot?: string): string[] {
+  const scoped = tempRoot?.trim() || process.env.PI_SUBAGENTS_TEMP_ROOT?.trim();
+  if (scoped) return [join(resolve(scoped), 'supervisor-channels')];
 
   let entries;
   try {

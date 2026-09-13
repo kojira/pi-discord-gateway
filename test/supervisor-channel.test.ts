@@ -72,4 +72,51 @@ describe('supervisor channel watcher', () => {
       message: 'Proceed best-effort.',
     });
   });
+
+  test('restricts supervisor requests to the configured invocation temp root', async () => {
+    const otherRoot = await mkdtemp(join(tmpdir(), 'pidg-supervisor-other-'));
+    try {
+      writeRequest(otherRoot, 'foreign-req', 'foreign-run');
+      const scopedChannelDir = writeRequest(tempRoot, 'scoped-req', 'scoped-run');
+
+      const request = await new Promise<SupervisorRequest>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('watcher did not detect scoped request')), 3000);
+        const watcher = startSupervisorWatcher({
+          tempRoot,
+          onRequest: (detected) => {
+            clearTimeout(timeout);
+            watcher.stop();
+            resolve(detected);
+          },
+        });
+      });
+
+      expect(request.id).toBe('scoped-req');
+      expect(request.runId).toBe('scoped-run');
+      expect(request.replyFile).toBe(join(scopedChannelDir, 'replies', 'scoped-req.json'));
+    } finally {
+      await rm(otherRoot, { recursive: true, force: true });
+    }
+  });
 });
+
+function writeRequest(root: string, id: string, runId: string): string {
+  const channelDir = join(root, 'supervisor-channels', `${runId}-worker-0`);
+  mkdirSync(join(channelDir, 'requests'), { recursive: true });
+  mkdirSync(join(channelDir, 'replies'), { recursive: true });
+  writeFileSync(
+    join(channelDir, 'requests', `${id}.json`),
+    JSON.stringify({
+      type: 'subagent.supervisor.request',
+      id,
+      createdAt: Date.now(),
+      reason: 'need_decision',
+      message: 'Which path should I take?',
+      expectsReply: true,
+      runId,
+      agent: 'worker',
+      childIndex: 0,
+    }),
+  );
+  return channelDir;
+}

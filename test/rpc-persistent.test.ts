@@ -35,6 +35,7 @@ import { spawn } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 const root = ${JSON.stringify(root)};
+const supervisorRoot = process.env.PI_SUBAGENTS_TEMP_ROOT || root;
 const send = value => process.stdout.write(JSON.stringify(value) + '\\n');
 const text = value => send({type:'message_end',message:{role:'assistant',content:[{type:'text',text:value}],stopReason:'stop'}});
 const settle = () => send({type:'agent_settled'});
@@ -84,7 +85,7 @@ process.stdin.on('data', chunk => {
     send({type:'work_contract',record:{status:'resolved',decision:{outcome:'completed',summary:'child summary'}}});
     settle();
     for (const [id, session] of [['ours','owned-session'],['other','other-session']]) {
-     const dir = join(root,'supervisor-channels',id,'requests'); mkdirSync(dir,{recursive:true});
+     const dir = join(supervisorRoot,'supervisor-channels',id,'requests'); mkdirSync(dir,{recursive:true});
      writeFileSync(join(dir,id+'.json'),JSON.stringify({type:'subagent.supervisor.request',id,createdAt:Date.now(),reason:'need_decision',message:'late question',expectsReply:true,runId:id,agent:'worker',childIndex:0,orchestratorSessionId:session}));
     }
    });

@@ -1,5 +1,7 @@
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { type AttachmentMeta } from '../discord/attachments.js';
 import { config } from '../config.js';
@@ -178,9 +180,10 @@ export async function invokeAgent(
   );
 
   return new Promise<AgentResult>((resolve) => {
+    const supervisorTempRoot = mkdtempSync(join(tmpdir(), 'piscord-subagents-'));
     const proc = spawn(effectiveBin, effectiveArgs, {
       cwd: effectiveCwd,
-      env: process.env,
+      env: { ...process.env, PI_SUBAGENTS_TEMP_ROOT: supervisorTempRoot },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     const decoder = new StringDecoder('utf8');
@@ -193,7 +196,11 @@ export async function invokeAgent(
     const connectionDelivery = opts?.connectionDelivery;
     let supervisorWatcher =
       !persistent && opts?.onSupervisorRequest
-        ? startSupervisorWatcher({ signal: opts.signal, onRequest: opts.onSupervisorRequest })
+        ? startSupervisorWatcher({
+            signal: opts.signal,
+            tempRoot: supervisorTempRoot,
+            onRequest: opts.onSupervisorRequest,
+          })
         : undefined;
     let requestResolve: ((result: AgentResult) => void) | undefined = resolve;
     let removeRequestAbort = () => {};
@@ -358,6 +365,7 @@ export async function invokeAgent(
             throw new Error('Pi did not return a session ID for supervisor routing');
           supervisorWatcher = startSupervisorWatcher({
             signal: connectionController.signal,
+            tempRoot: supervisorTempRoot,
             sessionId: data.sessionId,
             onRequest: (request) =>
               connectionDelivery.onSupervisorRequest!(request, connectionController.signal),
@@ -427,6 +435,7 @@ export async function invokeAgent(
       if (legacySettleTimer) clearTimeout(legacySettleTimer);
       unregister();
       supervisorWatcher?.stop();
+      rmSync(supervisorTempRoot, { recursive: true, force: true });
       for (const pending of pendingCommands.values()) {
         pending.reject(new Error('Pi RPC process exited before responding'));
       }
