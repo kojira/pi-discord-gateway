@@ -14,7 +14,7 @@ Thanks for your interest in contributing! This guide will help you get started.
 2. **Install dependencies** (Node.js >= 20 required):
 
    ```bash
-   npm install
+   pnpm install --frozen-lockfile
    ```
 
 3. **Copy the environment file** and fill in your Discord bot token:
@@ -26,8 +26,8 @@ Thanks for your interest in contributing! This guide will help you get started.
 4. **Build and test**:
 
    ```bash
-   npm run build
-   npm test
+   pnpm run build
+   pnpm test
    ```
 
 ## Development Workflow
@@ -41,16 +41,16 @@ Thanks for your interest in contributing! This guide will help you get started.
 2. Make your changes. Run the dev server with:
 
    ```bash
-   npm run dev
+   pnpm run dev
    ```
 
 3. Ensure your code passes all checks:
 
    ```bash
-   npm run lint      # ESLint
-   npm run format    # Prettier (auto-fix)
-   npm test          # Vitest
-   npm run build     # TypeScript compilation
+   pnpm run lint      # ESLint
+   pnpm run format    # Prettier (auto-fix)
+   pnpm test          # Vitest
+   pnpm run build     # TypeScript compilation
    ```
 
 4. Commit your changes with a descriptive message following [Conventional Commits](https://www.conventionalcommits.org/):
@@ -81,7 +81,7 @@ This project uses **ESLint** and **Prettier** to enforce consistent code style:
 - Semicolons
 - ES modules (`import`/`export`)
 
-Run `npm run format` to auto-format your code before committing.
+Run `pnpm run format` to auto-format your code before committing.
 
 ## Reporting Issues
 
