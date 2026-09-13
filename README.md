@@ -16,7 +16,7 @@ A lightweight Discord gateway for [pi coding agent](https://github.com/badlogic/
 **Latest release:** see the npm version badge above and [Changelog](./CHANGELOG.md) for details.
 
 ```bash
-npm install -g piscord
+pnpm add -g piscord
 piscord setup                 # interactive wizard -- walks you through everything
 ```
 
@@ -313,10 +313,10 @@ Paths are platform-aware. Defaults by OS:
 
 ## Alternative Installation
 
-### npx (quick trial, no global install)
+### pnpm dlx (quick trial, no global install)
 
 ```bash
-npx piscord@latest setup
+pnpm dlx piscord@latest setup
 ```
 
 ### From source
@@ -324,7 +324,7 @@ npx piscord@latest setup
 ```bash
 git clone https://github.com/Crokily/pi-discord-gateway.git
 cd pi-discord-gateway
-npm install && npm run build
+pnpm install --frozen-lockfile && pnpm run build
 node dist/cli/index.js setup
 ```
 
@@ -374,10 +374,10 @@ node dist/cli/index.js setup
 ## Development
 
 ```bash
-npm install
-npm run dev          # Start with tsx (no build needed)
-npm run build        # Compile TypeScript
-npm test             # Run Vitest suite
+pnpm install --frozen-lockfile
+pnpm run dev          # Start with tsx (no build needed)
+pnpm run build        # Compile TypeScript
+pnpm test             # Run Vitest suite
 ```
 
 ## Security

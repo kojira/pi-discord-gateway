@@ -8,10 +8,10 @@
 
 ## Test Plan
 
-- [ ] `npm run lint`
-- [ ] `npm run format:check`
-- [ ] `npm test`
-- [ ] `npm run build`
+- [ ] `pnpm run lint`
+- [ ] `pnpm run format:check`
+- [ ] `pnpm test`
+- [ ] `pnpm run build`
 
 ## Checklist
 
