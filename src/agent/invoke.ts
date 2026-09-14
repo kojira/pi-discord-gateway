@@ -507,6 +507,24 @@ export async function invokeAgent(
 
       emitTrace(formatAgentTraceEvent(message));
 
+      const markSteeringConsumed = (userText: string) => {
+        const request = pendingSteeringMessages.find((candidate) => candidate.message === userText);
+        if (!request) return false;
+        request.consumed = true;
+        removePendingSteering(request);
+        if (request.onConsumed) {
+          consumptionChain = consumptionChain
+            .then(() => request.onConsumed!())
+            .catch((error: any) => {
+              logger.error(
+                { channelFolder, err: error.message },
+                'Failed to record consumed steering message',
+              );
+            });
+        }
+        return true;
+      };
+
       if (message?.type === 'message_start' && message.message?.role === 'user') {
         const userText = extractUserText(message.message.content);
         // RPC events carry no command ID. Admission requires an empty user
@@ -517,21 +535,12 @@ export async function invokeAgent(
           return;
         }
 
-        const request = pendingSteeringMessages.find((candidate) => candidate.message === userText);
-        if (request) {
-          request.consumed = true;
-          removePendingSteering(request);
-          if (request.onConsumed) {
-            consumptionChain = consumptionChain
-              .then(() => request.onConsumed!())
-              .catch((error: any) => {
-                logger.error(
-                  { channelFolder, err: error.message },
-                  'Failed to record consumed steering message',
-                );
-              });
-          }
-        }
+        markSteeringConsumed(userText);
+        return;
+      }
+
+      if (message?.type === 'steering_consumed' && typeof message.message === 'string') {
+        markSteeringConsumed(message.message);
         return;
       }
 

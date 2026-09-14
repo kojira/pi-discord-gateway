@@ -1,7 +1,7 @@
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { config } from '../src/config.js';
 import { invokeAgent, steerActiveAgent } from '../src/agent/invoke.js';
 
@@ -245,6 +245,62 @@ setTimeout(finish, 2000);
     ).toBe(
       '[Discord user: Alice]\nchange course\n[Discord user: Alice]\nand keep the original files\n',
     );
+  });
+
+  it('treats steering_consumed events as authoritative consumption', async () => {
+    const root = makeFakePi(`
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+let buffer = '';
+process.stdin.on('data', (chunk) => {
+  buffer += chunk.toString('utf8');
+  while (buffer.includes('\\n')) {
+    const line = buffer.slice(0, buffer.indexOf('\\n'));
+    buffer = buffer.slice(buffer.indexOf('\\n') + 1);
+    if (!line.trim()) continue;
+    const command = JSON.parse(line);
+    if (command.type === 'set_steering_mode') {
+      send({ type: 'response', id: command.id, command: 'set_steering_mode', success: true });
+      continue;
+    }
+    if (command.type === 'prompt') {
+      send({ type: 'response', id: command.id, command: 'prompt', success: true });
+      setTimeout(() => {
+        send({ type: 'message_start', message: { role: 'user', content: command.message } });
+        send({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'ready' }] } });
+      }, 10);
+      continue;
+    }
+    if (command.type === 'steer') {
+      send({ type: 'response', id: command.id, command: 'steer', success: true });
+      setTimeout(() => {
+        send({ type: 'steering_consumed', message: command.message, target: 'recipient', recipientId: 'child-1' });
+        send({ type: 'agent_end', messages: [] });
+      }, 10);
+    }
+  }
+});
+`);
+
+    let consumed = 0;
+    let ready!: () => void;
+    const readyMessage = new Promise<void>((resolve) => {
+      ready = resolve;
+    });
+    const request = invokeAgent('ch_test', 'initial prompt', {
+      cwd: root,
+      onAssistantMessage: async (text) => {
+        if (text === 'ready') ready();
+      },
+    });
+
+    await readyMessage;
+    expect(
+      await steerActiveAgent('ch_test', '[Discord user: Alice]\ninterrupt child', {
+        onConsumed: () => void (consumed += 1),
+      }),
+    ).toBe(true);
+    await vi.waitFor(() => expect(consumed).toBe(1));
+    await expect(request).resolves.toMatchObject({ ok: true, text: 'ready' });
   });
 
   it('forwards bounded subagent tool output through the trace callback', async () => {
