@@ -68,18 +68,14 @@ it('delivers independently after a queue row finishes and shuts down idle reside
     const delivery = mocks.invoke.mock.calls[0][2].connectionDelivery;
     const connectionSignal = new AbortController().signal;
     await delivery.onAssistantMessage('delayed child reply', connectionSignal);
-    await delivery.onSupervisorRequest({ id: 'late supervisor' }, connectionSignal);
+    expect(delivery.onSupervisorRequest).toBeUndefined();
     expect(mocks.send).toHaveBeenLastCalledWith(
       'dc:test',
       'delayed child reply',
       expect.any(AbortSignal),
     );
     expect(mocks.send.mock.calls.at(-1)?.[2].aborted).toBe(false);
-    expect(mocks.supervisor).toHaveBeenCalledWith(
-      'dc:test',
-      { id: 'late supervisor' },
-      expect.any(AbortSignal),
-    );
+    expect(mocks.supervisor).not.toHaveBeenCalled();
     expect(reader.prepare('select status from message_queue').get()).toEqual({ status: 'done' });
     expect(mocks.invoke).toHaveBeenCalledTimes(1);
     expect(queue.isChannelProcessing('dc:test')).toBe(true); // /new cannot rotate a live session

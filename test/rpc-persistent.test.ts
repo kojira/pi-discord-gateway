@@ -125,7 +125,7 @@ function sinks() {
 }
 
 describe('persistent RPC connection', () => {
-  it('survives parent idle, delivers child output/supervisor on detached callbacks and reuses the same process', async () => {
+  it('survives parent idle, leaves supervisor requests to Pi and reuses the same process', async () => {
     const root = fixture();
     const connectionDelivery = sinks();
     const requestDelivery = vi.fn();
@@ -152,11 +152,8 @@ describe('persistent RPC connection', () => {
       'child summary',
     ]);
     expect(requestDelivery).toHaveBeenCalledTimes(1);
-    await vi.waitFor(
-      () => expect(connectionDelivery.onSupervisorRequest).toHaveBeenCalledTimes(1),
-      { timeout: 3000 },
-    );
-    expect(connectionDelivery.onSupervisorRequest.mock.calls[0]?.[0]).toMatchObject({ id: 'ours' });
+    // Even an old caller supplying this callback cannot intercept Pi's internal requests.
+    expect(connectionDelivery.onSupervisorRequest).not.toHaveBeenCalled();
     const next = await invokeAgent('channel', 'next', { cwd: root, onAssistantMessage: vi.fn() });
     expect(next.text.split(':')[1]).toBe(first.text.split(':')[1]);
     expect(readFileSync(join(root, 'commands'), 'utf8').match(/set_steering_mode/g)).toHaveLength(
