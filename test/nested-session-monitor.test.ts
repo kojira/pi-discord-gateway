@@ -195,6 +195,32 @@ describe('nested session trace monitoring', () => {
     ]);
   });
 
+  it('does not replay historical records copied into a newly discovered fork', () => {
+    const root = temporaryRoot();
+    const { monitor, lines } = harness(root);
+    monitor.pollOnce();
+
+    const copiedFork = join(root, 'parent', 'forks', 'copied-history.jsonl');
+    writeJsonl(copiedFork, [
+      { type: 'session_info', name: 'copied-fork' },
+      {
+        ...assistant('historical copied child output'),
+        timestamp: new Date(Date.now() - 60_000).toISOString(),
+      },
+    ]);
+    monitor.pollOnce();
+
+    expect(lines.join('\n')).not.toContain('historical copied child output');
+
+    appendRecord(copiedFork, {
+      ...assistant('live child append'),
+      timestamp: new Date(Date.now() + 60_000).toISOString(),
+    });
+    monitor.pollOnce();
+
+    expect(lines.join('\n')).toContain('live child append');
+  });
+
   it('keeps post-activation records appended before an old file reaches its initial EOF', () => {
     const root = temporaryRoot();
     const child = join(root, 'parent', 'child', 'session.jsonl');
@@ -563,16 +589,21 @@ describe('nested session trace monitoring', () => {
 
       monitor.pollOnce();
       now = 3_000;
-      appendRecord(child, assistant('live after recovery', { timestamp: 3_000 }));
+      appendRecord(child, assistant('before admission after recovery', { timestamp: 3_000 }));
       for (let index = 0; index < 4; index += 1) monitor.pollOnce();
+      now = 4_000;
+      appendRecord(child, assistant('live after admission', { timestamp: 4_000 }));
+      monitor.pollOnce();
 
-      expect(lines.join('\n')).toContain('live after recovery');
-      expect(lines.join('\n')).not.toContain('historical');
-      expect(lines.join('\n')).not.toContain(`${failure}-child started`);
+      const output = lines.join('\n');
+      expect(output).toContain('live after admission');
+      expect(output).not.toContain('before admission after recovery');
+      expect(output).not.toContain('historical');
+      expect(output).not.toContain(`${failure}-child started`);
     }
   });
 
-  it('captures post-activation appends to an old file discovered after a long initial scan', () => {
+  it('does not backfill an old file discovered after a long initial scan', () => {
     const root = temporaryRoot();
     const directory = join(root, 'parent');
     mkdirSync(directory, { recursive: true });
@@ -594,11 +625,16 @@ describe('nested session trace monitoring', () => {
 
     monitor.pollOnce();
     now = 3_000;
-    appendRecord(child, assistant('fast child completed', { timestamp: 3_000 }));
+    appendRecord(child, assistant('before admission append', { timestamp: 3_000 }));
     for (let index = 0; index < 5; index += 1) monitor.pollOnce();
+    now = 4_000;
+    appendRecord(child, assistant('after admission append', { timestamp: 4_000 }));
+    monitor.pollOnce();
 
-    expect(lines.join('\n')).toContain('fast child completed');
-    expect(lines.join('\n')).not.toContain('pre-activation history');
+    const output = lines.join('\n');
+    expect(output).toContain('after admission append');
+    expect(output).not.toContain('before admission append');
+    expect(output).not.toContain('pre-activation history');
   });
 
   it('applies global per-poll budgets and round-robin progress under tiny-line floods', () => {

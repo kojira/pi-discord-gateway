@@ -443,14 +443,21 @@ export class NestedSessionTraceMonitor {
       const createdAfterActivation =
         state.initialDiscoveryComplete ||
         (opened.stats.birthtimeMs > 0 && opened.stats.birthtimeMs > state.activatedAtMs + 1);
-      // Old files are read incrementally from zero and filtered by record time.
-      // This captures appends made while a long initial scan is still running;
-      // using discovery-time EOF as a baseline would lose them.
+      // Existing transcripts can be copied into new forks long after monitoring
+      // starts.  Use a per-file admission boundary, not the channel activation
+      // time, or those copied historical records are replayed to webhooks.  For
+      // genuinely new files, birthtime lets fast-completing children emit the
+      // records they wrote before discovery; old files only emit appends after
+      // this admission point.
+      const admissionCutoffMs =
+        createdAfterActivation && opened.stats.birthtimeMs > 0
+          ? opened.stats.birthtimeMs - 1
+          : this.now();
       const cursor = newCursor(
         opened.descriptor,
         opened.stats,
         0,
-        state.activatedAtMs,
+        admissionCutoffMs,
         createdAfterActivation,
       );
       state.files.set(relativePath, cursor);

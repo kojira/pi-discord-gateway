@@ -44,6 +44,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     case 'send':
       await cliSend(args);
       return 0;
+    case 'messages':
+      await cliMessages(args);
+      return 0;
     case 'register':
       await cliRegister(args);
       return 0;
@@ -99,6 +102,7 @@ export function formatHelpText(): string {
     '  piscord task disable <id>                     Disable a scheduled task',
     '  piscord channels                              List registered channels',
     '  piscord send --channel <jid> [--text <message>] [--file <path> ...]',
+    '  piscord messages fetch --channel <id|jid> [--limit 50] [--before <id>|--after <id>|--around <id>] [--format jsonl|table]',
     '  piscord register <id> <name> [opts]          Register a Discord channel',
     '  piscord unregister <id>                       Unregister a channel',
     '  piscord daemon install                        Install background service (systemd/launchd)',
@@ -278,6 +282,87 @@ async function cliSend(args: string[]): Promise<void> {
   }
 
   console.log(`Sent ${result.sentFiles} file(s) to ${channelJid}`);
+}
+
+async function cliMessages(args: string[]): Promise<void> {
+  const [subcommand, ...subArgs] = args;
+  switch (subcommand) {
+    case 'fetch':
+      await cliMessagesFetch(subArgs);
+      return;
+    default:
+      throw new Error(
+        'Usage: piscord messages fetch --channel <id|jid> [--limit 50] [--before <id>|--after <id>|--around <id>] [--format jsonl|table]',
+      );
+  }
+}
+
+async function cliMessagesFetch(args: string[]): Promise<void> {
+  const usage =
+    'Usage: piscord messages fetch --channel <id|jid> [--limit 50] [--before <id>|--after <id>|--around <id>] [--format jsonl|table]';
+  const options: {
+    channel?: string;
+    limit: number;
+    before?: string;
+    after?: string;
+    around?: string;
+    format: 'jsonl' | 'table';
+  } = { limit: 50, format: 'jsonl' };
+
+  for (let i = 0; i < args.length; i++) {
+    switch (args[i]) {
+      case '--channel':
+        options.channel = args[++i];
+        break;
+      case '--limit':
+        options.limit = Number.parseInt(args[++i] ?? '', 10);
+        break;
+      case '--before':
+        options.before = args[++i];
+        break;
+      case '--after':
+        options.after = args[++i];
+        break;
+      case '--around':
+        options.around = args[++i];
+        break;
+      case '--format': {
+        const format = args[++i];
+        if (format !== 'jsonl' && format !== 'table') throw new Error(usage);
+        options.format = format;
+        break;
+      }
+      default:
+        throw new Error(usage);
+    }
+  }
+
+  if (!options.channel) throw new Error(usage);
+  const { fetchDiscordMessages } = await import('../discord/message-history.js');
+  const messages = await fetchDiscordMessages({
+    token: config.discordToken,
+    channelId: discordChannelId(options.channel),
+    limit: options.limit,
+    before: options.before,
+    after: options.after,
+    around: options.around,
+  });
+
+  if (options.format === 'table') {
+    console.table(
+      messages.map((message) => ({
+        id: message.id,
+        timestamp: message.timestamp,
+        author: message.author?.username ?? '',
+        webhook_id: message.webhook_id ?? '',
+        len: message.content?.length ?? 0,
+        content: (message.content ?? '').replace(/\s+/g, ' ').slice(0, 120),
+      })),
+    );
+    return;
+  }
+
+  for (const message of messages) console.log(JSON.stringify(message));
 }
 
 async function cliAddTask(args: string[]): Promise<void> {
@@ -650,6 +735,10 @@ function formatChannelSummary(channel: RegisteredChannel): string {
 
 function toDiscordChannelJid(channelId: string): string {
   return channelId.startsWith('dc:') ? channelId : `dc:${channelId}`;
+}
+
+function discordChannelId(channelIdOrJid: string): string {
+  return channelIdOrJid.startsWith('dc:') ? channelIdOrJid.slice(3) : channelIdOrJid;
 }
 
 if (isDirectExecution()) {
