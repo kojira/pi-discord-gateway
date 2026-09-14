@@ -616,16 +616,23 @@ describe('nested session trace monitoring', () => {
       assistant('pre-activation history', { timestamp: 1_000 }),
     ]);
     let now = 2_000;
+    let allowAdmission = false;
     const lines: string[] = [];
     const monitor = new NestedSessionTraceMonitor({
       listSources: () => [{ jid: 'dc:source', root }],
       emit: (_source, line) => lines.push(line),
       now: () => now,
+      // readdir order is filesystem-dependent; do not assume zzzz sorts last.
+      beforeFileOpen: (path) => {
+        if (path === child && !allowAdmission) throw new Error('admission deferred');
+      },
     });
 
     monitor.pollOnce();
     now = 3_000;
     appendRecord(child, assistant('before admission append', { timestamp: 3_000 }));
+    now = 3_500;
+    allowAdmission = true;
     for (let index = 0; index < 5; index += 1) monitor.pollOnce();
     now = 4_000;
     appendRecord(child, assistant('after admission append', { timestamp: 4_000 }));
