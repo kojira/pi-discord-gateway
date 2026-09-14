@@ -19,7 +19,9 @@ describe('fetchDiscordMessages', () => {
 
     expect(messages).toEqual([{ id: 'm1', timestamp: '2026-09-14T04:29:24Z', content: 'hello' }]);
     const [url, init] = fetchImpl.mock.calls[0];
-    expect(String(url)).toBe('https://discord.com/api/v10/channels/123/messages?limit=25&before=456');
+    expect(String(url)).toBe(
+      'https://discord.com/api/v10/channels/123/messages?limit=25&before=456',
+    );
     expect(init).toEqual({ headers: { Authorization: 'Bot secret-token' } });
   });
 

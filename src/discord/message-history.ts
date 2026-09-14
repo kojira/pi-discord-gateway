@@ -61,9 +61,12 @@ export async function fetchDiscordMessages({
   const body = await response.json().catch(() => undefined);
   if (!response.ok) {
     const detail = discordErrorMessage(body);
-    throw new Error(`Discord message fetch failed (${response.status})${detail ? `: ${detail}` : ''}`);
+    throw new Error(
+      `Discord message fetch failed (${response.status})${detail ? `: ${detail}` : ''}`,
+    );
   }
-  if (!Array.isArray(body)) throw new Error('Discord message fetch returned an unexpected response.');
+  if (!Array.isArray(body))
+    throw new Error('Discord message fetch returned an unexpected response.');
   return body as DiscordHistoryMessage[];
 }
 
@@ -71,6 +74,7 @@ function discordErrorMessage(body: unknown): string {
   if (!body || typeof body !== 'object') return '';
   const record = body as { message?: unknown; code?: unknown };
   const message = typeof record.message === 'string' ? record.message : '';
-  const code = typeof record.code === 'number' || typeof record.code === 'string' ? String(record.code) : '';
+  const code =
+    typeof record.code === 'number' || typeof record.code === 'string' ? String(record.code) : '';
   return [message, code ? `code=${code}` : ''].filter(Boolean).join(' ');
 }
