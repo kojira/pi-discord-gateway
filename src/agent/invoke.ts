@@ -14,7 +14,6 @@ import {
 } from '../session/path.js';
 import type { AgentResult } from '../types.js';
 import { resolvePiSpawn } from './pi-spawn.js';
-import { startSupervisorWatcher, type SupervisorRequest } from './supervisor-channel.js';
 import { formatAgentTraceEvent } from './trace.js';
 
 export interface SessionTokenUsage {
@@ -56,7 +55,6 @@ interface PendingSteeringMessage {
 
 export interface ConnectionDelivery {
   onAssistantMessage: (text: string, signal: AbortSignal) => void | Promise<void>;
-  onSupervisorRequest?: (request: SupervisorRequest, signal: AbortSignal) => void | Promise<void>;
   onTraceEvent?: (text: string) => void;
   onError: (error: string, signal: AbortSignal) => void | Promise<void>;
 }
@@ -68,7 +66,6 @@ interface InvokeOptions {
   signal?: AbortSignal;
   attachments?: string | null;
   onAssistantMessage?: (text: string) => void | Promise<void>;
-  onSupervisorRequest?: (request: SupervisorRequest) => void | Promise<void>;
   onTraceEvent?: (text: string) => void;
   connectionDelivery?: ConnectionDelivery;
 }
@@ -194,14 +191,6 @@ export async function invokeAgent(
     const pendingSteeringMessages: PendingSteeringMessage[] = [];
     const connectionController = new AbortController();
     const connectionDelivery = opts?.connectionDelivery;
-    let supervisorWatcher =
-      !persistent && opts?.onSupervisorRequest
-        ? startSupervisorWatcher({
-            signal: opts.signal,
-            tempRoot: supervisorTempRoot,
-            onRequest: opts.onSupervisorRequest,
-          })
-        : undefined;
     let requestResolve: ((result: AgentResult) => void) | undefined = resolve;
     let removeRequestAbort = () => {};
     let closeResolve!: () => void;
@@ -308,7 +297,6 @@ export async function invokeAgent(
       if (stopPromise) return stopPromise;
       activeInvocation.closing = true;
       connectionController.abort();
-      supervisorWatcher?.stop();
       if (proc.stdin.writable && !proc.stdin.destroyed) {
         proc.stdin.end('{"type":"clear_queue"}\n{"type":"abort"}\n');
       }
@@ -360,17 +348,6 @@ export async function invokeAgent(
           throw new Error('Pi did not return pendingMessageCount for request admission');
         }
         if (activeInvocation.closing) return undefined;
-        if (!supervisorWatcher && connectionDelivery?.onSupervisorRequest) {
-          if (!data.sessionId)
-            throw new Error('Pi did not return a session ID for supervisor routing');
-          supervisorWatcher = startSupervisorWatcher({
-            signal: connectionController.signal,
-            tempRoot: supervisorTempRoot,
-            sessionId: data.sessionId,
-            onRequest: (request) =>
-              connectionDelivery.onSupervisorRequest!(request, connectionController.signal),
-          });
-        }
         if (data.pendingMessageCount !== 0) {
           const done = requestResolve;
           requestResolve = undefined;
@@ -434,7 +411,6 @@ export async function invokeAgent(
       if (forceKillTimer) clearTimeout(forceKillTimer);
       if (legacySettleTimer) clearTimeout(legacySettleTimer);
       unregister();
-      supervisorWatcher?.stop();
       rmSync(supervisorTempRoot, { recursive: true, force: true });
       for (const pending of pendingCommands.values()) {
         pending.reject(new Error('Pi RPC process exited before responding'));

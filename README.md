@@ -243,12 +243,29 @@ Most users won't need to edit this file directly — `piscord setup` generates i
 | `DB_PATH`                          | _(platform default)_/gateway.db | SQLite database path (see Data Locations)                                  |
 | `LOG_LEVEL`                        | `info`                          | Log level: debug/info/warn/error                                           |
 
+### Child supervisor decisions
+
+The parent Pi owns child supervision. It should inspect pending requests, consult
+existing approvals and project documentation, and reply through the supervisor
+tool that owns the request. If a decision requires human approval, the parent
+asks a concise question through its ordinary assistant response, receives the
+ordinary Discord reply, and then answers the child. Missing approval or an expired
+request must never be treated as permission to proceed. Check prior side effects
+before restarting expired work.
+
+Legacy supervisor buttons and modals are inert after upgrading. They display a
+retirement notice and cannot approve, cancel, or automatically answer a child.
+Parent tool-wait release and request expiry remain pi-subagents responsibilities;
+Piscord does not substitute a human question when parent delivery fails.
+
 ### Persistent RPC (opt-in)
 
 Set `PI_RPC_PERSISTENT=true` to keep the original Pi process connected after a
 response, so asynchronous children can finish and wake the parent without another
-Discord message. Later responses and supervisor requests still reach the channel;
-subsequent user requests reuse the process. Requires Pi RPC with `get_state` session
+Discord message. Later assistant responses still reach the channel;
+subsequent user requests reuse the process. Internal supervisor requests remain
+between child and parent Pi; Piscord neither forwards them as human questions nor
+writes supervisor replies. Requires Pi RPC with `get_state` session
 identity, `pendingMessageCount` and normal prompt/settlement events; no new lifetime extension is required.
 
 RPC events have no request IDs: a request is sent only with an empty Pi user queue,

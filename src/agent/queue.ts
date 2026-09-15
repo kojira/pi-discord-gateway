@@ -30,7 +30,7 @@ import {
   stopResidentAgent,
   steerActiveAgent,
 } from './invoke.js';
-import { promptSupervisorRequest, sendResponse, setTyping } from '../discord/client.js';
+import { sendResponse, setTyping } from '../discord/client.js';
 import { computeEffectiveChannelSettings } from './channel-settings.js';
 import {
   enqueueWebhookTerminal,
@@ -499,14 +499,6 @@ async function processMessage(
                 throw new Error('Could not deliver background assistant message to Discord');
               logMessage(jid, 'assistant', text);
             },
-            onSupervisorRequest: async (request, connectionSignal) => {
-              connectionSignal = AbortSignal.any([
-                connectionSignal,
-                connectionDeliveryController.signal,
-              ]);
-              if (!taskResourcesAvailable || connectionSignal.aborted) return;
-              await promptSupervisorRequest(jid, request, connectionSignal);
-            },
             onTraceEvent: (text) => {
               if (taskResourcesAvailable) enqueueWebhookTrace(jid, text);
             },
@@ -537,7 +529,6 @@ async function processMessage(
         }
         logMessage(jid, 'assistant', text);
       },
-      onSupervisorRequest: (request) => promptSupervisorRequest(jid, request, signal),
       onTraceEvent: (text) => enqueueWebhookTrace(jid, text),
     });
 
