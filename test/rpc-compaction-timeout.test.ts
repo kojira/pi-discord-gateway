@@ -180,12 +180,25 @@ describe('RPC prompt preflight compaction deadlines', () => {
     expect((await first.result).ok).toBe(true);
     send({ type: 'compaction_start' });
     const second = await start();
-    await vi.advanceTimersByTimeAsync(87_000);
+    await vi.advanceTimersByTimeAsync(180_000);
     expect(proc.stdin.writableEnded).toBe(false);
     send({ type: 'compaction_end', willRetry: false });
     complete(second.prompt);
     expect((await second.result).ok).toBe(true);
     expect(spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it('anchors the cap to delayed compaction start and does not exceed it on end', async () => {
+    const { result } = await start();
+    await vi.advanceTimersByTimeAsync(110_000);
+    send({ type: 'compaction_start' });
+    await vi.advanceTimersByTimeAsync(599_000);
+    expect(proc.stdin.writableEnded).toBe(false);
+    send({ type: 'compaction_end', willRetry: false });
+    await vi.advanceTimersByTimeAsync(999);
+    expect(proc.stdin.writableEnded).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect((await result).error).toBe('Pi RPC command timed out: prompt');
   });
 
   it('does not extend a state query deadline during background compaction', async () => {
