@@ -95,6 +95,8 @@ export async function shutdownResidentAgents(): Promise<void> {
   await Promise.all([...activeRpcInvocations.values()].map((connection) => connection.stop?.()));
 }
 
+const RPC_COMMAND_TIMEOUT_MS = 2 * 60_000;
+const RPC_COMPACTION_TIMEOUT_MS = 10 * 60_000;
 const MAX_RPC_EVENT_BYTES = 4 * 1024 * 1024;
 const MAX_STDERR_BYTES = 64 * 1024;
 const MAX_PENDING_DELIVERY_BYTES = 4 * 1024 * 1024;
@@ -186,8 +188,13 @@ export async function invokeAgent(
     const decoder = new StringDecoder('utf8');
     const pendingCommands = new Map<
       string,
-      { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }
+      {
+        resolve: (response: RpcResponse) => void;
+        reject: (error: Error) => void;
+        setCompacting: (active: boolean) => void;
+      }
     >();
+    let compacting = false;
     const pendingSteeringMessages: PendingSteeringMessage[] = [];
     const connectionController = new AbortController();
     const connectionDelivery = opts?.connectionDelivery;
@@ -227,13 +234,32 @@ export async function invokeAgent(
 
       const id = `piscord-${++commandSequence}`;
       return new Promise<RpcResponse>((resolveCommand, rejectCommand) => {
-        const timer = persistent
-          ? setTimeout(() => {
+        let timer: NodeJS.Timeout | undefined;
+        let compactionDeadline: number | undefined;
+        let commandCompacting = false;
+        const armTimeout = (delayMs: number) => {
+          clearTimeout(timer);
+          timer = setTimeout(
+            () => {
               pendingCommands.delete(id);
               rejectCommand(new Error(`Pi RPC command timed out: ${String(command.type)}`));
-            }, 30_000)
-          : undefined;
+            },
+            Math.max(0, delayMs),
+          );
+        };
+        const setCompacting = (active: boolean) => {
+          if (!persistent || command.type !== 'prompt' || active === commandCompacting) return;
+          commandCompacting = active;
+          // Prompt acceptance follows preflight, which can include summarization.
+          // Establish the long deadline once: duplicate events/retries cannot renew it.
+          compactionDeadline ??= Date.now() + RPC_COMPACTION_TIMEOUT_MS;
+          const remaining = compactionDeadline - Date.now();
+          armTimeout(active ? remaining : Math.min(RPC_COMMAND_TIMEOUT_MS, remaining));
+        };
+        if (persistent) armTimeout(RPC_COMMAND_TIMEOUT_MS);
+        setCompacting(compacting);
         pendingCommands.set(id, {
+          setCompacting,
           resolve: (response) => {
             clearTimeout(timer);
             resolveCommand(response);
@@ -479,6 +505,11 @@ export async function invokeAgent(
           pending.resolve(message as RpcResponse);
         }
         return;
+      }
+
+      if (message?.type === 'compaction_start' || message?.type === 'compaction_end') {
+        compacting = message.type === 'compaction_start';
+        for (const pending of pendingCommands.values()) pending.setCompacting(compacting);
       }
 
       emitTrace(formatAgentTraceEvent(message));
