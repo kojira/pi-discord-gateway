@@ -583,6 +583,11 @@ export async function invokeAgent(
           lastAssistantText = record.decision.summary;
           lastAssistantFailed = false;
           lastAssistantError = '';
+        } else if (record?.status === 'awaiting_input' && typeof record.question === 'string') {
+          workOutcome = undefined;
+          lastAssistantText = record.question;
+          lastAssistantFailed = false;
+          lastAssistantError = '';
         } else if (record?.status === 'suspended') {
           lastAssistantFailed = true;
           lastAssistantError = typeof record.reason === 'string' ? record.reason : 'Work suspended';

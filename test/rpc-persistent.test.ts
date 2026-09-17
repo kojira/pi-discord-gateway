@@ -42,7 +42,12 @@ const settle = () => send({type:'agent_settled'});
 const answer = command => {
  send({type:'agent_start'});
  send({type:'message_start',message:{role:'user',content:command.message === 'queued' ? 'transformed input' : command.message}});
- text(command.message + ':' + process.pid);
+ if(command.message === 'wait') {
+  send({type:'message_end',message:{role:'assistant',content:[{type:'toolCall',name:'wait_for_user',arguments:{question:'Which account?'}}],stopReason:'toolUse'}});
+  send({type:'work_contract',record:{status:'awaiting_input',question:'Which account?'}});
+ } else {
+  text(command.message + ':' + process.pid);
+ }
  if(command.message === 'summary') send({type:'work_contract',record:{status:'resolved',decision:{outcome:'waiting',summary:'waiting for children'}}});
  settle();
 };
@@ -125,6 +130,32 @@ function sinks() {
 }
 
 describe('persistent RPC connection', () => {
+  it('delivers an awaiting-input question once and retains the connection for the reply', async () => {
+    const root = fixture();
+    const connectionDelivery = sinks();
+    const requestDelivery = vi.fn();
+    const result = await invokeAgent('channel', 'wait', {
+      cwd: root,
+      onAssistantMessage: requestDelivery,
+      connectionDelivery,
+    });
+    expect(result).toEqual({ ok: true, text: 'Which account?' });
+    expect(requestDelivery).toHaveBeenCalledExactlyOnceWith('Which account?');
+    expect(connectionDelivery.onAssistantMessage).not.toHaveBeenCalled();
+    expect(hasResidentAgent('channel')).toBe(true);
+
+    const answer = await invokeAgent('channel', 'staging-user-2', {
+      cwd: root,
+      onAssistantMessage: requestDelivery,
+      connectionDelivery,
+    });
+    expect(answer.ok).toBe(true);
+    expect(requestDelivery.mock.calls.map(([text]) => text)).toEqual([
+      'Which account?',
+      expect.stringMatching(/^staging-user-2:\d+$/),
+    ]);
+  });
+
   it('survives parent idle, leaves supervisor requests to Pi and reuses the same process', async () => {
     const root = fixture();
     const connectionDelivery = sinks();
