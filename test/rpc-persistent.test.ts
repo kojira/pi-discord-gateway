@@ -45,6 +45,15 @@ const answer = command => {
  if(command.message === 'wait') {
   send({type:'message_end',message:{role:'assistant',content:[{type:'toolCall',name:'wait_for_user',arguments:{question:'Which account?'}}],stopReason:'toolUse'}});
   send({type:'work_contract',record:{status:'awaiting_input',question:'Which account?'}});
+ } else if(command.message === 'repeated-intermediate') {
+  text('progress once');
+  text('progress once');
+  text('progress restated');
+  send({type:'work_contract',record:{status:'resolved',decision:{outcome:'completed',summary:'final once'}}});
+ } else if(command.message === 'repeated-without-decision') {
+  text('visible once');
+  text('hidden repeat');
+  text('hidden restatement');
  } else {
   text(command.message + ':' + process.pid);
  }
@@ -298,6 +307,33 @@ describe('persistent RPC connection', () => {
     const crashed = await invokeAgent('channel', 'crash', { cwd: root, connectionDelivery });
     expect(crashed.ok).toBe(false);
     expect(crashed.error).toContain('unexpectedly');
+  });
+
+  it('publishes only the first intermediate text for one input, then the explicit final summary', async () => {
+    const root = fixture();
+    const onAssistantMessage = vi.fn();
+    const result = await invokeAgent('channel', 'repeated-intermediate', {
+      cwd: root,
+      onAssistantMessage,
+      connectionDelivery: sinks(),
+    });
+    expect(result).toEqual({ ok: true, text: 'final once', workOutcome: 'completed' });
+    expect(onAssistantMessage.mock.calls.map(([text]) => text)).toEqual([
+      'progress once',
+      'final once',
+    ]);
+  });
+
+  it('does not expose or return later text-only continuations when work settles without a decision', async () => {
+    const root = fixture();
+    const onAssistantMessage = vi.fn();
+    const result = await invokeAgent('channel', 'repeated-without-decision', {
+      cwd: root,
+      onAssistantMessage,
+      connectionDelivery: sinks(),
+    });
+    expect(result).toEqual({ ok: true, text: 'visible once' });
+    expect(onAssistantMessage).toHaveBeenCalledExactlyOnceWith('visible once');
   });
 
   it('delivers explicit request summaries before resolving while keeping the connection alive', async () => {

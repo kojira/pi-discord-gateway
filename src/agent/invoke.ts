@@ -213,6 +213,11 @@ export async function invokeAgent(
     let commandSequence = 0;
     let lastAssistantText = '';
     let lastDeliveredText = '';
+    // Pi may make several text-only continuation turns while one work checkpoint stays active.
+    // Preserve every turn in Pi's transcript/context, but expose at most one intermediate
+    // assistant message per user/native-input boundary. Explicit work-control output remains
+    // separately deliverable through the work_contract event.
+    let intermediateTextDelivered = false;
     let workOutcome: AgentResult['workOutcome'];
     let lastAssistantError = '';
     let lastAssistantFailed = false;
@@ -361,6 +366,7 @@ export async function invokeAgent(
     const resetOutput = () => {
       lastAssistantText = '';
       lastDeliveredText = '';
+      intermediateTextDelivered = false;
       workOutcome = undefined;
       lastAssistantError = '';
       lastAssistantFailed = false;
@@ -542,6 +548,9 @@ export async function invokeAgent(
           return;
         }
 
+        // A queued user message is a new public-response boundary even when Pi consumes
+        // it inside the same physical agent run.
+        intermediateTextDelivered = false;
         markSteeringConsumed(userText);
         return;
       }
@@ -560,8 +569,9 @@ export async function invokeAgent(
         lastAssistantError = lastAssistantFailed
           ? message.message.errorMessage || 'Pi assistant message ended with an error'
           : '';
-        if (text) {
+        if (text && (!persistent || !intermediateTextDelivered)) {
           lastAssistantText = text;
+          intermediateTextDelivered = true;
           const deliver =
             (!persistent || initialPromptObserved ? opts?.onAssistantMessage : undefined) ||
             (connectionDelivery
@@ -617,6 +627,9 @@ export async function invokeAgent(
       ) {
         if (message.type === 'agent_start') {
           legacyAgentEndPending = false;
+          // Native completion and a fresh prompt start a new physical run. Automatic
+          // text-only continuation turns do not emit agent_start and stay suppressed.
+          intermediateTextDelivered = false;
           if (persistent && !requestResolve) resetOutput();
         }
         cancelLegacySettlement();
