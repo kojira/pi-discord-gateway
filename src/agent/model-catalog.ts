@@ -9,6 +9,7 @@ const CACHE_TTL_MS = 30_000;
 // A hung `pi --list-models` (broken wrapper, stuck provider lookup) must not
 // block gateway startup or the event loop indefinitely.
 const LIST_MODELS_TIMEOUT_MS = 15_000;
+const modelVersionOrder = new Intl.Collator('en', { numeric: true, sensitivity: 'base' });
 
 export interface AvailableModelInfo {
   ref: string;
@@ -125,7 +126,12 @@ export async function autocompleteModels(
   const models = await listSelectableModels(options);
   const trimmed = query.trim();
   if (!trimmed) {
-    return models.slice(0, limit);
+    // Discord accepts at most 25 autocomplete choices. Alphabetical order hides
+    // newly-added model generations once the catalog grows past that limit, so
+    // show newer model IDs first while retaining a deterministic ref tie-break.
+    return [...models]
+      .sort((a, b) => modelVersionOrder.compare(b.id, a.id) || a.ref.localeCompare(b.ref))
+      .slice(0, limit);
   }
 
   const normalized = normalize(trimmed);
