@@ -1,6 +1,7 @@
 import { SettingsManager } from '@earendil-works/pi-coding-agent';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  autocompleteModels,
   isModelCatalogStale,
   listSelectableModels,
   parsePiModelList,
@@ -127,6 +128,28 @@ describe('listSelectableModels', () => {
       ['--list-models', '-e', './provider.ts', '--approve'],
       expect.anything(),
     );
+  });
+});
+
+describe('autocompleteModels', () => {
+  it("keeps new model generations visible in Discord's 25-choice empty query", async () => {
+    const rows = [
+      ...Array.from(
+        { length: 26 },
+        (_, index) => `anthropic claude-${String(index + 1).padStart(2, '0')} 200K 32K yes yes`,
+      ),
+      'openai-codex gpt-6-luna 272K 128K yes yes',
+      'openai-codex gpt-6-sol 272K 128K yes yes',
+    ].join('\n');
+    mockPiCatalog(undefined, `provider model context max-out thinking images\n${rows}\n`);
+
+    const result = await autocompleteModels('', 25, {
+      forceRefresh: true,
+      cwd: '/tmp/autocomplete',
+    });
+
+    expect(result.map((model) => model.ref)).toContain('openai-codex/gpt-6-luna');
+    expect(result.map((model) => model.ref)).toContain('openai-codex/gpt-6-sol');
   });
 });
 
