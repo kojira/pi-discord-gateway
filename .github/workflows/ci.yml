@@ -4,19 +4,28 @@ on:
   push:
     branches: [main]
   pull_request:
+  pull_request_target:
 
 jobs:
   design-id:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request_target'
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Fetch PR history as data
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ && "$PR_HEAD" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          git fetch --no-tags origin "refs/pull/$PR_NUMBER/head"
+          test "$(git rev-parse FETCH_HEAD)" = "$PR_HEAD"
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -24,6 +33,7 @@ jobs:
         run: node scripts/check-design-id.mjs "$GITHUB_EVENT_PATH"
 
   build-and-test:
+    if: github.event_name != 'pull_request_target'
     runs-on: ubuntu-latest
 
     strategy:

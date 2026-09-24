@@ -59,6 +59,22 @@ describe('check-design-id PR gate', () => {
     expect(result.stdout).toContain('design precedes IMPLEMENT');
   });
 
+  it('does not execute a checker supplied by the PR', () => {
+    const { cwd, base, design, implementation } = fixture();
+    mkdirSync(join(cwd, 'scripts'));
+    writeFileSync(join(cwd, 'scripts/check-design-id.mjs'), 'process.exit(0);\n');
+    git(cwd, 'add', '.');
+    git(cwd, 'commit', '-qm', 'replace checker in PR');
+    const result = run(
+      cwd,
+      base,
+      git(cwd, 'rev-parse', 'HEAD'),
+      evidence(design, implementation).replace('Design-ID: D-000001\n', ''),
+    );
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('Design-ID');
+  });
+
   it('rejects a missing design ID', () => {
     const { cwd, base, design, implementation } = fixture();
     const result = run(
