@@ -7,6 +7,23 @@ on:
     branches: [main]
 
 jobs:
+  design-id:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Check implementation design evidence
+        run: node scripts/check-design-id.mjs "$GITHUB_EVENT_PATH"
+
   build-and-test:
     runs-on: ubuntu-latest
 
