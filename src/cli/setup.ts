@@ -206,7 +206,7 @@ function checkPrerequisites(): {
   let modelCount: number | undefined;
 
   try {
-    modelCount = listAvailableModels().length;
+    modelCount = listAvailableModels({ forceRefresh: true }).length;
   } catch {
     modelCount = undefined;
   }

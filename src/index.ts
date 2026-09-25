@@ -5,7 +5,7 @@ import { startDiscord, stopDiscord, getBotTag } from './discord/client.js';
 import { stopWebhookLifecycle } from './discord/slash-commands.js';
 import { startArchiveCleanup } from './session/archive-cleanup.js';
 import { startMediaCleanup } from './session/media.js';
-import { listAvailableModels } from './agent/model-catalog.js';
+import { refreshModelCatalog } from './agent/model-catalog.js';
 import { startProcessingLoop, stopProcessingLoop } from './agent/queue.js';
 import { startScheduler } from './agent/scheduler.js';
 import { stopWebhookMonitor } from './discord/webhook-monitor.js';
@@ -88,8 +88,7 @@ export async function startGateway(): Promise<void> {
 
   try {
     logger.info('Starting pi-discord-gateway...');
-    warmModelCatalogs();
-
+    void warmModelCatalogs();
     await startDiscord();
     if (shutdownPromise) {
       await shutdownPromise;
@@ -120,7 +119,7 @@ export async function startGateway(): Promise<void> {
   }
 }
 
-function warmModelCatalogs(): void {
+async function warmModelCatalogs(): Promise<void> {
   const workingDirectories = new Set([
     config.piCwd,
     ...getAllChannels()
@@ -130,7 +129,7 @@ function warmModelCatalogs(): void {
 
   for (const cwd of workingDirectories) {
     try {
-      const models = listAvailableModels({ forceRefresh: true, cwd });
+      const models = await refreshModelCatalog({ forceRefresh: true, cwd });
       logger.info({ cwd, models: models.length }, 'Model catalog warmed');
     } catch (err: any) {
       logger.warn({ cwd, err: err.message }, 'Failed to warm model catalog');

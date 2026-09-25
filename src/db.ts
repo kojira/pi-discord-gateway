@@ -81,7 +81,9 @@ export function initDb(): void {
   db = new Database(config.dbPath);
   dbOpen = true;
   db.pragma('journal_mode = WAL');
-  db.pragma('busy_timeout = 5000');
+  // better-sqlite3 waits synchronously: a five-second writer lock also blocks
+  // every Discord interaction ACK. Surface contention promptly instead.
+  db.pragma('busy_timeout = 100');
 
   db.exec(`
     create table if not exists channels (

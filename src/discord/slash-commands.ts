@@ -52,7 +52,7 @@ import {
   hasCachedModelCatalog,
   isModelCatalogStale,
   isThinkingLevel,
-  listAvailableModels,
+  refreshModelCatalog,
   listSelectableModels,
   resolveModelReference,
   resolveThinkingForModel,
@@ -206,15 +206,11 @@ function webhookCommandError(message: string): WebhookCommandError {
 function scheduleCatalogRefresh(cwd: string): void {
   if (catalogRefreshesInFlight.has(cwd)) return;
   catalogRefreshesInFlight.add(cwd);
-  setImmediate(() => {
-    try {
-      listAvailableModels({ forceRefresh: true, cwd });
-    } catch (err: any) {
-      logger.warn({ cwd, err: err.message }, 'Failed to warm model catalog');
-    } finally {
-      catalogRefreshesInFlight.delete(cwd);
-    }
-  });
+  void refreshModelCatalog({ cwd })
+    .catch((err: unknown) => {
+      logger.warn({ cwd, err }, 'Failed to warm model catalog');
+    })
+    .finally(() => catalogRefreshesInFlight.delete(cwd));
 }
 
 export async function handleAutocomplete(interaction: AutocompleteInteraction): Promise<void> {
@@ -383,13 +379,16 @@ async function handleNew(interaction: ChatInputCommandInteraction): Promise<void
 }
 
 async function handleStop(interaction: ChatInputCommandInteraction): Promise<void> {
+  // ACK before touching the agent or SQLite: neither must consume Discord's
+  // short interaction deadline, particularly when the local database is busy.
+  await interaction.deferReply(
+    interaction.inGuild() ? { flags: MessageFlags.Ephemeral } : undefined,
+  );
   const jid = `dc:${interaction.channelId}`;
   const result = abortChannelTask(jid);
 
   if (!result.aborted && result.cleared === 0) {
-    await interaction.reply(
-      reply('No active task or queued messages in this channel.', interaction),
-    );
+    await interaction.editReply({ content: 'No active task or queued messages in this channel.' });
     return;
   }
 
@@ -403,7 +402,7 @@ async function handleStop(interaction: ChatInputCommandInteraction): Promise<voi
     );
   }
 
-  await interaction.reply(reply(notes.join(' '), interaction));
+  await interaction.editReply({ content: notes.join(' ') });
 }
 
 async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -990,7 +989,9 @@ async function handleModelSet(interaction: ChatInputCommandInteraction): Promise
 
   const selectedRef = interaction.options.getString('model', true);
   const cwd = channel.cwdOverride || config.piCwd;
-  const models = await listSelectableModels({ forceRefresh: true, cwd });
+  // Autocomplete (or startup warming) has already obtained a recent catalog in
+  // the usual flow. Do not re-run pi just to commit a still-fresh selection.
+  const models = await listSelectableModels({ cwd });
   const selectedModel = resolveModelReference(selectedRef, models);
   if (!selectedModel) {
     await interaction.editReply({ content: `Model is no longer available: ${selectedRef}` });
