@@ -387,6 +387,8 @@ describe('webhook slash commands', () => {
         }),
       },
       reply,
+      deferReply: vi.fn().mockResolvedValue(undefined),
+      editReply: reply,
       replied: false,
       deferred: false,
     };
@@ -1279,9 +1281,9 @@ describe('webhook slash commands', () => {
 
       expect(createWebhook).not.toHaveBeenCalled();
       expect(db.getChannelWebhookProvisioning('dc:source')).toBeUndefined();
-      expect(reply).toHaveBeenCalledWith(
-        expect.objectContaining({ content: expect.stringContaining('did not acknowledge') }),
-      );
+      // The initial ACK failed: the interaction token is not retried with a
+      // competing reply, but the unissued lease is safely cancelled.
+      expect(reply).not.toHaveBeenCalled();
     } finally {
       db.closeDb();
     }
@@ -1852,6 +1854,8 @@ describe('webhook slash commands', () => {
         inGuild: () => true,
         options: { getSubcommand: () => 'webhook' },
         reply,
+        deferReply: vi.fn().mockResolvedValue(undefined),
+        editReply: reply,
         replied: false,
         deferred: false,
       } as any);

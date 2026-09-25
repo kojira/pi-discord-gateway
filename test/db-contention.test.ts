@@ -23,6 +23,46 @@ afterAll(() => {
 });
 
 describe('Discord ingress under a SQLite writer lock', () => {
+  it.each([
+    'status',
+    'model',
+    'reset-model',
+    'thinking',
+    'new',
+    'stop',
+    'webhook',
+    'webhook-clear',
+  ])('starts the common ACK before parsing or handling /pi %s', async (subcommand) => {
+    const editReply = vi.fn().mockResolvedValue(undefined);
+    const deferReply = vi.fn().mockResolvedValue(undefined);
+    const options = {
+      getSubcommand: vi.fn().mockImplementation(() => {
+        expect(deferReply).toHaveBeenCalledTimes(1);
+        return subcommand;
+      }),
+      getString: () => 'high',
+    };
+    await handleInteraction({
+      id: `isolated-${subcommand}`,
+      commandName: 'pi',
+      channelId: 'unregistered',
+      guild: { id: 'isolated' },
+      memberPermissions: { has: () => false },
+      options,
+      deferred: false,
+      replied: false,
+      inGuild: () => true,
+      deferReply,
+      editReply,
+      isButton: () => false,
+      isModalSubmit: () => false,
+      isAutocomplete: () => false,
+      isChatInputCommand: () => true,
+    } as any);
+    expect(deferReply).toHaveBeenCalledTimes(1);
+    expect(editReply).toHaveBeenCalledTimes(1);
+  });
+
   it('acknowledges /pi stop with an explicit failure under a writer lock', async () => {
     registerChannel({
       jid: 'dc:stop-test',

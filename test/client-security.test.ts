@@ -24,6 +24,8 @@ describe('Discord interaction error logging', () => {
       deferred: false,
       inGuild: () => false,
       reply,
+      deferReply: vi.fn().mockResolvedValue(undefined),
+      editReply: reply,
       isButton: () => false,
       isModalSubmit: () => false,
       isAutocomplete: () => false,
