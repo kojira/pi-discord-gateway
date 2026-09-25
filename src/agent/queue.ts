@@ -32,6 +32,7 @@ import {
 } from './invoke.js';
 import { sendResponse, setTyping } from '../discord/client.js';
 import { computeEffectiveChannelSettings } from './channel-settings.js';
+import { hasCachedModelCatalog, refreshModelCatalog } from './model-catalog.js';
 import {
   enqueueWebhookTerminal,
   enqueueWebhookTrace,
@@ -474,6 +475,20 @@ async function processMessage(
 
     logMessage(jid, 'user', content);
 
+    const cwd = channel.cwdOverride || config.piCwd;
+    // Startup warms catalogs without blocking Discord. A queued turn needing
+    // model-specific thinking must not run before that asynchronous warm-up.
+    if (
+      (channel.modelOverride || config.piModel) &&
+      (channel.thinkingOverride || config.piThinking) &&
+      !hasCachedModelCatalog(cwd)
+    ) {
+      await refreshModelCatalog({ cwd });
+      if (signal.aborted || !taskResourcesAvailable) {
+        markMessageFailed(rowid);
+        return;
+      }
+    }
     const effective = computeEffectiveChannelSettings(channel);
 
     let lastAttemptedText = '';

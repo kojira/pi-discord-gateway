@@ -984,9 +984,9 @@ async function handleModelSet(interaction: ChatInputCommandInteraction): Promise
 
   const selectedRef = interaction.options.getString('model', true);
   const cwd = channel.cwdOverride || config.piCwd;
-  // Autocomplete (or startup warming) has already obtained a recent catalog in
-  // the usual flow. Do not re-run pi just to commit a still-fresh selection.
-  const models = await listSelectableModels({ cwd });
+  // Confirm the candidate against Pi's current catalog before persisting it.
+  // Discovery is asynchronous; the shared Discord ACK has already started.
+  const models = await listSelectableModels({ forceRefresh: true, requireSuccess: true, cwd });
   const selectedModel = resolveModelReference(selectedRef, models);
   if (!selectedModel) {
     await interaction.editReply({ content: `Model is no longer available: ${selectedRef}` });
@@ -1027,6 +1027,17 @@ async function handleModelReset(interaction: ChatInputCommandInteraction): Promi
     return;
   }
 
+  if (config.piModel) {
+    const cwd = channel.cwdOverride || config.piCwd;
+    const models = await refreshModelCatalog({ forceRefresh: true, requireSuccess: true, cwd });
+    if (!resolveModelReference(config.piModel, models)) {
+      await interaction.editReply({
+        content: 'Cannot verify the default model; reset was not saved.',
+      });
+      return;
+    }
+  }
+
   clearChannelModelOverride(channel.jid);
 
   const updated = getChannel(channel.jid)!;
@@ -1063,6 +1074,17 @@ async function handleThinkingSet(interaction: ChatInputCommandInteraction): Prom
     return;
   }
 
+  const modelRef = channel.modelOverride || config.piModel;
+  if (modelRef) {
+    const cwd = channel.cwdOverride || config.piCwd;
+    const models = await refreshModelCatalog({ forceRefresh: true, requireSuccess: true, cwd });
+    if (!resolveModelReference(modelRef, models)) {
+      await interaction.editReply({
+        content: 'Cannot verify the current model; thinking was not saved.',
+      });
+      return;
+    }
+  }
   const effective = computeEffectiveChannelSettings(channel);
   const resolution = resolveThinkingForModel(effective.modelInfo, rawLevel);
 

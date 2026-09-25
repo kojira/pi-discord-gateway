@@ -35,6 +35,8 @@ export interface ModelListOptions {
   forceRefresh?: boolean;
   allowStale?: boolean;
   cwd?: string;
+  /** Fail a model mutation instead of trusting a stale catalog after CLI failure. */
+  requireSuccess?: boolean;
 }
 
 export function listAvailableModels(options?: ModelListOptions): AvailableModelInfo[] {
@@ -54,9 +56,15 @@ export async function refreshModelCatalog(
   options?: ModelListOptions,
 ): Promise<AvailableModelInfo[]> {
   const cwd = options?.cwd ?? process.cwd();
-  return (
-    await loadModelCatalogAsync(options?.forceRefresh ?? false, cwd, options?.allowStale ?? false)
-  ).models;
+  const catalog = await loadModelCatalogAsync(
+    options?.forceRefresh ?? false,
+    cwd,
+    options?.allowStale ?? false,
+  );
+  if (options?.requireSuccess && lastFailedRefreshByCwd.has(cwd)) {
+    throw new Error('Could not verify available models with pi');
+  }
+  return catalog.models;
 }
 
 export function hasCachedModelCatalog(cwd: string): boolean {
@@ -81,6 +89,9 @@ export async function listSelectableModels(
     cwd,
     options?.allowStale ?? false,
   );
+  if (options?.requireSuccess && lastFailedRefreshByCwd.has(cwd)) {
+    throw new Error('Could not verify available models with pi');
+  }
   const settingsManager = SettingsManager.create(cwd);
   const patterns = settingsManager.getEnabledModels();
 
