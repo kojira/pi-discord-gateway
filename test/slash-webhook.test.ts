@@ -1102,7 +1102,7 @@ describe('webhook slash commands', () => {
     expect(isDefinitiveWebhookCreateRejection(new Error('socket timeout'))).toBe(false);
   });
 
-  it('leases before defer so clear tombstones a blocked setup before webhook creation', async () => {
+  it('starts ACK then leases before awaiting it so clear tombstones a blocked setup', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'piscord-slash-webhook-defer-race-'));
     tempDirs.push(tempDir);
     process.env.DB_PATH = join(tempDir, 'gateway.db');

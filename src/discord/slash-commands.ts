@@ -259,7 +259,10 @@ export async function handleChatCommand(interaction: ChatInputCommandInteraction
     await executeChatCommand(interaction, subcommand, false);
     return;
   }
-  if (!acceptingWebhookLifecycles) return;
+  if (!acceptingWebhookLifecycles) {
+    await replyToChatCommand(interaction, 'Gateway is shutting down. Please retry shortly.');
+    return;
+  }
 
   const operation = executeChatCommand(interaction, subcommand, true);
   activeWebhookLifecycles.add(operation);
@@ -676,8 +679,8 @@ async function handleWebhookClear(interaction: ChatInputCommandInteraction): Pro
     return;
   }
 
-  // This durable transition deliberately happens before defer/network awaits
-  // and outside the process-local setup lock. It disables routing immediately
+  // This durable transition deliberately happens before awaiting the already
+  // started ACK and outside the process-local setup lock. It disables routing immediately
   // and prevents even a fresh or hung creator from activating later.
   const clearStart = beginChannelWebhookClear(channelJid);
   discardWebhookTrace(channelJid);
