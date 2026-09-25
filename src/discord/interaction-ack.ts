@@ -1,18 +1,72 @@
-import { MessageFlags, type ChatInputCommandInteraction } from 'discord.js';
+import {
+  MessageFlags,
+  type AutocompleteInteraction,
+  type ChatInputCommandInteraction,
+} from 'discord.js';
+import { logger } from '../logger.js';
 
 const pendingAcks = new WeakMap<ChatInputCommandInteraction, Promise<unknown>>();
 
 /** Start the Discord ACK before any command-specific lookup or side effect. */
 export function startChatCommandAck(interaction: ChatInputCommandInteraction): void {
   if (interaction.replied || pendingAcks.has(interaction)) return;
+  const wallStartedAt = Date.now();
+  const startedAt = performance.now();
   const pending = interaction.deferReply(
     interaction.inGuild() ? { flags: MessageFlags.Ephemeral } : undefined,
   );
-  // The valid webhook setup/clear paths establish their durable lease before
-  // awaiting the network ACK. Attach a handler now so an early rejection is
-  // not reported as unhandled; awaitChatCommandAck still propagates it.
-  void pending.catch(() => {});
   pendingAcks.set(interaction, pending);
+  // Observe completion without waiting for the network before command handling.
+  // Do not log option values, tokens, or raw REST errors.
+  logger.info(
+    { id: interaction.id, ageAtAckStartMs: ageOf(interaction, wallStartedAt) },
+    'Discord chat ACK started',
+  );
+  void pending.then(
+    () =>
+      logger.info(
+        { id: interaction.id, ackElapsedMs: Math.round(performance.now() - startedAt) },
+        'Discord chat ACK completed',
+      ),
+    () =>
+      logger.warn(
+        { id: interaction.id, ackElapsedMs: Math.round(performance.now() - startedAt) },
+        'Discord chat ACK failed',
+      ),
+  );
+}
+
+/** Autocomplete ACK must send choices instead of deferring. */
+export async function respondToAutocomplete(
+  interaction: AutocompleteInteraction,
+  choices: Parameters<AutocompleteInteraction['respond']>[0],
+): Promise<void> {
+  const wallStartedAt = Date.now();
+  const startedAt = performance.now();
+  const pending = interaction.respond(choices);
+  logger.info(
+    { id: interaction.id, ageAtAckStartMs: ageOf(interaction, wallStartedAt) },
+    'Discord autocomplete ACK started',
+  );
+  try {
+    await pending;
+    logger.info(
+      { id: interaction.id, ackElapsedMs: Math.round(performance.now() - startedAt) },
+      'Discord autocomplete ACK completed',
+    );
+  } catch (error) {
+    logger.warn(
+      { id: interaction.id, ackElapsedMs: Math.round(performance.now() - startedAt) },
+      'Discord autocomplete ACK failed',
+    );
+    throw error;
+  }
+}
+
+function ageOf(interaction: { createdTimestamp: number }, now: number): number | null {
+  return Number.isFinite(interaction.createdTimestamp)
+    ? Math.max(0, now - interaction.createdTimestamp)
+    : null;
 }
 
 export async function awaitChatCommandAck(interaction: ChatInputCommandInteraction): Promise<void> {
