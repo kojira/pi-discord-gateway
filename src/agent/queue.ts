@@ -483,7 +483,22 @@ async function processMessage(
       (channel.thinkingOverride || config.piThinking) &&
       !hasCachedModelCatalog(cwd)
     ) {
-      await refreshModelCatalog({ cwd });
+      // The shared catalog refresh may continue for other callers, but a
+      // stopped turn must release its channel lock without waiting for Pi's
+      // subprocess timeout.
+      let onAbort: (() => void) | undefined;
+      const aborted = new Promise<void>((resolve) => {
+        if (signal.aborted) resolve();
+        else {
+          onAbort = resolve;
+          signal.addEventListener('abort', onAbort, { once: true });
+        }
+      });
+      try {
+        await Promise.race([refreshModelCatalog({ cwd }), aborted]);
+      } finally {
+        if (onAbort) signal.removeEventListener('abort', onAbort);
+      }
       if (signal.aborted || !taskResourcesAvailable) {
         markMessageFailed(rowid);
         return;
