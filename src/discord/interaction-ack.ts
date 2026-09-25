@@ -10,7 +10,8 @@ const pendingAcks = new WeakMap<ChatInputCommandInteraction, Promise<unknown>>()
 /** Start the Discord ACK before any command-specific lookup or side effect. */
 export function startChatCommandAck(interaction: ChatInputCommandInteraction): void {
   if (interaction.replied || pendingAcks.has(interaction)) return;
-  const startedAt = Date.now();
+  const wallStartedAt = Date.now();
+  const startedAt = performance.now();
   const pending = interaction.deferReply(
     interaction.inGuild() ? { flags: MessageFlags.Ephemeral } : undefined,
   );
@@ -18,18 +19,18 @@ export function startChatCommandAck(interaction: ChatInputCommandInteraction): v
   // Observe completion without waiting for the network before command handling.
   // Do not log option values, tokens, or raw REST errors.
   logger.info(
-    { id: interaction.id, ageAtAckStartMs: ageOf(interaction, startedAt) },
+    { id: interaction.id, ageAtAckStartMs: ageOf(interaction, wallStartedAt) },
     'Discord chat ACK started',
   );
   void pending.then(
     () =>
       logger.info(
-        { id: interaction.id, ackNetworkMs: Date.now() - startedAt },
+        { id: interaction.id, ackElapsedMs: Math.round(performance.now() - startedAt) },
         'Discord chat ACK completed',
       ),
     () =>
       logger.warn(
-        { id: interaction.id, ackNetworkMs: Date.now() - startedAt },
+        { id: interaction.id, ackElapsedMs: Math.round(performance.now() - startedAt) },
         'Discord chat ACK failed',
       ),
   );
@@ -40,21 +41,22 @@ export async function respondToAutocomplete(
   interaction: AutocompleteInteraction,
   choices: Parameters<AutocompleteInteraction['respond']>[0],
 ): Promise<void> {
-  const startedAt = Date.now();
+  const wallStartedAt = Date.now();
+  const startedAt = performance.now();
   const pending = interaction.respond(choices);
   logger.info(
-    { id: interaction.id, ageAtAckStartMs: ageOf(interaction, startedAt) },
+    { id: interaction.id, ageAtAckStartMs: ageOf(interaction, wallStartedAt) },
     'Discord autocomplete ACK started',
   );
   try {
     await pending;
     logger.info(
-      { id: interaction.id, ackNetworkMs: Date.now() - startedAt },
+      { id: interaction.id, ackElapsedMs: Math.round(performance.now() - startedAt) },
       'Discord autocomplete ACK completed',
     );
   } catch (error) {
     logger.warn(
-      { id: interaction.id, ackNetworkMs: Date.now() - startedAt },
+      { id: interaction.id, ackElapsedMs: Math.round(performance.now() - startedAt) },
       'Discord autocomplete ACK failed',
     );
     throw error;
