@@ -52,7 +52,7 @@ import {
   hasCachedModelCatalog,
   isModelCatalogStale,
   isThinkingLevel,
-  listAvailableModels,
+  refreshModelCatalog,
   listSelectableModels,
   resolveModelReference,
   resolveThinkingForModel,
@@ -66,6 +66,7 @@ import {
 } from '../agent/channel-settings.js';
 import { abortChannelTask, isChannelProcessing } from '../agent/queue.js';
 import { rotateChannelSessionDir } from '../session/path.js';
+import { startChatCommandAck, awaitChatCommandAck, replyToChatCommand } from './interaction-ack.js';
 import type { RegisteredChannel } from '../types.js';
 import {
   deleteDiscordWebhook,
@@ -206,15 +207,11 @@ function webhookCommandError(message: string): WebhookCommandError {
 function scheduleCatalogRefresh(cwd: string): void {
   if (catalogRefreshesInFlight.has(cwd)) return;
   catalogRefreshesInFlight.add(cwd);
-  setImmediate(() => {
-    try {
-      listAvailableModels({ forceRefresh: true, cwd });
-    } catch (err: any) {
-      logger.warn({ cwd, err: err.message }, 'Failed to warm model catalog');
-    } finally {
-      catalogRefreshesInFlight.delete(cwd);
-    }
-  });
+  void refreshModelCatalog({ cwd })
+    .catch((err: unknown) => {
+      logger.warn({ cwd, err }, 'Failed to warm model catalog');
+    })
+    .finally(() => catalogRefreshesInFlight.delete(cwd));
 }
 
 export async function handleAutocomplete(interaction: AutocompleteInteraction): Promise<void> {
@@ -255,13 +252,17 @@ export async function handleAutocomplete(interaction: AutocompleteInteraction): 
 export async function handleChatCommand(interaction: ChatInputCommandInteraction): Promise<void> {
   if (interaction.commandName !== 'pi') return;
 
+  startChatCommandAck(interaction);
   const subcommand = interaction.options.getSubcommand();
   const isWebhookCommand = subcommand === 'webhook' || subcommand === 'webhook-clear';
   if (!isWebhookCommand) {
     await executeChatCommand(interaction, subcommand, false);
     return;
   }
-  if (!acceptingWebhookLifecycles) return;
+  if (!acceptingWebhookLifecycles) {
+    await replyToChatCommand(interaction, 'Gateway is shutting down. Please retry shortly.');
+    return;
+  }
 
   const operation = executeChatCommand(interaction, subcommand, true);
   activeWebhookLifecycles.add(operation);
@@ -304,7 +305,7 @@ async function executeChatCommand(
         await handleWebhookClear(interaction);
         return;
       default:
-        await interaction.reply(reply(`Unknown subcommand: ${subcommand}`, interaction));
+        await replyToChatCommand(interaction, `Unknown subcommand: ${subcommand}`);
     }
   } catch (error) {
     // A timed-out lifecycle continuation must not use the closed Discord client
@@ -335,31 +336,35 @@ async function executeChatCommand(
         ? error.message
         : 'Webhook command failed safely. Run /pi webhook-clear to inspect or retry cleanup.'
       : 'Command failed. Check the gateway logs and try again.';
-    const payload = reply(`⚠️ ${publicMessage}`, interaction);
+    // When the initial Discord ACK itself failed, the interaction token is no
+    // longer safe to use for a second response. The error was logged above.
+    try {
+      await awaitChatCommandAck(interaction);
+    } catch {
+      return;
+    }
+    const content = `⚠️ ${publicMessage}`;
     if (interaction.replied) {
-      await interaction.followUp(payload);
-    } else if (interaction.deferred) {
-      await interaction.editReply({ content: payload.content });
+      await interaction.followUp(reply(content, interaction));
     } else {
-      await interaction.reply(payload);
+      await replyToChatCommand(interaction, content);
     }
   }
 }
 
 async function handleNew(interaction: ChatInputCommandInteraction): Promise<void> {
+  await awaitChatCommandAck(interaction);
   const channel = ensureManagedChannel(interaction);
   if (!channel) {
-    await interaction.reply(reply(notRegisteredMessage(), interaction));
+    await interaction.editReply({ content: notRegisteredMessage() });
     return;
   }
 
   if (isChannelProcessing(channel.jid)) {
-    await interaction.reply(
-      reply(
+    await interaction.editReply({
+      content:
         'This channel has an active task or retained Pi connection. Use /stop and wait for it to close before /new.',
-        interaction,
-      ),
-    );
+    });
     return;
   }
 
@@ -379,17 +384,16 @@ async function handleNew(interaction: ChatInputCommandInteraction): Promise<void
     notes.push('Archived the previous session on disk.');
   }
 
-  await interaction.reply(reply(notes.join('\n'), interaction));
+  await interaction.editReply({ content: notes.join('\n') });
 }
 
 async function handleStop(interaction: ChatInputCommandInteraction): Promise<void> {
+  await awaitChatCommandAck(interaction);
   const jid = `dc:${interaction.channelId}`;
   const result = abortChannelTask(jid);
 
   if (!result.aborted && result.cleared === 0) {
-    await interaction.reply(
-      reply('No active task or queued messages in this channel.', interaction),
-    );
+    await interaction.editReply({ content: 'No active task or queued messages in this channel.' });
     return;
   }
 
@@ -403,23 +407,24 @@ async function handleStop(interaction: ChatInputCommandInteraction): Promise<voi
     );
   }
 
-  await interaction.reply(reply(notes.join(' '), interaction));
+  await interaction.editReply({ content: notes.join(' ') });
 }
 
 async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promise<void> {
   const channel = ensureManagedChannel(interaction);
   if (!channel) {
-    await interaction.reply(reply(notRegisteredMessage(), interaction));
+    await replyToChatCommand(interaction, notRegisteredMessage());
     return;
   }
   if (!interaction.inGuild() || !interaction.guildId) {
-    await interaction.reply(
-      reply('Monitoring webhooks can only be configured in a server.', interaction),
+    await replyToChatCommand(
+      interaction,
+      'Monitoring webhooks can only be configured in a server.',
     );
     return;
   }
   if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageWebhooks)) {
-    await interaction.reply(reply('Manage Webhooks permission is required.', interaction));
+    await replyToChatCommand(interaction, 'Manage Webhooks permission is required.');
     return;
   }
 
@@ -436,9 +441,7 @@ async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promi
       destination.type !== ChannelType.GuildAnnouncement) ||
     !('createWebhook' in destination)
   ) {
-    await interaction.reply(
-      reply('Choose a text or announcement channel in this server.', interaction),
-    );
+    await replyToChatCommand(interaction, 'Choose a text or announcement channel in this server.');
     return;
   }
 
@@ -448,11 +451,9 @@ async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promi
     !callerPermissions?.has(PermissionFlagsBits.ViewChannel) ||
     !callerPermissions.has(PermissionFlagsBits.ManageWebhooks)
   ) {
-    await interaction.reply(
-      reply(
-        'You need View Channel and Manage Webhooks in the monitoring destination.',
-        interaction,
-      ),
+    await replyToChatCommand(
+      interaction,
+      'You need View Channel and Manage Webhooks in the monitoring destination.',
     );
     return;
   }
@@ -462,11 +463,9 @@ async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promi
     !botPermissions?.has(PermissionFlagsBits.ViewChannel) ||
     !botPermissions.has(PermissionFlagsBits.ManageWebhooks)
   ) {
-    await interaction.reply(
-      reply(
-        'The bot needs View Channel and Manage Webhooks in the monitoring destination.',
-        interaction,
-      ),
+    await replyToChatCommand(
+      interaction,
+      'The bot needs View Channel and Manage Webhooks in the monitoring destination.',
     );
     return;
   }
@@ -493,7 +492,7 @@ async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promi
   }
 
   try {
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    await awaitChatCommandAck(interaction);
   } catch {
     // No Discord create request has been issued, so this lease is safe to
     // cancel. cancelChannelWebhookProvisioning refuses reconciled tombstones.
@@ -658,13 +657,14 @@ async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promi
 
 async function handleWebhookClear(interaction: ChatInputCommandInteraction): Promise<void> {
   if (!interaction.inGuild()) {
-    await interaction.reply(
-      reply('Monitoring webhooks can only be configured in a server.', interaction),
+    await replyToChatCommand(
+      interaction,
+      'Monitoring webhooks can only be configured in a server.',
     );
     return;
   }
   if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageWebhooks)) {
-    await interaction.reply(reply('Manage Webhooks permission is required.', interaction));
+    await replyToChatCommand(interaction, 'Manage Webhooks permission is required.');
     return;
   }
 
@@ -675,17 +675,17 @@ async function handleWebhookClear(interaction: ChatInputCommandInteraction): Pro
     Boolean(getChannelWebhookProvisioning(channelJid)) ||
     getPendingWebhookCleanup(channelJid).length > 0;
   if (!channel && !hasWebhookLifecycle) {
-    await interaction.reply(reply(notRegisteredMessage(), interaction));
+    await replyToChatCommand(interaction, notRegisteredMessage());
     return;
   }
 
-  // This durable transition deliberately happens before defer/network awaits
-  // and outside the process-local setup lock. It disables routing immediately
+  // This durable transition deliberately happens before awaiting the already
+  // started ACK and outside the process-local setup lock. It disables routing immediately
   // and prevents even a fresh or hung creator from activating later.
   const clearStart = beginChannelWebhookClear(channelJid);
   discardWebhookTrace(channelJid);
 
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  await awaitChatCommandAck(interaction);
   if (!canMutateWebhookDb()) return;
   const pendingBefore = getPendingWebhookCleanup(channelJid);
 
@@ -960,15 +960,12 @@ function escapeDiscordMarkdown(text: string): string {
 }
 
 async function handleStatus(interaction: ChatInputCommandInteraction): Promise<void> {
+  await awaitChatCommandAck(interaction);
   const channel = ensureManagedChannel(interaction);
   if (!channel) {
-    await interaction.reply(reply(notRegisteredMessage(), interaction));
+    await replyToChatCommand(interaction, notRegisteredMessage());
     return;
   }
-
-  await interaction.deferReply(
-    interaction.inGuild() ? { flags: MessageFlags.Ephemeral } : undefined,
-  );
 
   const effective = computeEffectiveChannelSettings(channel);
   const sessionStatus = await getChannelSessionStatus(channel.folder, effective.effectiveCwd);
@@ -978,19 +975,18 @@ async function handleStatus(interaction: ChatInputCommandInteraction): Promise<v
 }
 
 async function handleModelSet(interaction: ChatInputCommandInteraction): Promise<void> {
+  await awaitChatCommandAck(interaction);
   const channel = ensureManagedChannel(interaction);
   if (!channel) {
-    await interaction.reply(reply(notRegisteredMessage(), interaction));
+    await replyToChatCommand(interaction, notRegisteredMessage());
     return;
   }
 
-  await interaction.deferReply(
-    interaction.inGuild() ? { flags: MessageFlags.Ephemeral } : undefined,
-  );
-
   const selectedRef = interaction.options.getString('model', true);
   const cwd = channel.cwdOverride || config.piCwd;
-  const models = await listSelectableModels({ forceRefresh: true, cwd });
+  // Confirm the candidate against Pi's current catalog before persisting it.
+  // Discovery is asynchronous; the shared Discord ACK has already started.
+  const models = await listSelectableModels({ forceRefresh: true, requireSuccess: true, cwd });
   const selectedModel = resolveModelReference(selectedRef, models);
   if (!selectedModel) {
     await interaction.editReply({ content: `Model is no longer available: ${selectedRef}` });
@@ -1024,20 +1020,28 @@ async function handleModelSet(interaction: ChatInputCommandInteraction): Promise
 }
 
 async function handleModelReset(interaction: ChatInputCommandInteraction): Promise<void> {
+  await awaitChatCommandAck(interaction);
   const channel = ensureManagedChannel(interaction);
   if (!channel) {
-    await interaction.reply(reply(notRegisteredMessage(), interaction));
+    await replyToChatCommand(interaction, notRegisteredMessage());
     return;
   }
 
-  await interaction.deferReply(
-    interaction.inGuild() ? { flags: MessageFlags.Ephemeral } : undefined,
-  );
+  if (config.piModel) {
+    const cwd = channel.cwdOverride || config.piCwd;
+    const models = await refreshModelCatalog({ forceRefresh: true, requireSuccess: true, cwd });
+    if (!resolveModelReference(config.piModel, models)) {
+      await interaction.editReply({
+        content: 'Cannot verify the default model; reset was not saved.',
+      });
+      return;
+    }
+  }
 
   clearChannelModelOverride(channel.jid);
 
   const updated = getChannel(channel.jid)!;
-  const effective = computeEffectiveChannelSettings(updated, { forceRefresh: true });
+  const effective = computeEffectiveChannelSettings(updated);
   const notes = ['Model reset for this channel.'];
 
   if (updated.thinkingOverride && effective.thinkingAdjusted) {
@@ -1057,23 +1061,31 @@ async function handleModelReset(interaction: ChatInputCommandInteraction): Promi
 }
 
 async function handleThinkingSet(interaction: ChatInputCommandInteraction): Promise<void> {
+  await awaitChatCommandAck(interaction);
   const channel = ensureManagedChannel(interaction);
   if (!channel) {
-    await interaction.reply(reply(notRegisteredMessage(), interaction));
+    await replyToChatCommand(interaction, notRegisteredMessage());
     return;
   }
 
   const rawLevel = interaction.options.getString('level', true);
   if (!isThinkingLevel(rawLevel)) {
-    await interaction.reply(reply(`Invalid thinking level: ${rawLevel}`, interaction));
+    await replyToChatCommand(interaction, `Invalid thinking level: ${rawLevel}`);
     return;
   }
 
-  await interaction.deferReply(
-    interaction.inGuild() ? { flags: MessageFlags.Ephemeral } : undefined,
-  );
-
-  const effective = computeEffectiveChannelSettings(channel, { forceRefresh: true });
+  const modelRef = channel.modelOverride || config.piModel;
+  if (modelRef) {
+    const cwd = channel.cwdOverride || config.piCwd;
+    const models = await refreshModelCatalog({ forceRefresh: true, requireSuccess: true, cwd });
+    if (!resolveModelReference(modelRef, models)) {
+      await interaction.editReply({
+        content: 'Cannot verify the current model; thinking was not saved.',
+      });
+      return;
+    }
+  }
+  const effective = computeEffectiveChannelSettings(channel);
   const resolution = resolveThinkingForModel(effective.modelInfo, rawLevel);
 
   setChannelThinkingOverride(channel.jid, resolution.effective);

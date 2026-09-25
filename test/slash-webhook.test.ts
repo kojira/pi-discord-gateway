@@ -387,6 +387,8 @@ describe('webhook slash commands', () => {
         }),
       },
       reply,
+      deferReply: vi.fn().mockResolvedValue(undefined),
+      editReply: reply,
       replied: false,
       deferred: false,
     };
@@ -1100,7 +1102,7 @@ describe('webhook slash commands', () => {
     expect(isDefinitiveWebhookCreateRejection(new Error('socket timeout'))).toBe(false);
   });
 
-  it('leases before defer so clear tombstones a blocked setup before webhook creation', async () => {
+  it('starts ACK then leases before awaiting it so clear tombstones a blocked setup', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'piscord-slash-webhook-defer-race-'));
     tempDirs.push(tempDir);
     process.env.DB_PATH = join(tempDir, 'gateway.db');
@@ -1279,9 +1281,9 @@ describe('webhook slash commands', () => {
 
       expect(createWebhook).not.toHaveBeenCalled();
       expect(db.getChannelWebhookProvisioning('dc:source')).toBeUndefined();
-      expect(reply).toHaveBeenCalledWith(
-        expect.objectContaining({ content: expect.stringContaining('did not acknowledge') }),
-      );
+      // The initial ACK failed: the interaction token is not retried with a
+      // competing reply, but the unissued lease is safely cancelled.
+      expect(reply).not.toHaveBeenCalled();
     } finally {
       db.closeDb();
     }
@@ -1852,6 +1854,8 @@ describe('webhook slash commands', () => {
         inGuild: () => true,
         options: { getSubcommand: () => 'webhook' },
         reply,
+        deferReply: vi.fn().mockResolvedValue(undefined),
+        editReply: reply,
         replied: false,
         deferred: false,
       } as any);

@@ -462,6 +462,9 @@ process.stdin.on('data', (chunk) => {
     if (command.type === 'prompt') {
       send({ type: 'response', id: command.id, command: 'prompt', success: true });
       send({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'ready' }], stopReason: 'stop' } });
+      // A real Pi settles even if no steer is sent. Keep this fake from
+      // hanging forever when delivery scheduling is delayed under CI load.
+      setTimeout(() => send({ type: 'agent_settled' }), 100);
     } else if (command.type === 'steer') {
       send({ type: 'agent_settled' });
       send({ type: 'response', id: command.id, command: 'steer', success: true });

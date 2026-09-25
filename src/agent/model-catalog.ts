@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 import { SettingsManager } from '@earendil-works/pi-coding-agent';
 import { minimatch } from 'minimatch';
 import { config } from '../config.js';
@@ -27,19 +27,44 @@ interface ModelCache {
 }
 
 const cacheByCwd = new Map<string, ModelCache>();
+const refreshesByCwd = new Map<string, Promise<ModelCache>>();
+const lastFailedRefreshByCwd = new Map<string, number>();
+const FAILED_REFRESH_RETRY_MS = 1_000;
 
 export interface ModelListOptions {
   forceRefresh?: boolean;
   allowStale?: boolean;
   cwd?: string;
+  /** Fail a model mutation instead of trusting a stale catalog after CLI failure. */
+  requireSuccess?: boolean;
 }
 
 export function listAvailableModels(options?: ModelListOptions): AvailableModelInfo[] {
-  return loadModelCatalog(
+  const cwd = options?.cwd ?? process.cwd();
+  // Explicit synchronous refresh is reserved for CLI setup and pre-connect startup.
+  // A live message/status request must never synchronously start a pi subprocess.
+  if (options?.forceRefresh) return loadModelCatalog(true, cwd, false).models;
+  const cached = cacheByCwd.get(cwd);
+  if (!cached || (!options?.allowStale && isModelCatalogStale(cwd))) {
+    void refreshModelCatalog({ cwd }).catch(() => {});
+  }
+  return cached?.models ?? [];
+}
+
+/** Non-blocking discovery for every live Discord request, with one refresh per cwd. */
+export async function refreshModelCatalog(
+  options?: ModelListOptions,
+): Promise<AvailableModelInfo[]> {
+  const cwd = options?.cwd ?? process.cwd();
+  const catalog = await loadModelCatalogAsync(
     options?.forceRefresh ?? false,
-    options?.cwd ?? process.cwd(),
+    cwd,
     options?.allowStale ?? false,
-  ).models;
+  );
+  if (options?.requireSuccess && lastFailedRefreshByCwd.has(cwd)) {
+    throw new Error('Could not verify available models with pi');
+  }
+  return catalog.models;
 }
 
 export function hasCachedModelCatalog(cwd: string): boolean {
@@ -59,11 +84,14 @@ export async function listSelectableModels(
   options?: ModelListOptions,
 ): Promise<AvailableModelInfo[]> {
   const cwd = options?.cwd ?? process.cwd();
-  const catalog = loadModelCatalog(
+  const catalog = await loadModelCatalogAsync(
     options?.forceRefresh ?? false,
     cwd,
     options?.allowStale ?? false,
   );
+  if (options?.requireSuccess && lastFailedRefreshByCwd.has(cwd)) {
+    throw new Error('Could not verify available models with pi');
+  }
   const settingsManager = SettingsManager.create(cwd);
   const patterns = settingsManager.getEnabledModels();
 
@@ -309,16 +337,76 @@ function loadModelCatalog(forceRefresh: boolean, cwd: string, allowStale: boolea
   return refreshed;
 }
 
-function listModelsFromPiCli(piBin: string, cwd: string): AvailableModelInfo[] | undefined {
+function modelListCommand(piBin: string): { bin: string; args: string[] } {
   const cliArgs = ['--list-models'];
-
   // Match the agent invocation so models registered by PI_EXTRA_FLAGS
   // extensions are discovered too.
-  if (config.piExtraFlags) {
-    cliArgs.push(...config.piExtraFlags.split(/\s+/).filter(Boolean));
+  if (config.piExtraFlags) cliArgs.push(...config.piExtraFlags.split(/\s+/).filter(Boolean));
+  return resolvePiSpawn(piBin, cliArgs);
+}
+
+async function loadModelCatalogAsync(
+  forceRefresh: boolean,
+  cwd: string,
+  allowStale: boolean,
+): Promise<ModelCache> {
+  const cached = cacheByCwd.get(cwd);
+  if (!forceRefresh && cached && (allowStale || !isModelCatalogStale(cwd))) return cached;
+  const inflight = refreshesByCwd.get(cwd);
+  if (inflight) return inflight;
+  if (
+    !forceRefresh &&
+    Date.now() - (lastFailedRefreshByCwd.get(cwd) ?? 0) < FAILED_REFRESH_RETRY_MS
+  ) {
+    return cached ?? { cwd, loadedAt: 0, models: [] };
   }
 
-  const { bin, args } = resolvePiSpawn(piBin, cliArgs);
+  const refresh = (async (): Promise<ModelCache> => {
+    const models = await listModelsFromPiCliAsync(config.piBin, cwd);
+    if (!models) {
+      lastFailedRefreshByCwd.set(cwd, Date.now());
+      return cacheByCwd.get(cwd) ?? { cwd, loadedAt: 0, models: [] };
+    }
+    const updated = {
+      cwd,
+      loadedAt: Date.now(),
+      models: models.sort((a, b) => a.ref.localeCompare(b.ref)),
+    };
+    cacheByCwd.set(cwd, updated);
+    lastFailedRefreshByCwd.delete(cwd);
+    return updated;
+  })();
+  refreshesByCwd.set(cwd, refresh);
+  try {
+    return await refresh;
+  } finally {
+    if (refreshesByCwd.get(cwd) === refresh) refreshesByCwd.delete(cwd);
+  }
+}
+
+function listModelsFromPiCliAsync(
+  piBin: string,
+  cwd: string,
+): Promise<AvailableModelInfo[] | undefined> {
+  const { bin, args } = modelListCommand(piBin);
+  return new Promise((resolve) => {
+    execFile(
+      bin,
+      args,
+      {
+        cwd,
+        env: process.env,
+        encoding: 'utf8',
+        maxBuffer: 10 * 1024 * 1024,
+        timeout: LIST_MODELS_TIMEOUT_MS,
+      },
+      (error, stdout) => resolve(error || !stdout ? undefined : parsePiModelList(stdout)),
+    );
+  });
+}
+
+function listModelsFromPiCli(piBin: string, cwd: string): AvailableModelInfo[] | undefined {
+  const { bin, args } = modelListCommand(piBin);
   const result = spawnSync(bin, args, {
     cwd,
     env: process.env,

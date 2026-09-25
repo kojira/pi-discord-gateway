@@ -3,16 +3,21 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   autocompleteModels,
   isModelCatalogStale,
+  listAvailableModels,
   listSelectableModels,
   parsePiModelList,
 } from '../src/agent/model-catalog.js';
 import { config } from '../src/config.js';
 
-const { spawnSyncMock } = vi.hoisted(() => ({ spawnSyncMock: vi.fn() }));
+const { spawnSyncMock, execFileMock } = vi.hoisted(() => ({
+  spawnSyncMock: vi.fn(),
+  execFileMock: vi.fn(),
+}));
 
 vi.mock('node:child_process', async (importOriginal) => ({
   ...(await importOriginal<typeof import('node:child_process')>()),
   spawnSync: spawnSyncMock,
+  execFile: execFileMock,
 }));
 
 const defaultCliOutput = `provider  model  context  max-out  thinking  images
@@ -22,13 +27,16 @@ test     beta   128K     16K      yes       no
 `;
 
 function mockPiCatalog(enabledModels?: string[], cliOutput = defaultCliOutput): void {
-  spawnSyncMock.mockReturnValue({ status: 0, stdout: cliOutput, stderr: '' });
+  execFileMock.mockImplementation((_bin, _args, _options, callback) =>
+    callback(null, cliOutput, ''),
+  );
   vi.spyOn(SettingsManager, 'create').mockReturnValue(SettingsManager.inMemory({ enabledModels }));
 }
 
 afterEach(() => {
   vi.restoreAllMocks();
   spawnSyncMock.mockReset();
+  execFileMock.mockReset();
 });
 
 describe('listSelectableModels', () => {
@@ -70,9 +78,11 @@ describe('listSelectableModels', () => {
 
   it('returns an empty catalog when pi --list-models fails', async () => {
     mockPiCatalog(['test/beta']);
-    spawnSyncMock.mockReturnValue({ status: 1, stdout: '', stderr: 'failed' });
+    execFileMock.mockImplementation((_bin, _args, _options, callback) =>
+      callback(new Error('failed'), '', 'failed'),
+    );
 
-    const result = await listSelectableModels({ forceRefresh: true });
+    const result = await listSelectableModels({ forceRefresh: true, cwd: '/tmp/cold-cli-failure' });
 
     expect(result).toEqual([]);
   });
@@ -87,14 +97,11 @@ describe('listSelectableModels', () => {
 
   it('returns an empty catalog when pi --list-models errors out', async () => {
     mockPiCatalog(['test/beta']);
-    spawnSyncMock.mockReturnValue({
-      error: new Error('spawnSync pi ETIMEDOUT'),
-      status: null,
-      stdout: '',
-      stderr: '',
-    });
+    execFileMock.mockImplementation((_bin, _args, _options, callback) =>
+      callback(new Error('execFile pi ETIMEDOUT'), '', ''),
+    );
 
-    const result = await listSelectableModels({ forceRefresh: true });
+    const result = await listSelectableModels({ forceRefresh: true, cwd: '/tmp/cold-cli-error' });
 
     expect(result).toEqual([]);
   });
@@ -104,10 +111,11 @@ describe('listSelectableModels', () => {
 
     await listSelectableModels({ forceRefresh: true });
 
-    expect(spawnSyncMock).toHaveBeenCalledWith(
+    expect(execFileMock).toHaveBeenCalledWith(
       expect.anything(),
       expect.anything(),
       expect.objectContaining({ timeout: expect.any(Number) }),
+      expect.any(Function),
     );
   });
 
@@ -123,10 +131,11 @@ describe('listSelectableModels', () => {
       mutableConfig.piExtraFlags = previousFlags;
     }
 
-    expect(spawnSyncMock).toHaveBeenCalledWith(
+    expect(execFileMock).toHaveBeenCalledWith(
       expect.anything(),
       ['--list-models', '-e', './provider.ts', '--approve'],
       expect.anything(),
+      expect.any(Function),
     );
   });
 });
@@ -150,6 +159,47 @@ describe('autocompleteModels', () => {
 
     expect(result.map((model) => model.ref)).toContain('openai-codex/gpt-6-luna');
     expect(result.map((model) => model.ref)).toContain('openai-codex/gpt-6-sol');
+  });
+});
+
+describe('non-blocking live discovery', () => {
+  it('keeps the event loop available while a CLI lookup is pending', async () => {
+    mockPiCatalog();
+    execFileMock.mockImplementation((_bin, _args, _options, callback) => {
+      setTimeout(() => callback(null, defaultCliOutput, ''), 80);
+    });
+    const pending = listSelectableModels({ forceRefresh: true, cwd: '/tmp/slow-live-catalog' });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(execFileMock).toHaveBeenCalledTimes(1);
+    expect(spawnSyncMock).not.toHaveBeenCalled();
+    expect((await pending).length).toBe(3);
+  });
+
+  it('uses a fresh warmed catalog without spawning another CLI process', async () => {
+    mockPiCatalog();
+    const cwd = '/tmp/warm-model-selection';
+    await listSelectableModels({ forceRefresh: true, cwd });
+    execFileMock.mockClear();
+    expect((await listSelectableModels({ cwd })).length).toBe(3);
+    expect(listAvailableModels({ cwd }).length).toBe(3);
+    expect(execFileMock).not.toHaveBeenCalled();
+    expect(spawnSyncMock).not.toHaveBeenCalled();
+  });
+
+  it('coalesces refreshes and preserves a valid catalog on lookup failure', async () => {
+    mockPiCatalog();
+    const cwd = '/tmp/refresh-coalescing';
+    expect((await listSelectableModels({ forceRefresh: true, cwd })).length).toBe(3);
+    execFileMock.mockClear();
+    execFileMock.mockImplementation((_bin, _args, _options, callback) => {
+      setTimeout(() => callback(new Error('timeout'), '', ''), 30);
+    });
+    const first = listSelectableModels({ forceRefresh: true, cwd });
+    const second = listSelectableModels({ forceRefresh: true, cwd });
+    expect((await Promise.all([first, second])).map((models) => models.length)).toEqual([3, 3]);
+    expect(execFileMock).toHaveBeenCalledTimes(1);
+    expect(listAvailableModels({ cwd }).length).toBe(3);
+    expect(spawnSyncMock).not.toHaveBeenCalled();
   });
 });
 
