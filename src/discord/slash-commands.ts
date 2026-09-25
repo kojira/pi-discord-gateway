@@ -66,7 +66,12 @@ import {
 } from '../agent/channel-settings.js';
 import { abortChannelTask, isChannelProcessing } from '../agent/queue.js';
 import { rotateChannelSessionDir } from '../session/path.js';
-import { startChatCommandAck, awaitChatCommandAck, replyToChatCommand } from './interaction-ack.js';
+import {
+  startChatCommandAck,
+  awaitChatCommandAck,
+  replyToChatCommand,
+  respondToAutocomplete,
+} from './interaction-ack.js';
 import type { RegisteredChannel } from '../types.js';
 import {
   deleteDiscordWebhook,
@@ -221,13 +226,13 @@ export async function handleAutocomplete(interaction: AutocompleteInteraction): 
 
   const channel = getChannel(`dc:${interaction.channelId}`);
   if (!channel) {
-    await interaction.respond([]);
+    await respondToAutocomplete(interaction, []);
     return;
   }
 
   const cwd = channel.cwdOverride || config.piCwd;
   if (!hasCachedModelCatalog(cwd)) {
-    await interaction.respond([]);
+    await respondToAutocomplete(interaction, []);
     scheduleCatalogRefresh(cwd);
     return;
   }
@@ -239,7 +244,7 @@ export async function handleAutocomplete(interaction: AutocompleteInteraction): 
     value: model.ref,
   }));
 
-  await interaction.respond(matches);
+  await respondToAutocomplete(interaction, matches);
 
   // Serve stale results within Discord's deadline, but refresh expired
   // catalogs in the background so autocomplete-only users still pick up
@@ -315,6 +320,7 @@ async function executeChatCommand(
     if (isWebhookCommand) {
       logger.error(
         {
+          id: interaction.id,
           command: interaction.commandName,
           subcommand,
           ...safeDiscordErrorMetadata(error),
@@ -324,6 +330,7 @@ async function executeChatCommand(
     } else {
       logger.error(
         {
+          id: interaction.id,
           command: interaction.commandName,
           subcommand,
           ...safeDiscordErrorMetadata(error),

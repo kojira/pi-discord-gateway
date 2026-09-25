@@ -37,6 +37,7 @@ import { safeDiscordErrorMetadata } from './webhook-monitor.js';
 let client: Client | null = null;
 let triggerPattern: RegExp;
 let botId: string;
+let eventLoopProbe: NodeJS.Timeout | undefined;
 
 export async function startDiscord(): Promise<void> {
   client = new Client({
@@ -53,6 +54,18 @@ export async function startDiscord(): Promise<void> {
   client.on(Events.MessageCreate, handleMessage);
   client.on(Events.InteractionCreate, handleInteraction);
   client.on(Events.Error, (err) => logger.error({ err: err.message }, 'Discord client error'));
+  // Only log significant loop stalls; this distinguishes delayed dispatch from
+  // a slow Discord REST acknowledgement without storing interaction contents.
+  if (!eventLoopProbe) {
+    let nextTick = performance.now() + 250;
+    eventLoopProbe = setInterval(() => {
+      const now = performance.now();
+      const lagMs = Math.max(0, now - nextTick);
+      nextTick = now + 250;
+      if (lagMs >= 1000) logger.warn({ lagMs: Math.round(lagMs) }, 'Discord event loop delayed');
+    }, 250);
+    eventLoopProbe.unref();
+  }
 
   return new Promise<void>((resolve, reject) => {
     const onReady = async (ready: Client<true>) => {
@@ -87,6 +100,17 @@ export async function startDiscord(): Promise<void> {
 }
 
 export async function handleInteraction(interaction: Interaction): Promise<void> {
+  if (interaction.isAutocomplete() || interaction.isChatInputCommand()) {
+    const created = interaction.createdTimestamp;
+    logger.info(
+      {
+        id: interaction.id,
+        kind: interaction.isAutocomplete() ? 'autocomplete' : 'chat',
+        ageAtIngressMs: Number.isFinite(created) ? Math.max(0, Date.now() - created) : null,
+      },
+      'Discord interaction received',
+    );
+  }
   try {
     if (interaction.isButton() && interaction.customId.startsWith(SUPERVISOR_BUTTON_PREFIX)) {
       await handleSupervisorButton(interaction);
@@ -364,6 +388,10 @@ function abortError(): Error {
 }
 
 export function stopDiscord(): void {
+  if (eventLoopProbe) {
+    clearInterval(eventLoopProbe);
+    eventLoopProbe = undefined;
+  }
   if (client) {
     client.destroy();
     client = null;
