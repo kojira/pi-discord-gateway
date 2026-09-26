@@ -201,6 +201,40 @@ describe('non-blocking live discovery', () => {
     expect(listAvailableModels({ cwd }).length).toBe(3);
     expect(spawnSyncMock).not.toHaveBeenCalled();
   });
+
+  it('serves stale autocomplete choices immediately and refreshes once in the background', async () => {
+    vi.useFakeTimers();
+    try {
+      mockPiCatalog();
+      const cwd = '/tmp/autocomplete-stale-refresh';
+      await listSelectableModels({ forceRefresh: true, cwd });
+      execFileMock.mockClear();
+      let finishRefresh: (() => void) | undefined;
+      execFileMock.mockImplementation((_bin, _args, _options, callback) => {
+        finishRefresh = () =>
+          callback(null, `${defaultCliOutput}test delta 256K 32K yes yes\n`, '');
+      });
+      vi.advanceTimersByTime(31_000);
+
+      const first = await autocompleteModels('delta', 25, { allowStale: true, cwd });
+      const second = await autocompleteModels('delta', 25, { allowStale: true, cwd });
+      expect(first).toEqual([]);
+      expect(second).toEqual([]);
+      expect(execFileMock).toHaveBeenCalledTimes(1);
+      expect(finishRefresh).toBeDefined();
+
+      finishRefresh!();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(
+        (await autocompleteModels('delta', 25, { allowStale: true, cwd })).map((m) => m.ref),
+      ).toEqual(['test/delta']);
+      expect(execFileMock).toHaveBeenCalledTimes(1);
+      expect(spawnSyncMock).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('isModelCatalogStale', () => {

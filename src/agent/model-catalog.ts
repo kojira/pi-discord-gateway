@@ -351,7 +351,16 @@ async function loadModelCatalogAsync(
   allowStale: boolean,
 ): Promise<ModelCache> {
   const cached = cacheByCwd.get(cwd);
-  if (!forceRefresh && cached && (allowStale || !isModelCatalogStale(cwd))) return cached;
+  if (!forceRefresh && cached && allowStale) {
+    // Keep Discord autocomplete responsive, but do not freeze the catalog forever
+    // after credentials or extensions change. The in-flight map and failure
+    // cooldown below bound repeated refreshes from successive keystrokes.
+    if (isModelCatalogStale(cwd)) {
+      void loadModelCatalogAsync(false, cwd, false).catch(() => {});
+    }
+    return cached;
+  }
+  if (!forceRefresh && cached && !isModelCatalogStale(cwd)) return cached;
   const inflight = refreshesByCwd.get(cwd);
   if (inflight) return inflight;
   if (
