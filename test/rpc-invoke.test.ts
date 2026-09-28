@@ -359,6 +359,26 @@ process.stdin.on('data', (chunk) => {
     },
   );
 
+  it('reports the provider error that caused a work suspension', async () => {
+    const root = makeFakePi(`
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+process.stdin.on('data', (chunk) => {
+  const command = JSON.parse(chunk.toString('utf8').trim());
+  send({ type: 'response', id: command.id, command: 'prompt', success: true });
+  send({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'progress' }], stopReason: 'stop' } });
+  send({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: '400 assistant message prefill unsupported' } });
+  send({ type: 'work_contract', record: { status: 'suspended', reason: 'Agent settled without an explicit finish decision' } });
+  send({ type: 'agent_settled' });
+});
+`);
+    expect(await invokeAgent('ch_contract_cause', 'verify', { cwd: root })).toEqual({
+      ok: false,
+      text: '',
+      error:
+        '400 assistant message prefill unsupported (Agent settled without an explicit finish decision)',
+    });
+  });
+
   it('supports pre-agent_settled Pi versions that terminate with agent_end', async () => {
     const root = makeFakePi(`
 const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');

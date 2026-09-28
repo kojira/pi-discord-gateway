@@ -599,8 +599,12 @@ export async function invokeAgent(
           lastAssistantFailed = false;
           lastAssistantError = '';
         } else if (record?.status === 'suspended') {
+          const reason = typeof record.reason === 'string' ? record.reason : 'Work suspended';
+          // A suspension right after a failed provider turn is only the consequence;
+          // keep the underlying provider error visible instead of the generic reason.
+          const cause = lastAssistantFailed && lastAssistantError ? lastAssistantError : '';
           lastAssistantFailed = true;
-          lastAssistantError = typeof record.reason === 'string' ? record.reason : 'Work suspended';
+          lastAssistantError = cause && cause !== reason ? `${cause} (${reason})` : reason;
         }
         return;
       }
