@@ -220,6 +220,8 @@ export async function invokeAgent(
     let intermediateTextDelivered = false;
     let workOutcome: AgentResult['workOutcome'];
     let lastAssistantError = '';
+    // Error text of the latest assistant turn only, used as the cause of a later suspension.
+    let lastProviderError = '';
     let lastAssistantFailed = false;
     let settled = false;
     let finished = false;
@@ -369,6 +371,7 @@ export async function invokeAgent(
       intermediateTextDelivered = false;
       workOutcome = undefined;
       lastAssistantError = '';
+      lastProviderError = '';
       lastAssistantFailed = false;
     };
 
@@ -569,6 +572,7 @@ export async function invokeAgent(
         lastAssistantError = lastAssistantFailed
           ? message.message.errorMessage || 'Pi assistant message ended with an error'
           : '';
+        lastProviderError = lastAssistantError;
         if (text && (!persistent || !intermediateTextDelivered)) {
           lastAssistantText = text;
           intermediateTextDelivered = true;
@@ -593,16 +597,18 @@ export async function invokeAgent(
           lastAssistantText = record.decision.summary;
           lastAssistantFailed = false;
           lastAssistantError = '';
+          lastProviderError = '';
         } else if (record?.status === 'awaiting_input' && typeof record.question === 'string') {
           workOutcome = undefined;
           lastAssistantText = record.question;
           lastAssistantFailed = false;
           lastAssistantError = '';
+          lastProviderError = '';
         } else if (record?.status === 'suspended') {
           const reason = typeof record.reason === 'string' ? record.reason : 'Work suspended';
           // A suspension right after a failed provider turn is only the consequence;
           // keep the underlying provider error visible instead of the generic reason.
-          const cause = lastAssistantFailed && lastAssistantError ? lastAssistantError : '';
+          const cause = lastProviderError;
           lastAssistantFailed = true;
           lastAssistantError = cause && cause !== reason ? `${cause} (${reason})` : reason;
         }

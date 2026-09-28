@@ -379,6 +379,26 @@ process.stdin.on('data', (chunk) => {
     });
   });
 
+  it('does not attribute a suspension to an error that a later turn recovered from', async () => {
+    const root = makeFakePi(`
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+process.stdin.on('data', (chunk) => {
+  const command = JSON.parse(chunk.toString('utf8').trim());
+  send({ type: 'response', id: command.id, command: 'prompt', success: true });
+  send({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: 'overloaded' } });
+  send({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'retried' }], stopReason: 'stop' } });
+  send({ type: 'work_contract', record: { status: 'suspended', reason: 'first' } });
+  send({ type: 'work_contract', record: { status: 'suspended', reason: 'second' } });
+  send({ type: 'agent_settled' });
+});
+`);
+    expect(await invokeAgent('ch_contract_recovered', 'verify', { cwd: root })).toEqual({
+      ok: false,
+      text: '',
+      error: 'second',
+    });
+  });
+
   it('supports pre-agent_settled Pi versions that terminate with agent_end', async () => {
     const root = makeFakePi(`
 const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
