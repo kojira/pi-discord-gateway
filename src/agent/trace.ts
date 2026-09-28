@@ -31,7 +31,12 @@ export function formatAgentTraceEvent(event: any): string | undefined {
     case 'compaction_start':
       return `🗜️ compaction started${event.reason ? ` (${safeTraceLabel(event.reason)})` : ''}`;
     case 'compaction_end':
-      return `🗜️ compaction ${event.aborted ? 'aborted' : event.errorMessage ? 'failed' : 'finished'}`;
+      if (event.aborted) return '🗜️ compaction aborted';
+      if (typeof event.errorMessage === 'string' && event.errorMessage.trim()) {
+        const reason = sanitizeTraceText(event.errorMessage.replace(/[\r\n\t]+/gu, ' '), 300);
+        return `🗜️ compaction failed: ${reason}`;
+      }
+      return '🗜️ compaction finished';
     case 'auto_retry_start':
       return `🔄 retry ${numberLabel(event.attempt)}/${numberLabel(event.maxAttempts)} scheduled`;
     case 'auto_retry_end':

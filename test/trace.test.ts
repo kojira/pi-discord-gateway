@@ -57,6 +57,30 @@ describe('Pi activity trace formatting', () => {
     ).toBeUndefined();
   });
 
+  it('shows the bounded and redacted Pi compaction failure reason without changing other outcomes', () => {
+    expect(formatAgentTraceEvent({ type: 'compaction_start', reason: 'threshold' })).toBe(
+      '🗜️ compaction started (threshold)',
+    );
+    expect(
+      formatAgentTraceEvent({ type: 'compaction_end', aborted: true, errorMessage: 'ignored' }),
+    ).toBe('🗜️ compaction aborted');
+    expect(formatAgentTraceEvent({ type: 'compaction_end', aborted: false, result: {} })).toBe(
+      '🗜️ compaction finished',
+    );
+    const reason = `Summarization failed: context too long\nAuthorization: Bearer ghp_super_secret_token ${'x'.repeat(500)}`;
+    const trace = formatAgentTraceEvent({
+      type: 'compaction_end',
+      aborted: false,
+      errorMessage: reason,
+    });
+    expect(trace).toContain(
+      '🗜️ compaction failed: Summarization failed: context too long Authorization: [REDACTED]',
+    );
+    expect(trace).not.toContain('\n');
+    expect(trace).not.toContain('ghp_super_secret_token');
+    expect(trace!.slice('🗜️ compaction failed: '.length).length).toBeLessThanOrEqual(300);
+  });
+
   it('redacts common credentials from free-form trace text', () => {
     const trace = formatAgentTraceEvent({
       type: 'message_start',
