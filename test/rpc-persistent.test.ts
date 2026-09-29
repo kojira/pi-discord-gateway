@@ -58,6 +58,22 @@ const answer = command => {
   send({type:'message_start',message:{role:'assistant',content:[]}});
   send({type:'message_end',message:{role:'assistant',content:[{type:'toolCall',name:'subagent',arguments:{}}],stopReason:'toolUse'}});
   send({type:'tool_execution_end',toolName:'subagent',isError:false,result:{content:[{type:'text',text:'Async: worker'}],terminate:true,park:true}});
+ } else if(command.message === 'park-completes') {
+  send({type:'tool_execution_end',toolName:'subagent',isError:false,result:{content:[],terminate:true,park:true}});
+  settle();
+  setTimeout(() => {
+   send({type:'agent_start'});
+   send({type:'message_start',message:{role:'assistant',content:[]}});
+   text('async result');
+   send({type:'work_contract',record:{status:'resolved',decision:{outcome:'completed',summary:'async result'}}});
+   settle();
+  }, 100);
+  return;
+ } else if(command.message === 'park-failed-tool') {
+  send({type:'tool_execution_end',toolName:'finish_work',isError:true,result:{content:[],terminate:true,park:true}});
+ } else if(command.message === 'park-suspended') {
+  send({type:'tool_execution_end',toolName:'subagent',isError:false,result:{content:[],terminate:true,park:true}});
+  send({type:'work_contract',record:{status:'suspended',reason:'Agent aborted'}});
  } else if(command.message === 'park-then-reply') {
   send({type:'tool_execution_end',toolName:'subagent',isError:false,result:{content:[],terminate:true,park:true}});
   send({type:'message_start',message:{role:'assistant',content:[]}});
@@ -355,6 +371,42 @@ describe('persistent RPC connection', () => {
     expect(result).toEqual({ ok: true, text: '', parked: true });
     expect(onAssistantMessage).not.toHaveBeenCalled();
     expect(hasResidentAgent('channel')).toBe(true);
+  });
+
+  it('delivers the async completion after a park exactly once through the connection', async () => {
+    const root = fixture();
+    const delivery = sinks();
+    const onAssistantMessage = vi.fn();
+    const result = await invokeAgent('channel', 'park-completes', {
+      cwd: root,
+      onAssistantMessage,
+      connectionDelivery: delivery,
+    });
+    expect(result).toEqual({ ok: true, text: '', parked: true });
+    await vi.waitFor(() =>
+      expect(delivery.onAssistantMessage).toHaveBeenCalledWith(
+        'async result',
+        expect.any(AbortSignal),
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(delivery.onAssistantMessage).toHaveBeenCalledTimes(1);
+    expect(delivery.onError).not.toHaveBeenCalled();
+    expect(onAssistantMessage).not.toHaveBeenCalled();
+  });
+
+  it('does not treat a failed work-decision park or a suspension as a parked wait', async () => {
+    const root = fixture();
+    const failed = await invokeAgent('channel', 'park-failed-tool', {
+      cwd: root,
+      connectionDelivery: sinks(),
+    });
+    expect(failed.ok).toBe(false);
+    const suspended = await invokeAgent('channel', 'park-suspended', {
+      cwd: root,
+      connectionDelivery: sinks(),
+    });
+    expect(suspended).toMatchObject({ ok: false, error: 'Agent aborted' });
   });
 
   it('still reports a missing reply when a later provider turn supersedes the park', async () => {
