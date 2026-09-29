@@ -223,6 +223,9 @@ export async function invokeAgent(
     // Error text of the latest assistant turn only, used as the cause of a later suspension.
     let lastProviderError = '';
     let lastAssistantFailed = false;
+    // Pi parks the parent after a successful async launch; the native completion
+    // notice resumes it later. A parked run is waiting, not a missing reply.
+    let parked = false;
     let settled = false;
     let finished = false;
     let initialPromptObserved = false;
@@ -373,6 +376,7 @@ export async function invokeAgent(
       lastAssistantError = '';
       lastProviderError = '';
       lastAssistantFailed = false;
+      parked = false;
     };
 
     const submitPrompt = async (): Promise<RpcResponse | undefined> => {
@@ -563,6 +567,21 @@ export async function invokeAgent(
         return;
       }
 
+      if (message?.type === 'message_start' && message.message?.role === 'assistant') {
+        parked = false;
+        return;
+      }
+
+      if (
+        message?.type === 'tool_execution_end' &&
+        message.isError !== true &&
+        message.result?.terminate === true &&
+        message.result?.park === true
+      ) {
+        parked = true;
+        return;
+      }
+
       if (message?.type === 'message_end' && message.message?.role === 'assistant') {
         workOutcome = undefined;
         const text = extractAssistantText(message.message.content);
@@ -674,6 +693,9 @@ export async function invokeAgent(
     };
 
     const currentResult = (): AgentResult => {
+      if (!fatalRpcError && !lastAssistantFailed && !lastAssistantText && parked) {
+        return { ok: true, text: '', parked: true };
+      }
       if (fatalRpcError || lastAssistantFailed || !lastAssistantText) {
         return {
           ok: false,

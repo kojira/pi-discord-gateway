@@ -33,4 +33,6 @@ export interface AgentResult {
   text: string;
   error?: string;
   workOutcome?: 'completed' | 'cancelled' | 'waiting' | 'blocked';
+  /** Parent parked after an async launch; completion arrives as a later native notice. */
+  parked?: boolean;
 }

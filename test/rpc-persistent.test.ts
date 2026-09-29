@@ -54,6 +54,14 @@ const answer = command => {
   text('visible once');
   text('hidden repeat');
   text('hidden restatement');
+ } else if(command.message === 'park') {
+  send({type:'message_start',message:{role:'assistant',content:[]}});
+  send({type:'message_end',message:{role:'assistant',content:[{type:'toolCall',name:'subagent',arguments:{}}],stopReason:'toolUse'}});
+  send({type:'tool_execution_end',toolName:'subagent',isError:false,result:{content:[{type:'text',text:'Async: worker'}],terminate:true,park:true}});
+ } else if(command.message === 'park-then-reply') {
+  send({type:'tool_execution_end',toolName:'subagent',isError:false,result:{content:[],terminate:true,park:true}});
+  send({type:'message_start',message:{role:'assistant',content:[]}});
+  send({type:'message_end',message:{role:'assistant',content:[],stopReason:'stop'}});
  } else {
   text(command.message + ':' + process.pid);
  }
@@ -334,6 +342,29 @@ describe('persistent RPC connection', () => {
     });
     expect(result).toEqual({ ok: true, text: 'visible once' });
     expect(onAssistantMessage).toHaveBeenCalledExactlyOnceWith('visible once');
+  });
+
+  it('reports a parent parked after an async launch as waiting, not a missing reply', async () => {
+    const root = fixture();
+    const onAssistantMessage = vi.fn();
+    const result = await invokeAgent('channel', 'park', {
+      cwd: root,
+      onAssistantMessage,
+      connectionDelivery: sinks(),
+    });
+    expect(result).toEqual({ ok: true, text: '', parked: true });
+    expect(onAssistantMessage).not.toHaveBeenCalled();
+    expect(hasResidentAgent('channel')).toBe(true);
+  });
+
+  it('still reports a missing reply when a later provider turn supersedes the park', async () => {
+    const root = fixture();
+    const result = await invokeAgent('channel', 'park-then-reply', {
+      cwd: root,
+      connectionDelivery: sinks(),
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/without producing an assistant text message/);
   });
 
   it('delivers explicit request summaries before resolving while keeping the connection alive', async () => {

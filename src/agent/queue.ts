@@ -573,12 +573,33 @@ async function processMessage(
     if (result.ok) {
       enqueueWebhookTerminal(
         jid,
-        `Final response (${result.workOutcome || 'agent idle'}): ${sanitizeTraceText(result.text, 60_000)}`,
+        result.parked && !result.text
+          ? 'Parent parked: waiting for async completion'
+          : `Final response (${result.workOutcome || 'agent idle'}): ${sanitizeTraceText(result.text, 60_000)}`,
       );
       // Any rows left here were accepted but never observed as user messages.
       // A retained Pi may still consume accepted input: do not replay it.
       // Legacy connections are already closed and retain their requeue policy.
       finalizeSteeringRows(jid, config.piRpcPersistent ? 'failed' : 'pending');
+
+      // A parked parent has no reply yet; the async completion notice resumes it
+      // and its reply is delivered through the retained connection.
+      if (result.parked && !result.text) {
+        if (hadLiveDeliveryFailure) {
+          markMessageFailed(rowid);
+          await sendResponse(
+            jid,
+            '⚠️ One or more intermediate assistant messages could not be delivered.',
+            signal,
+          );
+          if (!taskResourcesAvailable || signal.aborted) return;
+          logger.warn({ jid }, 'Agent parked with missing live Discord messages');
+          return;
+        }
+        markMessageDone(rowid);
+        logger.info({ jid }, 'Message processed: parent parked awaiting async completion');
+        return;
+      }
 
       // Every RPC assistant message is delivered at message_end. Send a fallback
       // only when the callback was never attempted; retrying a partially sent

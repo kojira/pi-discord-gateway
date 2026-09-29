@@ -96,3 +96,53 @@ it('delivers independently after a queue row finishes and shuts down idle reside
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+it('marks a parent parked after an async launch done without an error message', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'piscord-queue-parked-'));
+  const previousEnv = { ...process.env };
+  Object.assign(process.env, {
+    DB_PATH: join(root, 'db'),
+    SESSIONS_DIR: join(root, 'sessions'),
+    PI_RPC_PERSISTENT: 'true',
+    POLL_INTERVAL_MS: '1',
+  });
+  vi.resetModules();
+  mocks.invoke.mockReset().mockResolvedValue({ ok: true, text: '', parked: true });
+  mocks.send.mockClear();
+  const db = await import('../src/db.js');
+  const queue = await import('../src/agent/queue.js');
+  db.initDb();
+  const reader = new Database(join(root, 'db'), { readonly: true });
+  try {
+    db.registerChannel({
+      jid: 'dc:parked',
+      name: 'parked',
+      folder: 'parked',
+      requiresTrigger: false,
+      isMain: false,
+      modelOverride: '',
+      thinkingOverride: '',
+      cwdOverride: '',
+    });
+    db.enqueueMessage({
+      channelJid: 'dc:parked',
+      sender: 'user',
+      senderName: 'User',
+      content: 'launch async work',
+      timestamp: new Date().toISOString(),
+    });
+    queue.startProcessingLoop();
+    await vi.waitFor(() =>
+      expect(reader.prepare('select status from message_queue').get()).toEqual({ status: 'done' }),
+    );
+    expect(mocks.send).not.toHaveBeenCalled();
+  } finally {
+    await queue.stopProcessingLoop();
+    reader.close();
+    db.closeDb();
+    for (const key of Object.keys(process.env)) if (!(key in previousEnv)) delete process.env[key];
+    Object.assign(process.env, previousEnv);
+    vi.resetModules();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
