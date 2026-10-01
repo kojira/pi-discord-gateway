@@ -549,12 +549,54 @@ let buffer = '';
 process.stdin.on('data', (chunk) => {
   buffer += chunk.toString('utf8');
   if (!buffer.includes('\\n')) return;
-  process.stdout.write('x'.repeat(4 * 1024 * 1024 + 1));
+  process.stdout.write('x'.repeat(64 * 1024 * 1024 + 1));
   setInterval(() => {}, 1000);
 });
 `);
 
     const result = await invokeAgent('ch_oversized', 'hello', { cwd: root });
+    expect(result).toEqual({
+      ok: false,
+      text: '',
+      error: 'Pi RPC event exceeded the 4 MiB safety limit',
+    });
+  });
+
+  it('drops inline image payloads from an oversized event instead of failing the run', async () => {
+    const root = makeFakePi(`
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+let buffer = '';
+process.stdin.on('data', (chunk) => {
+  buffer += chunk.toString('utf8');
+  if (!buffer.includes('\\n')) return;
+  const image = { type: 'image', mimeType: 'image/png', data: 'A'.repeat(3 * 1024 * 1024) };
+  send({ type: 'agent_start' });
+  send({ type: 'tool_execution_end', toolName: 'read', isError: false, result: { content: [{ type: 'text', text: 'Read image file' }, image] } });
+  send({ type: 'turn_end', message: { role: 'assistant', content: [] }, toolResults: [{ role: 'toolResult', content: [image] }, { role: 'toolResult', content: [image] }] });
+  send({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'saw the images' }] } });
+  send({ type: 'agent_end', messages: [{ role: 'toolResult', content: [image, image] }] });
+  send({ type: 'agent_settled' });
+});
+`);
+
+    const result = await invokeAgent('ch_images', 'hello', { cwd: root });
+    expect(result).toEqual({ ok: true, text: 'saw the images' });
+  });
+
+  it('still rejects an oversized event that is not inline image data', async () => {
+    const root = makeFakePi(`
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+let buffer = '';
+process.stdin.on('data', (chunk) => {
+  buffer += chunk.toString('utf8');
+  if (!buffer.includes('\\n')) return;
+  send({ type: 'agent_start' });
+  send({ type: 'turn_end', message: { role: 'assistant', content: [{ type: 'text', text: 'x '.repeat(3 * 1024 * 1024) }] } });
+  setInterval(() => {}, 1000);
+});
+`);
+
+    const result = await invokeAgent('ch_text', 'hello', { cwd: root });
     expect(result).toEqual({
       ok: false,
       text: '',
