@@ -98,6 +98,17 @@ export async function shutdownResidentAgents(): Promise<void> {
 const RPC_COMMAND_TIMEOUT_MS = 2 * 60_000;
 const RPC_COMPACTION_TIMEOUT_MS = 10 * 60_000;
 const MAX_RPC_EVENT_BYTES = 4 * 1024 * 1024;
+// Pi events such as tool results and agent_end can embed base64 images that the
+// gateway never reads. Accept such raw lines up to this bound, then drop the
+// inline image payloads before parsing so the 4 MiB limit still applies to the
+// rest of the event.
+const MAX_RPC_RAW_LINE_CHARS = 64 * 1024 * 1024;
+const INLINE_BASE64_PAYLOAD = /"data":"[A-Za-z0-9+/=]{4096,}"/gu;
+
+/** Remove large inline base64 payloads (image data) from an oversized Pi RPC line. */
+export function stripInlineRpcPayloads(rawLine: string): string {
+  return rawLine.replace(INLINE_BASE64_PAYLOAD, '"data":""');
+}
 const MAX_STDERR_BYTES = 64 * 1024;
 const MAX_PENDING_DELIVERY_BYTES = 4 * 1024 * 1024;
 
@@ -206,7 +217,10 @@ export async function invokeAgent(
     });
     let stopPromise: Promise<void> | undefined;
 
-    let stdoutBuffer = '';
+    // Partial line pieces since the last newline, joined only when the line completes
+    // so a large event is not re-copied and re-scanned on every chunk.
+    let pendingParts: string[] = [];
+    let pendingLength = 0;
     let stderr = '';
     let fatalRpcError = '';
     let pendingDeliveryBytes = 0;
@@ -476,7 +490,8 @@ export async function invokeAgent(
     const failRpcOutput = (error: string) => {
       if (fatalRpcError || finished) return;
       fatalRpcError = error;
-      stdoutBuffer = '';
+      pendingParts = [];
+      pendingLength = 0;
       if (persistent) {
         void stop();
         return;
@@ -762,10 +777,14 @@ export async function invokeAgent(
       }, 2000);
     };
 
-    const consumeLine = (rawLine: string) => {
+    const consumeLine = (inputLine: string) => {
+      let rawLine = inputLine;
       if (Buffer.byteLength(rawLine) > MAX_RPC_EVENT_BYTES) {
-        failRpcOutput('Pi RPC event exceeded the 4 MiB safety limit');
-        return;
+        rawLine = stripInlineRpcPayloads(rawLine);
+        if (Buffer.byteLength(rawLine) > MAX_RPC_EVENT_BYTES) {
+          failRpcOutput('Pi RPC event exceeded the 4 MiB safety limit');
+          return;
+        }
       }
       const line = rawLine.replace(/\r$/u, '');
       if (!line) return;
@@ -786,22 +805,33 @@ export async function invokeAgent(
 
     proc.stdout.on('data', (chunk: Buffer) => {
       if (fatalRpcError) return;
-      stdoutBuffer += decoder.write(chunk);
-      let newlineIndex = stdoutBuffer.indexOf('\n');
+      let text = decoder.write(chunk);
+      let newlineIndex = text.indexOf('\n');
       while (newlineIndex !== -1 && !fatalRpcError) {
-        consumeLine(stdoutBuffer.slice(0, newlineIndex));
-        stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
-        newlineIndex = stdoutBuffer.indexOf('\n');
+        pendingParts.push(text.slice(0, newlineIndex));
+        const line = pendingParts.join('');
+        pendingParts = [];
+        pendingLength = 0;
+        consumeLine(line);
+        text = text.slice(newlineIndex + 1);
+        newlineIndex = text.indexOf('\n');
       }
-      if (!fatalRpcError && Buffer.byteLength(stdoutBuffer) > MAX_RPC_EVENT_BYTES) {
+      if (fatalRpcError || !text) return;
+      pendingParts.push(text);
+      // UTF-16 length is a lower bound on the UTF-8 byte count; the precise
+      // 4 MiB byte check runs on each complete line in consumeLine.
+      pendingLength += text.length;
+      if (pendingLength > MAX_RPC_RAW_LINE_CHARS) {
         failRpcOutput('Pi RPC event exceeded the 4 MiB safety limit');
       }
     });
     proc.stdout.on('end', () => {
       if (fatalRpcError) return;
-      stdoutBuffer += decoder.end();
-      if (stdoutBuffer) consumeLine(stdoutBuffer);
-      stdoutBuffer = '';
+      pendingParts.push(decoder.end());
+      const rest = pendingParts.join('');
+      pendingParts = [];
+      pendingLength = 0;
+      if (rest) consumeLine(rest);
     });
     proc.stderr.on('data', (chunk: Buffer) => {
       const available = Math.max(0, MAX_STDERR_BYTES - Buffer.byteLength(stderr));
