@@ -258,11 +258,16 @@ async function processSteeringMessages(
   const rowids = prepared.messages.map((message) => message.rowid);
   if (!isCurrentGeneration(jid, generation) || signal.aborted || !claimMessages(rowids)) return;
 
+  let finishProcessing!: () => void;
+  const processingComplete = new Promise<void>((resolve) => {
+    finishProcessing = resolve;
+  });
   try {
     let consumed = false;
     const accepted = await steerActiveAgent(channelFolder, prepared.prompt, {
       attachments: prepared.attachments,
       signal,
+      processingComplete,
       onConsumed: () => {
         if (!taskResourcesAvailable || signal.aborted) return;
         markMessagesDone(rowids);
@@ -300,6 +305,8 @@ async function processSteeringMessages(
     markMessagesFailed(rowids);
     logger.warn({ jid, rowids, err: err.message }, 'Failed to steer message batch into active run');
     await sendResponse(jid, `⚠️ Steer failed: ${err.message?.slice(0, 250)}`, signal);
+  } finally {
+    finishProcessing();
   }
 }
 

@@ -32,7 +32,9 @@ const reply = (command: Command, success = true) =>
     id: command.id,
     command: command.type,
     success,
-    ...(success ? { data: { pendingMessageCount: 0 } } : { error: 'Compaction failed' }),
+    ...(success
+      ? { data: { pendingMessageCount: 0, capabilities: { guardedSteer: 1 } } }
+      : { error: 'Compaction failed' }),
   });
 
 beforeEach(() => {

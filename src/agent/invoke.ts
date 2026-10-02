@@ -75,6 +75,7 @@ interface ActiveRpcInvocation {
   request?: (prompt: string, opts?: InvokeOptions) => Promise<AgentResult>;
   stop?: () => Promise<void>;
   closing?: boolean;
+  trackSteering?: (processing: Promise<void>) => void;
   sendCommand: (command: Record<string, unknown>) => Promise<RpcResponse>;
   sendSteer: (message: string, onConsumed?: () => void | Promise<void>) => Promise<boolean>;
 }
@@ -120,15 +121,27 @@ export async function steerActiveAgent(
     attachments?: string | null;
     signal?: AbortSignal;
     onConsumed?: () => void | Promise<void>;
+    processingComplete?: Promise<void>;
   },
 ): Promise<boolean> {
   const invocation = activeRpcInvocations.get(channelFolder);
   if (!invocation) return false;
 
-  const prompt = await buildPromptWithAttachments(channelFolder, userText, opts);
-  if (activeRpcInvocations.get(channelFolder) !== invocation) return false;
-
-  return invocation.sendSteer(prompt, opts?.onConsumed);
+  const steering = (async () => {
+    const prompt = await buildPromptWithAttachments(channelFolder, userText, opts);
+    if (activeRpcInvocations.get(channelFolder) !== invocation) return false;
+    return invocation.sendSteer(prompt, opts?.onConsumed);
+  })();
+  // Include attachment preparation and the caller's row-state commit, not just
+  // the transport ACK. The queue resolves processingComplete in its finally.
+  invocation.trackSteering?.(
+    opts?.processingComplete ??
+      steering.then(
+        () => {},
+        () => {},
+      ),
+  );
+  return steering;
 }
 
 /**
@@ -241,6 +254,10 @@ export async function invokeAgent(
     // notice resumes it later. A parked run is waiting, not a missing reply.
     let parked = false;
     let settled = false;
+    let currentRunId: string | undefined;
+    let requestRunId: string | undefined;
+    let steeringClosed = false;
+    const steeringProcessing = new Set<Promise<void>>();
     let finished = false;
     let initialPromptObserved = false;
     let promptSubmitted = false;
@@ -313,18 +330,39 @@ export async function invokeAgent(
     ): Promise<boolean> => {
       // Steering has priority over follow-ups in Pi. Do not let it become
       // the user event that identifies a still-unconsumed initial prompt.
-      if (activeInvocation.closing || (persistent && (!requestResolve || !initialPromptObserved)))
+      if (
+        activeInvocation.closing ||
+        (persistent &&
+          (!requestResolve || !initialPromptObserved || steeringClosed || !requestRunId))
+      )
         return false;
       const request: PendingSteeringMessage = { message, consumed: false, onConsumed };
       pendingSteeringMessages.push(request);
 
       try {
-        const response = await sendCommand({ type: 'steer', message });
+        const response = await sendCommand({
+          type: 'steer',
+          message,
+          ...(persistent ? { expectedRunId: requestRunId } : {}),
+        });
         if (!response.success) {
           removePendingSteering(request);
           throw new Error(response.error || 'Pi rejected the steering message');
         }
 
+        if (persistent) {
+          const data = response.data as { accepted?: boolean; reason?: string } | undefined;
+          if (
+            data?.accepted === false &&
+            data.reason === 'run_not_accepting' &&
+            !request.consumed
+          ) {
+            removePendingSteering(request);
+            return false;
+          }
+          if (data?.accepted !== true)
+            throw new Error('Pi returned an invalid guarded steering acknowledgement');
+        }
         // Consumption is authoritative even if settlement raced the response.
         if (request.consumed) return true;
         if (!persistent && activeRpcInvocations.get(channelFolder) !== activeInvocation) {
@@ -396,12 +434,18 @@ export async function invokeAgent(
     const submitPrompt = async (): Promise<RpcResponse | undefined> => {
       if (persistent) {
         const state = await sendCommand({ type: 'get_state' });
-        const data = state.data as { sessionId?: string; pendingMessageCount?: number } | undefined;
+        const data = state.data as
+          | {
+              sessionId?: string;
+              pendingMessageCount?: number;
+              capabilities?: { guardedSteer?: number };
+            }
+          | undefined;
         if (!state.success || typeof data?.pendingMessageCount !== 'number') {
           throw new Error('Pi did not return pendingMessageCount for request admission');
         }
         if (activeInvocation.closing) return undefined;
-        if (data.pendingMessageCount !== 0) {
+        if (data.capabilities?.guardedSteer !== 1 || data.pendingMessageCount !== 0) {
           const done = requestResolve;
           requestResolve = undefined;
           opts = undefined;
@@ -410,7 +454,9 @@ export async function invokeAgent(
             ok: false,
             text: '',
             error:
-              'Pi already has pending user messages; request was not sent. Wait before retrying.',
+              data.capabilities?.guardedSteer !== 1
+                ? 'Pi must be updated to support guarded steering; request was not sent.'
+                : 'Pi already has pending user messages; request was not sent. Wait before retrying.',
           });
           return undefined;
         }
@@ -420,6 +466,11 @@ export async function invokeAgent(
     };
 
     if (persistent) {
+      activeInvocation.trackSteering = (processing) => {
+        if (!requestResolve || steeringClosed) return;
+        steeringProcessing.add(processing);
+        void processing.finally(() => steeringProcessing.delete(processing)).catch(() => {});
+      };
       activeInvocation.identity = identity;
       activeInvocation.stop = stop;
       activeInvocation.request = (nextPrompt, nextOpts) => {
@@ -433,6 +484,8 @@ export async function invokeAgent(
         prompt = nextPrompt;
         opts = nextOpts;
         settled = false;
+        steeringClosed = false;
+        requestRunId = undefined;
         initialPromptObserved = false;
         promptSubmitted = false;
         resetOutput();
@@ -566,6 +619,7 @@ export async function invokeAgent(
         // queue; concurrent extension sendUserMessage is outside this contract.
         if (!initialPromptObserved && (persistent ? promptSubmitted : userText === prompt)) {
           initialPromptObserved = true;
+          requestRunId = currentRunId;
           if (persistent) resetOutput();
           return;
         }
@@ -646,10 +700,29 @@ export async function invokeAgent(
           lastAssistantFailed = true;
           lastAssistantError = cause && cause !== reason ? `${cause} (${reason})` : reason;
         }
+        if (
+          (record?.status === 'resolved' && typeof record.decision?.summary === 'string') ||
+          (record?.status === 'awaiting_input' && typeof record.question === 'string')
+        ) {
+          const deliver =
+            (!persistent || initialPromptObserved ? opts?.onAssistantMessage : undefined) ||
+            (connectionDelivery
+              ? (text: string) =>
+                  connectionDelivery.onAssistantMessage(text, connectionController.signal)
+              : undefined);
+          if (deliver) enqueueRpcDelivery(lastAssistantText, deliver);
+        }
         return;
       }
 
       if (message?.type === 'agent_settled') {
+        // An older native run can settle while the next prompt is in preflight.
+        if (
+          persistent &&
+          requestResolve &&
+          (!initialPromptObserved || (requestRunId && message.runId !== requestRunId))
+        )
+          return;
         settleInvocation();
         return;
       }
@@ -670,6 +743,7 @@ export async function invokeAgent(
         message?.type === 'compaction_start'
       ) {
         if (message.type === 'agent_start') {
+          currentRunId = typeof message.runId === 'string' ? message.runId : undefined;
           legacyAgentEndPending = false;
           // Native completion and a fresh prompt start a new physical run. Automatic
           // text-only continuation turns do not emit agent_start and stay suppressed.
@@ -745,13 +819,17 @@ export async function invokeAgent(
         if (activeInvocation.closing) return;
         if (requestConsumed) {
           settled = true;
+          steeringClosed = true;
           const done = requestResolve!;
           // Snapshot output and callback chains at the request boundary. Later
           // unsolicited events belong to the connection, not this request.
           opts = undefined;
           removeRequestAbort();
           requestResolve = undefined;
-          void Promise.all([deliveryChain, consumptionChain]).then(() => done(result));
+          const processing = [...steeringProcessing];
+          void Promise.allSettled(processing)
+            .then(() => Promise.all([deliveryChain, consumptionChain]))
+            .then(() => done(result));
         } else if (connectionDelivery && !result.ok) {
           enqueueRpcDelivery(
             result.error || 'Pi failed',
