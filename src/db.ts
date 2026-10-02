@@ -78,12 +78,12 @@ export function initDb(): void {
   if (dbOpen) return;
 
   mkdirSync(dirname(config.dbPath), { recursive: true });
-  db = new Database(config.dbPath);
+  // SQLite's busy timeout sums requested sleeps, not elapsed wall time. Even
+  // a short timeout can block Discord ACKs much longer when the OS oversleeps.
+  // Fail explicitly on contention instead of sleeping on the event-loop thread.
+  db = new Database(config.dbPath, { timeout: 0 });
   dbOpen = true;
   db.pragma('journal_mode = WAL');
-  // better-sqlite3 waits synchronously: a five-second writer lock also blocks
-  // every Discord interaction ACK. Surface contention promptly instead.
-  db.pragma('busy_timeout = 100');
 
   db.exec(`
     create table if not exists channels (

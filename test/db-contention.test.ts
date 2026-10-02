@@ -5,7 +5,14 @@ import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { config } from '../src/config.js';
-import { closeDb, initDb, registerChannel } from '../src/db.js';
+import {
+  closeDb,
+  enqueueMessage,
+  getChannel,
+  initDb,
+  listPendingMessages,
+  registerChannel,
+} from '../src/db.js';
 import { handleInteraction } from '../src/discord/client.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'piscord-busy-'));
@@ -74,6 +81,15 @@ describe('Discord ingress under a SQLite writer lock', () => {
       thinkingOverride: '',
       cwdOverride: '',
     });
+    enqueueMessage({
+      channelJid: 'dc:stop-test',
+      sender: 'user',
+      senderName: 'User',
+      content: 'Keep pending when stop fails',
+      timestamp: '2026-01-01T00:00:00Z',
+    });
+    const pending = listPendingMessages('dc:stop-test', 10);
+    expect(pending).toHaveLength(1);
     const writer = new Database(config.dbPath);
     writer.exec('begin immediate');
     writer
@@ -105,6 +121,9 @@ describe('Discord ingress under a SQLite writer lock', () => {
       expect(interaction.deferReply).toHaveBeenCalledTimes(1);
       expect(editReply).toHaveBeenCalledTimes(1);
       expect(editReply.mock.calls[0]?.[0]?.content).toContain('Command failed');
+      expect(listPendingMessages('dc:stop-test', 10)).toEqual(pending);
+      expect(writer.inTransaction).toBe(true);
+      expect(getChannel('dc:locked')).toBeUndefined();
     } finally {
       writer.exec('rollback');
       writer.close();
@@ -112,6 +131,16 @@ describe('Discord ingress under a SQLite writer lock', () => {
   });
 
   it('fails explicitly instead of blocking all interaction ACKs for five seconds', () => {
+    const channel = {
+      jid: 'dc:busy',
+      name: 'busy',
+      folder: 'busy',
+      requiresTrigger: false,
+      isMain: false,
+      modelOverride: '',
+      thinkingOverride: '' as const,
+      cwdOverride: '',
+    };
     const writer = new Database(config.dbPath);
     writer.exec('begin immediate');
     writer
@@ -119,22 +148,19 @@ describe('Discord ingress under a SQLite writer lock', () => {
       .run('dc:writer', 'writer', 'writer');
     try {
       const start = performance.now();
-      expect(() =>
-        registerChannel({
-          jid: 'dc:busy',
-          name: 'busy',
-          folder: 'busy',
-          requiresTrigger: false,
-          isMain: false,
-          modelOverride: '',
-          thinkingOverride: '',
-          cwdOverride: '',
-        }),
-      ).toThrow(/database is locked/i);
+      expect(() => registerChannel(channel)).toThrow(/database is locked/i);
       expect(performance.now() - start).toBeLessThan(500);
+      expect(getChannel(channel.jid)).toBeUndefined();
+      expect(getChannel('dc:writer')).toBeUndefined();
+      expect(writer.inTransaction).toBe(true);
+      writer.exec('commit');
     } finally {
-      writer.exec('rollback');
+      if (writer.inTransaction) writer.exec('rollback');
       writer.close();
     }
+    expect(getChannel('dc:writer')?.name).toBe('writer');
+    expect(getChannel(channel.jid)).toBeUndefined();
+    registerChannel(channel);
+    expect(getChannel(channel.jid)).toEqual(channel);
   });
 });
