@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { expect, it } from 'vitest';
@@ -11,10 +11,13 @@ import {
   shutdownResidentAgents,
 } from '../src/agent/invoke.js';
 
-// Real installed Pi, read-only. No credentials, network provider, production
-// settings, extensions, sessions or Gateway DB are used by this integration.
+// The lockfile's older Pi proves capability rejection in ordinary CI. The explicit
+// test:paired-pi gate runs the original delayed-child/history checks against the
+// candidate CLI. Both use synthetic offline settings and isolated sessions only.
 it.skipIf(process.platform === 'win32')(
-  'real Pi keeps delayed custom child results and the next request on its original RPC process',
+  process.env.PI_RPC_TEST_CLI
+    ? 'candidate Pi keeps delayed custom child results and the next request on its original RPC process'
+    : 'lockfile Pi is rejected before user input because guarded steering is unavailable',
   async () => {
     const root = mkdtempSync(join(tmpdir(), 'piscord-real-persistent-'));
     const original = { ...config };
@@ -29,7 +32,7 @@ it.skipIf(process.platform === 'win32')(
     const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`;
     writeFileSync(
       wrapper,
-      `#!/bin/sh\nexec env -i PATH=${quote(process.env.PATH || '/usr/bin:/bin')} HOME=${quote(root)} PI_CODING_AGENT_DIR=${quote(join(root, 'agent'))} ${quote(process.execPath)} ${quote(cli)} "$@"\n`,
+      `#!/bin/sh\nexec env -i PATH=${quote(process.env.PATH || '/usr/bin:/bin')} HOME=${quote(root)} PI_OFFLINE=1 PI_CODING_AGENT_DIR=${quote(join(root, 'agent'))} ${quote(process.execPath)} ${quote(cli)} "$@"\n`,
     );
     chmodSync(wrapper, 0o755);
     writeFileSync(
@@ -50,8 +53,8 @@ export default function(pi) {
    const n = ++calls;
    appendFileSync(${JSON.stringify(join(root, 'calls.jsonl'))}, JSON.stringify({n,pid:process.pid,messages:context.messages})+'\\n');
    const text = n === 1 ? 'children started:' + process.pid : n === 2 ? 'children collected:' + process.pid : 'next request:' + process.pid;
-   const message = {role:'assistant',content:[{type:'text',text}],api:model.api,provider:model.provider,model:model.id,usage:{input:1,output:1,cacheRead:0,cacheWrite:0,totalTokens:2,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}},stopReason:'stop',timestamp:Date.now()};
-   queueMicrotask(()=>{stream.push({type:'done',reason:'stop',message});stream.end();});
+   const message = {role:'assistant',content:[{type:'toolCall',id:'finish-'+n,name:'finish_work',arguments:{outcome:'completed',reason:'Fixture completed',summary:text}}],api:model.api,provider:model.provider,model:model.id,usage:{input:1,output:1,cacheRead:0,cacheWrite:0,totalTokens:2,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}},stopReason:'toolUse',timestamp:Date.now()};
+   queueMicrotask(()=>{stream.push({type:'done',reason:'toolUse',message});stream.end();});
    return stream;
   }
  });
@@ -82,6 +85,7 @@ export default function(pi) {
       sessionsDir: join(root, 'sessions'),
     });
     const late: string[] = [];
+    const errors: string[] = [];
     let received!: () => void;
     const delivered = new Promise<void>((done) => {
       received = done;
@@ -96,10 +100,16 @@ export default function(pi) {
             received();
           },
           onError: (error) => {
-            throw new Error(error);
+            errors.push(error);
           },
         },
       });
+      if (!process.env.PI_RPC_TEST_CLI) {
+        expect(first.ok).toBe(false);
+        expect(first.error).toContain('must be updated');
+        expect(existsSync(join(root, 'calls.jsonl'))).toBe(false);
+        return;
+      }
       expect(first.ok, first.error).toBe(true);
       expect(first.text).toMatch(/^children started:/);
       expect(late).toEqual([]);
@@ -116,6 +126,7 @@ export default function(pi) {
         onAssistantMessage: () => {},
       });
       expect(second.ok, second.error).toBe(true);
+      expect(errors).toEqual([]);
       const pid = Number(first.text.split(':')[1]);
       expect(late).toEqual([`children collected:${pid}`]);
       expect(second.text).toBe(`next request:${pid}`);

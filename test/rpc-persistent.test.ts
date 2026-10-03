@@ -38,9 +38,9 @@ const root = ${JSON.stringify(root)};
 const supervisorRoot = process.env.PI_SUBAGENTS_TEMP_ROOT || root;
 const send = value => process.stdout.write(JSON.stringify(value) + '\\n');
 const text = value => send({type:'message_end',message:{role:'assistant',content:[{type:'text',text:value}],stopReason:'stop'}});
-const settle = () => send({type:'agent_settled'});
+const settle = () => send({type:'agent_settled',runId:'fixture-run'});
 const answer = command => {
- send({type:'agent_start'});
+ send({type:'agent_start',runId:'fixture-run'});
  send({type:'message_start',message:{role:'user',content:command.message === 'queued' ? 'transformed input' : command.message}});
  if(command.message === 'wait') {
   send({type:'message_end',message:{role:'assistant',content:[{type:'toolCall',name:'wait_for_user',arguments:{question:'Which account?'}}],stopReason:'toolUse'}});
@@ -62,7 +62,7 @@ const answer = command => {
   send({type:'tool_execution_end',toolName:'subagent',isError:false,result:{content:[],terminate:true,park:true}});
   settle();
   setTimeout(() => {
-   send({type:'agent_start'});
+   send({type:'agent_start',runId:'fixture-run'});
    send({type:'message_start',message:{role:'assistant',content:[]}});
    text('async result');
    send({type:'work_contract',record:{status:'resolved',decision:{outcome:'completed',summary:'async result'}}});
@@ -92,7 +92,7 @@ process.stdin.on('data', chunk => {
   const c = JSON.parse(buffer.slice(0,i)); buffer = buffer.slice(i+1);
   appendFileSync(join(root,'commands'), JSON.stringify(c) + '\\n');
   if(c.type === 'steer' && c.message === 'disconnect-steer') { process.exit(9); return; }
-  send({type:'response',id:c.id,command:c.type,success:true,data:{sessionId:'owned-session',pendingMessageCount:existsSync(join(root,'pending')) ? 1 : 0}});
+  send({type:'response',id:c.id,command:c.type,success:true,data:{capabilities:{guardedSteer:1},accepted:true,sessionId:'owned-session',pendingMessageCount:existsSync(join(root,'pending')) ? 1 : 0}});
   if(c.type === 'steer') {
    send({type:'message_start',message:{role:'user',content:c.message}});
    text('steering consumed'); settle();
@@ -103,7 +103,7 @@ process.stdin.on('data', chunk => {
    const poll = setInterval(() => {
     if(!existsSync(join(root,'release-initial'))) return;
     clearInterval(poll);
-    send({type:'agent_start'});
+    send({type:'agent_start',runId:'fixture-run'});
     send({type:'message_start',message:{role:'user',content:'transformed queued prompt'}});
    },10);
    continue;
@@ -119,7 +119,7 @@ process.stdin.on('data', chunk => {
   if(c.message === 'child') {
    const child = spawn(process.execPath, ['-e', 'setTimeout(()=>process.stdout.write("child done"),250)']);
    child.stdout.on('data', chunk => {
-    send({type:'agent_start'}); text(chunk.toString());
+    send({type:'agent_start',runId:'fixture-run'}); text(chunk.toString());
     send({type:'work_contract',record:{status:'resolved',decision:{outcome:'completed',summary:'child summary'}}});
     settle();
     for (const [id, session] of [['ours','owned-session'],['other','other-session']]) {
@@ -373,7 +373,7 @@ describe('persistent RPC connection', () => {
     expect(hasResidentAgent('channel')).toBe(true);
   });
 
-  it('delivers the async completion after a park exactly once through the connection', async () => {
+  it('delivers async intermediate text and the work decision once each after a park', async () => {
     const root = fixture();
     const delivery = sinks();
     const onAssistantMessage = vi.fn();
@@ -390,7 +390,11 @@ describe('persistent RPC connection', () => {
       ),
     );
     await new Promise((resolve) => setTimeout(resolve, 100));
-    expect(delivery.onAssistantMessage).toHaveBeenCalledTimes(1);
+    // These are distinct events: equal prose must not erase an explicit decision.
+    expect(delivery.onAssistantMessage.mock.calls.map(([text]) => text)).toEqual([
+      'async result',
+      'async result',
+    ]);
     expect(delivery.onError).not.toHaveBeenCalled();
     expect(onAssistantMessage).not.toHaveBeenCalled();
   });

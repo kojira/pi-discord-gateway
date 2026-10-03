@@ -25,7 +25,7 @@ process.stdin.on('data', chunk => {
  buffer += chunk;
  while(buffer.includes('\\n')) {
   const i=buffer.indexOf('\\n'); const c=JSON.parse(buffer.slice(0,i)); buffer=buffer.slice(i+1);
-  if(c.type==='get_state') {send({type:'response',id:c.id,command:c.type,success:true,data:{sessionId:'parent',pendingMessageCount:0}});continue;}
+  if(c.type==='get_state') {send({type:'response',id:c.id,command:c.type,success:true,data:{sessionId:'parent',pendingMessageCount:0,capabilities:{guardedSteer:1}}});continue;}
   send({type:'response',id:c.id,command:c.type,success:true});
   if(c.type!=='prompt')continue;
   const dir=path.join(tempRoot,'supervisor-channels','run');fs.mkdirSync(path.join(dir,'requests'),{recursive:true});
