@@ -558,6 +558,58 @@ describe('nested session trace monitoring', () => {
     monitor.stop();
   });
 
+  it('does not replay long historical transcripts skipped while active capacity was saturated', () => {
+    const root = temporaryRoot();
+    for (let index = 0; index < 700; index += 1) {
+      writeJsonl(
+        join(root, 'parent', `old-${String(index).padStart(4, '0')}`, 'session.jsonl'),
+        Array.from({ length: 60 }, (_, line) =>
+          line % 2 === 0
+            ? assistant(`finished history ${index}`)
+            : { ...assistant(`finished history ${index}`), timestamp: '2020-01-01T00:00:00.000Z' },
+        ),
+      );
+    }
+    const { monitor, lines } = harness(root);
+    for (let index = 0; index < 400; index += 1) monitor.pollOnce();
+    expect(monitor.stats().files + monitor.stats().dormantFiles).toBe(700);
+    expect(lines.join('\n')).not.toContain('finished history');
+
+    writeJsonl(join(root, 'parent', 'zz-new-child', 'session.jsonl'), [assistant('fresh child')]);
+    for (let index = 0; index < 40; index += 1) monitor.pollOnce();
+    expect(lines.join('\n')).toContain('fresh child');
+    expect(lines.join('\n')).not.toContain('finished history');
+    monitor.stop();
+  });
+
+  it('sweeps dormant cursors for deleted transcripts and handles dormant truncation', () => {
+    const root = temporaryRoot();
+    let now = 1_000_000;
+    const lines: string[] = [];
+    const monitor = new NestedSessionTraceMonitor({
+      listSources: () => [{ jid: 'dc:sweep', root }],
+      emit: (_source, line) => lines.push(line),
+      now: () => now,
+    });
+    monitor.pollOnce();
+    const deleted = join(root, 'parent', 'deleted', 'session.jsonl');
+    const truncated = join(root, 'parent', 'truncated', 'session.jsonl');
+    writeJsonl(deleted, [assistant('deleted live')]);
+    writeJsonl(truncated, [assistant('truncated live'), assistant('more padding output')]);
+    for (let index = 0; index < 3; index += 1) monitor.pollOnce();
+    now += 6 * 60_000;
+    monitor.pollOnce();
+    expect(monitor.stats()).toMatchObject({ files: 0, dormantFiles: 2 });
+
+    rmSync(dirname(deleted), { recursive: true, force: true });
+    writeFileSync(truncated, `${JSON.stringify(assistant('rewritten'))}\n`);
+    for (let index = 0; index < 6; index += 1) monitor.pollOnce();
+    expect(monitor.stats().dormantFiles).toBe(0);
+    expect(monitor.stats().files).toBe(1);
+    expect(lines.join('\n').split('rewritten').length - 1).toBe(1);
+    monitor.stop();
+  });
+
   it('demotes idle child transcripts and revives them on append', () => {
     const root = temporaryRoot();
     let now = 1_000_000;
