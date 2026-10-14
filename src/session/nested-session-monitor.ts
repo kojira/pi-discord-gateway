@@ -183,9 +183,12 @@ type OpenDirectoryResult = OpenedDirectory | { kind: 'missing' } | { kind: 'unav
  * the active Pi RPC stream already reports those records.
  *
  * Resource policy is admission-bounded: at most MAX_CHANNELS active webhook
- * routes and MAX_FILES_PER_CHANNEL child transcripts retain cursors. Existing
- * admissions are stable until the route/file disappears, so overload cannot
- * cause replay. Directory iteration is incremental and bounded per poll.
+ * routes and MAX_FILES_PER_CHANNEL active child-transcript cursors. Fully read
+ * idle cursors move to a bounded dormant tier (never evicted) and are revived
+ * on change, so finished children do not block new ones. Cursors are kept
+ * until the route/file disappears, so overload cannot cause replay; at the
+ * dormant caps new files are simply not admitted. Files born before
+ * activation are always history, even when admitted late. Directory iteration is incremental and bounded per poll.
  */
 export class NestedSessionTraceMonitor {
   private readonly channels = new Map<string, ChannelCursor>();
