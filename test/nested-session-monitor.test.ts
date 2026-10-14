@@ -514,8 +514,76 @@ describe('nested session trace monitoring', () => {
       emit: (_source, line) => lines.push(line),
     });
     for (let index = 0; index < 12; index += 1) fileMonitor.pollOnce();
-    expect(fileMonitor.stats().files).toBe(512);
+    expect(fileMonitor.stats().files).toBeLessThanOrEqual(512);
+    expect(fileMonitor.stats().files + fileMonitor.stats().dormantFiles).toBe(513);
     fileMonitor.stop();
+  });
+
+  it('keeps forwarding new and resumed child transcripts after a channel exceeds active cursor capacity', () => {
+    const root = temporaryRoot();
+    for (let index = 0; index < 700; index += 1) {
+      writeJsonl(join(root, 'parent', `old-${String(index).padStart(4, '0')}`, 'session.jsonl'), [
+        assistant(`finished history ${index}`),
+      ]);
+    }
+    const { monitor, lines, warn } = harness(root);
+    for (let index = 0; index < 20; index += 1) monitor.pollOnce();
+    expect(monitor.stats().files).toBeLessThanOrEqual(512);
+    expect(monitor.stats().files + monitor.stats().dormantFiles).toBe(700);
+    expect(lines.join('\n')).not.toContain('finished history');
+
+    const fresh = join(root, 'parent', 'zz-new-child', 'session.jsonl');
+    writeJsonl(fresh, [assistant('new child after capacity')]);
+    for (let index = 0; index < 20; index += 1) monitor.pollOnce();
+    expect(lines.join('\n')).toContain('new child after capacity');
+
+    // Every historical transcript is now either active or dormant; appending to
+    // any of them is still forwarded exactly once without replaying history.
+    for (const index of [0, 350, 699]) {
+      appendRecord(
+        join(root, 'parent', `old-${String(index).padStart(4, '0')}`, 'session.jsonl'),
+        assistant(`resumed child ${index}`),
+      );
+    }
+    for (let index = 0; index < 20; index += 1) monitor.pollOnce();
+    const output = lines.join('\n');
+    for (const index of [0, 350, 699]) {
+      expect(output.split(`resumed child ${index}`).length - 1).toBe(1);
+    }
+    expect(output).not.toContain('finished history');
+    expect(warn).not.toHaveBeenCalledWith(
+      expect.anything(),
+      'Nested session transcript cursor admission limit reached',
+    );
+    monitor.stop();
+  });
+
+  it('demotes idle child transcripts and revives them on append', () => {
+    const root = temporaryRoot();
+    let now = 1_000_000;
+    const lines: string[] = [];
+    const monitor = new NestedSessionTraceMonitor({
+      listSources: () => [{ jid: 'dc:idle', root }],
+      emit: (_source, line) => lines.push(line),
+      now: () => now,
+    });
+    monitor.pollOnce();
+    const child = join(root, 'parent', 'child', 'session.jsonl');
+    writeJsonl(child, [assistant('first live output')]);
+    monitor.pollOnce();
+    monitor.pollOnce();
+    expect(lines.join('\n')).toContain('first live output');
+    now += 6 * 60_000;
+    monitor.pollOnce();
+    expect(monitor.stats()).toMatchObject({ files: 0, dormantFiles: 1 });
+
+    appendRecord(child, assistant('after dormant append'));
+    for (let index = 0; index < 4; index += 1) monitor.pollOnce();
+    const output = lines.join('\n');
+    expect(output.split('first live output').length - 1).toBe(1);
+    expect(output.split('after dormant append').length - 1).toBe(1);
+    expect(monitor.stats().files).toBe(1);
+    monitor.stop();
   });
 
   it('continues incremental directory discovery beyond one bounded poll', () => {
@@ -720,6 +788,6 @@ describe('nested session trace monitoring', () => {
     appendRecord(child, assistant('after shutdown'));
     monitor.pollOnce();
     expect(lines.join('\n')).not.toContain('after shutdown');
-    expect(monitor.stats()).toEqual({ channels: 0, files: 0, pendingBytes: 0 });
+    expect(monitor.stats()).toEqual({ channels: 0, files: 0, dormantFiles: 0, pendingBytes: 0 });
   });
 });
