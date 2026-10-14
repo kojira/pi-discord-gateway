@@ -23,6 +23,13 @@ import { enqueueWebhookTraceForEpoch, webhookEpoch } from '../discord/webhook-mo
 const POLL_INTERVAL_MS = 1000;
 const MAX_CHANNELS = 256;
 const MAX_FILES_PER_CHANNEL = 512;
+// Idle child transcripts at EOF keep a compact dormant cursor instead of an
+// active read slot. Discovery revives them by metadata change, so long-lived
+// channels do not exhaust active admission with finished child sessions.
+// A dormant cursor is a few hundred bytes, so these bound memory to ~tens of MB.
+const MAX_DORMANT_FILES_PER_CHANNEL = 16_384;
+const MAX_DORMANT_FILES_GLOBAL = 65_536;
+const DORMANT_AFTER_IDLE_MS = 5 * 60_000;
 const MAX_CHANNELS_VISITED_PER_POLL = 16;
 const MAX_DISCOVERY_ENTRIES_PER_POLL = 4096;
 const MAX_DISCOVERY_ENTRIES_PER_CHANNEL_POLL = 512;
@@ -68,6 +75,15 @@ export interface NestedSessionMonitorDependencies {
   beforeRootOpen?(path: string): void;
   beforeFileOpen?(path: string): void;
   beforeDirectoryOpen?(path: string): void;
+  /** Test seam for cursor capacity limits; production uses the defaults. */
+  limits?: Partial<NestedSessionMonitorLimits>;
+}
+
+export interface NestedSessionMonitorLimits {
+  activeFilesPerChannel: number;
+  dormantFilesPerChannel: number;
+  dormantFilesGlobal: number;
+  dormantAfterIdleMs: number;
 }
 
 interface NormalizedSource extends NestedSessionSource {
@@ -87,6 +103,10 @@ interface FileCursor {
   initialScan: boolean;
   activationCutoffMs: number;
   sourceName?: string;
+  /** Last observed metadata and activity, used for dormant revival checks. */
+  lastSize: number;
+  lastMtimeMs: number;
+  lastActivityMs: number;
 }
 
 interface DirectoryWork {
@@ -102,6 +122,10 @@ interface DiscoveryCursor {
   queue: DirectoryWork[];
   queued: Set<string>;
   current?: OpenDirectoryWork;
+  /** A file entry was consumed without being admitted during this cycle. */
+  incomplete: boolean;
+  /** Dormant transcripts listed during this cycle; unseen ones are swept. */
+  seenDormant: Set<string>;
 }
 
 interface ChannelCursor {
@@ -111,6 +135,7 @@ interface ChannelCursor {
   rootMissingAtActivation: boolean;
   initialDiscoveryComplete: boolean;
   files: Map<string, FileCursor>;
+  dormantFiles: Map<string, FileCursor>;
   unavailableFiles: Set<string>;
   nextFileIndex: number;
   discovery: DiscoveryCursor;
@@ -158,9 +183,12 @@ type OpenDirectoryResult = OpenedDirectory | { kind: 'missing' } | { kind: 'unav
  * the active Pi RPC stream already reports those records.
  *
  * Resource policy is admission-bounded: at most MAX_CHANNELS active webhook
- * routes and MAX_FILES_PER_CHANNEL child transcripts retain cursors. Existing
- * admissions are stable until the route/file disappears, so overload cannot
- * cause replay. Directory iteration is incremental and bounded per poll.
+ * routes and MAX_FILES_PER_CHANNEL active child-transcript cursors. Fully read
+ * idle cursors move to a bounded dormant tier (never evicted) and are revived
+ * on change, so finished children do not block new ones. Cursors are kept
+ * until the route/file disappears, so overload cannot cause replay; at the
+ * dormant caps new files are simply not admitted. Files born before
+ * activation are always history, even when admitted late. Directory iteration is incremental and bounded per poll.
  */
 export class NestedSessionTraceMonitor {
   private readonly channels = new Map<string, ChannelCursor>();
@@ -170,8 +198,17 @@ export class NestedSessionTraceMonitor {
   private polling = false;
   private nextChannelIndex = 0;
   private lastUsage: NestedSessionPollUsage = emptyPollUsage();
+  private readonly limits: NestedSessionMonitorLimits;
 
-  constructor(private readonly dependencies: NestedSessionMonitorDependencies) {}
+  constructor(private readonly dependencies: NestedSessionMonitorDependencies) {
+    this.limits = {
+      activeFilesPerChannel: MAX_FILES_PER_CHANNEL,
+      dormantFilesPerChannel: MAX_DORMANT_FILES_PER_CHANNEL,
+      dormantFilesGlobal: MAX_DORMANT_FILES_GLOBAL,
+      dormantAfterIdleMs: DORMANT_AFTER_IDLE_MS,
+      ...dependencies.limits,
+    };
+  }
 
   start(): void {
     if (this.timer || this.stopped) return;
@@ -250,11 +287,12 @@ export class NestedSessionTraceMonitor {
     return { ...this.lastUsage };
   }
 
-  stats(): { channels: number; files: number; pendingBytes: number } {
+  stats(): { channels: number; files: number; dormantFiles: number; pendingBytes: number } {
     const states = [...this.channels.values()];
     return {
       channels: states.length,
       files: states.reduce((count, state) => count + state.files.size, 0),
+      dormantFiles: states.reduce((count, state) => count + state.dormantFiles.size, 0),
       pendingBytes: states.reduce(
         (count, state) =>
           count +
@@ -296,6 +334,7 @@ export class NestedSessionTraceMonitor {
     state.rootMissingAtActivation = pathIsMissing(source.root);
     state.initialDiscoveryComplete = false;
     state.files = new Map();
+    state.dormantFiles = new Map();
     state.unavailableFiles = new Set();
     state.nextFileIndex = 0;
     state.discovery = newDiscoveryCursor();
@@ -347,7 +386,15 @@ export class NestedSessionTraceMonitor {
       if (!state.discovery.current) {
         const work = state.discovery.queue.shift();
         if (!work) {
-          if (state.unavailableFiles.size === 0) state.initialDiscoveryComplete = true;
+          const clean = state.unavailableFiles.size === 0 && !state.discovery.incomplete;
+          if (clean) {
+            state.initialDiscoveryComplete = true;
+            // A complete cycle lists every surviving transcript, so dormant
+            // cursors that were not seen were deleted or renamed.
+            for (const path of [...state.dormantFiles.keys()]) {
+              if (!state.discovery.seenDormant.has(path)) state.dormantFiles.delete(path);
+            }
+          }
           state.discovery = newDiscoveryCursor();
           break;
         }
@@ -405,6 +452,7 @@ export class NestedSessionTraceMonitor {
           state.discovery.queue.push({ relativePath, depth: current.depth + 1 });
           state.discovery.queued.add(relativePath);
         } else if (state.discovery.queue.length >= MAX_DISCOVERY_DIRECTORIES) {
+          state.discovery.incomplete = true;
           this.warnThrottled(
             `directory-limit:${jid}`,
             { jid },
@@ -416,7 +464,32 @@ export class NestedSessionTraceMonitor {
       if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
       if (dirname(relativePath) === '.') continue;
       if (state.files.has(relativePath)) continue;
-      if (state.files.size + state.unavailableFiles.size >= MAX_FILES_PER_CHANNEL) {
+      const dormant = state.dormantFiles.get(relativePath);
+      if (dormant) {
+        state.discovery.seenDormant.add(relativePath);
+        if (!dormantFileChanged(state.source, canonicalRoot, relativePath, dormant)) continue;
+        // Release this dormant slot before making active room, so a swap is
+        // possible even when dormant storage is at its cap.
+        state.dormantFiles.delete(relativePath);
+        if (!this.ensureActiveCapacity(state)) {
+          state.dormantFiles.set(relativePath, dormant);
+          state.discovery.incomplete = true;
+          this.warnThrottled(
+            `file-limit:${jid}`,
+            { jid },
+            'Nested session transcript cursor admission limit reached',
+          );
+          continue;
+        }
+        // Resume from the retained byte offset. readFile revalidates identity
+        // and continuity, so appends are emitted exactly once and rewrites are
+        // treated like tail -F replacement rather than replayed as history.
+        dormant.lastActivityMs = this.now();
+        state.files.set(relativePath, dormant);
+        continue;
+      }
+      if (!this.ensureActiveCapacity(state)) {
+        state.discovery.incomplete = true;
         this.warnThrottled(
           `file-limit:${jid}`,
           { jid },
@@ -424,7 +497,12 @@ export class NestedSessionTraceMonitor {
         );
         continue;
       }
-      if (budget.fileOpens <= 0 || channelFiles <= 0) break;
+      if (budget.fileOpens <= 0 || channelFiles <= 0) {
+        // The directory entry is already consumed; rescan before declaring a
+        // complete baseline so this file is not later mistaken for a new one.
+        state.discovery.incomplete = true;
+        break;
+      }
       budget.fileOpens -= 1;
       channelFiles -= 1;
       const admitted = this.admitFile(state, canonicalRoot, relativePath);
@@ -440,8 +518,12 @@ export class NestedSessionTraceMonitor {
     const opened = this.openVerifiedFile(state.source, canonicalRoot, relativePath);
     if (opened.kind !== 'opened') return opened.kind;
     try {
+      // A transcript whose birthtime clearly predates activation is history
+      // even when it is admitted after the initial discovery completed.
+      const bornBeforeActivation =
+        opened.stats.birthtimeMs > 0 && opened.stats.birthtimeMs < state.activatedAtMs - 1;
       const createdAfterActivation =
-        state.initialDiscoveryComplete ||
+        (state.initialDiscoveryComplete && !bornBeforeActivation) ||
         (opened.stats.birthtimeMs > 0 && opened.stats.birthtimeMs > state.activatedAtMs + 1);
       // Existing transcripts can be copied into new forks long after monitoring
       // starts.  Use a per-file admission boundary, not the channel activation
@@ -459,6 +541,7 @@ export class NestedSessionTraceMonitor {
         0,
         admissionCutoffMs,
         createdAfterActivation,
+        this.now(),
       );
       state.files.set(relativePath, cursor);
     } finally {
@@ -506,6 +589,12 @@ export class NestedSessionTraceMonitor {
         budget,
       );
       if (result.missing) state.files.delete(relativePath);
+      else if (
+        result.bytes === 0 &&
+        this.now() - cursor.lastActivityMs >= this.limits.dormantAfterIdleMs
+      ) {
+        this.demoteFile(state, relativePath, cursor);
+      }
       channelBytes -= result.bytes;
       budget.bytes -= result.bytes;
       this.enforceChannelPendingLimit(jid, state);
@@ -527,6 +616,8 @@ export class NestedSessionTraceMonitor {
       return { bytes: 0, missing: opened.kind === 'missing' };
     }
     try {
+      cursor.lastSize = opened.stats.size;
+      cursor.lastMtimeMs = opened.stats.mtimeMs;
       const identity = fileIdentity(opened.stats);
       const continuityMatches = fileContinuityMatches(opened.descriptor, cursor);
       if (identity !== cursor.identity || opened.stats.size < cursor.offset || !continuityMatches) {
@@ -558,6 +649,7 @@ export class NestedSessionTraceMonitor {
       const buffer = Buffer.allocUnsafe(bytesToRead);
       const bytesRead = readSync(opened.descriptor, buffer, 0, bytesToRead, cursor.offset);
       cursor.offset += bytesRead;
+      if (bytesRead > 0) cursor.lastActivityMs = this.now();
       setContinuity(opened.descriptor, cursor);
       this.consume(source, cursor, buffer.subarray(0, bytesRead), budget);
       if (cursor.pending.length === 0 && cursor.offset >= opened.stats.size) {
@@ -713,6 +805,45 @@ export class NestedSessionTraceMonitor {
     }
   }
 
+  /**
+   * Make room for one active cursor. Only fully consumed, baselined cursors are
+   * demoted; the least recently active one goes first. Returns false when every
+   * active cursor still has unread or pending data, or dormant storage is full.
+   */
+  private ensureActiveCapacity(state: ChannelCursor): boolean {
+    if (state.files.size + state.unavailableFiles.size < this.limits.activeFilesPerChannel) {
+      return true;
+    }
+    let candidate: [string, FileCursor] | undefined;
+    for (const entry of state.files) {
+      if (!isDormantEligible(entry[1])) continue;
+      if (!candidate || entry[1].lastActivityMs < candidate[1].lastActivityMs) candidate = entry;
+    }
+    if (!candidate) return false;
+    return this.demoteFile(state, candidate[0], candidate[1]);
+  }
+
+  private demoteFile(state: ChannelCursor, relativePath: string, cursor: FileCursor): boolean {
+    if (!isDormantEligible(cursor)) return false;
+    // Dormant cursors are never evicted: a forgotten cursor could only be
+    // re-admitted without its offset, risking history replay. At the caps the
+    // monitor falls back to the original bounded behavior (no new admission).
+    if (state.dormantFiles.size >= this.limits.dormantFilesPerChannel) return false;
+    if (this.dormantTotal() >= this.limits.dormantFilesGlobal) return false;
+    state.files.delete(relativePath);
+    state.dormantFiles.set(relativePath, cursor);
+    // The path may already have been listed earlier in this discovery cycle;
+    // count it as seen so the end-of-cycle sweep cannot drop a live cursor.
+    state.discovery.seenDormant.add(relativePath);
+    return true;
+  }
+
+  private dormantTotal(): number {
+    let total = 0;
+    for (const state of this.channels.values()) total += state.dormantFiles.size;
+    return total;
+  }
+
   private enforceChannelPendingLimit(jid: string, state: ChannelCursor): void {
     let total = [...state.files.values()].reduce((sum, cursor) => sum + cursor.pending.length, 0);
     if (total <= MAX_PENDING_BYTES_PER_CHANNEL) return;
@@ -817,6 +948,7 @@ function newChannelCursor(source: NormalizedSource, activatedAtMs: number): Chan
     rootMissingAtActivation: pathIsMissing(source.root),
     initialDiscoveryComplete: false,
     files: new Map(),
+    dormantFiles: new Map(),
     unavailableFiles: new Set(),
     nextFileIndex: 0,
     discovery: newDiscoveryCursor(),
@@ -824,7 +956,12 @@ function newChannelCursor(source: NormalizedSource, activatedAtMs: number): Chan
 }
 
 function newDiscoveryCursor(): DiscoveryCursor {
-  return { queue: [{ relativePath: '', depth: 0 }], queued: new Set(['']) };
+  return {
+    queue: [{ relativePath: '', depth: 0 }],
+    queued: new Set(['']),
+    incomplete: false,
+    seenDormant: new Set(),
+  };
 }
 
 function disposeChannel(state: ChannelCursor): void {
@@ -832,7 +969,9 @@ function disposeChannel(state: ChannelCursor): void {
   state.discovery.current = undefined;
   state.discovery.queue = [];
   state.discovery.queued.clear();
+  state.discovery.seenDormant.clear();
   state.files.clear();
+  state.dormantFiles.clear();
   state.unavailableFiles.clear();
 }
 
@@ -941,6 +1080,7 @@ function newCursor(
   offset: number,
   activationCutoffMs: number,
   baselineComplete: boolean,
+  nowMs: number,
 ): FileCursor {
   const cursor: FileCursor = {
     identity: fileIdentity(stats),
@@ -951,6 +1091,9 @@ function newCursor(
     baselineComplete,
     initialScan: true,
     activationCutoffMs,
+    lastSize: stats.size,
+    lastMtimeMs: stats.mtimeMs,
+    lastActivityMs: nowMs,
   };
   setContinuity(descriptor, cursor);
   return cursor;
@@ -997,6 +1140,35 @@ function fileContinuityMatches(descriptor: number, cursor: FileCursor): boolean 
 
 function fileIdentity(stats: Stats): string {
   return `${String(stats.dev)}:${String(stats.ino)}`;
+}
+
+function isDormantEligible(cursor: FileCursor): boolean {
+  return (
+    cursor.baselineComplete &&
+    !cursor.initialScan &&
+    cursor.pending.length === 0 &&
+    !cursor.droppingOversizedLine &&
+    cursor.offset >= cursor.lastSize
+  );
+}
+
+/** Metadata-only revival check; no descriptor is opened for unchanged files. */
+function dormantFileChanged(
+  source: NormalizedSource,
+  canonicalRoot: string,
+  relativePath: string,
+  cursor: FileCursor,
+): boolean {
+  const candidate = resolve(canonicalRoot, relativePath);
+  if (!isSafeRelativePath(canonicalRoot, candidate)) return false;
+  const verified = verifiedCanonicalStats(source, canonicalRoot, candidate, false);
+  if (!verified) return false;
+  const stats = verified.stats;
+  return (
+    fileIdentity(stats) !== cursor.identity ||
+    stats.size !== cursor.offset ||
+    stats.mtimeMs !== cursor.lastMtimeMs
+  );
 }
 
 function finishBaseline(cursor: FileCursor): void {
