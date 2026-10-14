@@ -26,7 +26,7 @@ const MAX_FILES_PER_CHANNEL = 512;
 // Idle child transcripts at EOF keep a compact dormant cursor instead of an
 // active read slot. Discovery revives them by metadata change, so long-lived
 // channels do not exhaust active admission with finished child sessions.
-// A dormant cursor is a few hundred bytes, so these bound memory to tens of MB.
+// A dormant cursor is a few hundred bytes, so these bound memory to ~tens of MB.
 const MAX_DORMANT_FILES_PER_CHANNEL = 16_384;
 const MAX_DORMANT_FILES_GLOBAL = 65_536;
 const DORMANT_AFTER_IDLE_MS = 5 * 60_000;
@@ -126,7 +126,6 @@ interface DiscoveryCursor {
   incomplete: boolean;
   /** Dormant transcripts listed during this cycle; unseen ones are swept. */
   seenDormant: Set<string>;
-  startedAtMs: number;
 }
 
 interface ChannelCursor {
@@ -135,14 +134,6 @@ interface ChannelCursor {
   rootIdentity?: string;
   rootMissingAtActivation: boolean;
   initialDiscoveryComplete: boolean;
-  /**
-   * Start time of the latest discovery cycle that listed every transcript.
-   * Any file born before it has already been seen, so a later admission of
-   * that file (e.g. after dormant eviction) is history, never new output.
-   */
-  lastCleanCycleStartMs?: number;
-  /** Set once a dormant cursor is forgotten; disables birthtime-less "new" admission. */
-  evictedDormant: boolean;
   files: Map<string, FileCursor>;
   dormantFiles: Map<string, FileCursor>;
   unavailableFiles: Set<string>;
@@ -343,9 +334,7 @@ export class NestedSessionTraceMonitor {
     state.dormantFiles = new Map();
     state.unavailableFiles = new Set();
     state.nextFileIndex = 0;
-    state.lastCleanCycleStartMs = undefined;
-    state.evictedDormant = false;
-    state.discovery = newDiscoveryCursor(this.now());
+    state.discovery = newDiscoveryCursor();
   }
 
   private pollSource(jid: string, state: ChannelCursor, budget: PollBudget): void {
@@ -397,14 +386,13 @@ export class NestedSessionTraceMonitor {
           const clean = state.unavailableFiles.size === 0 && !state.discovery.incomplete;
           if (clean) {
             state.initialDiscoveryComplete = true;
-            state.lastCleanCycleStartMs = state.discovery.startedAtMs;
             // A complete cycle lists every surviving transcript, so dormant
             // cursors that were not seen were deleted or renamed.
             for (const path of [...state.dormantFiles.keys()]) {
               if (!state.discovery.seenDormant.has(path)) state.dormantFiles.delete(path);
             }
           }
-          state.discovery = newDiscoveryCursor(this.now());
+          state.discovery = newDiscoveryCursor();
           break;
         }
         state.discovery.queued.delete(work.relativePath);
@@ -477,7 +465,11 @@ export class NestedSessionTraceMonitor {
       if (dormant) {
         state.discovery.seenDormant.add(relativePath);
         if (!dormantFileChanged(state.source, canonicalRoot, relativePath, dormant)) continue;
+        // Release this dormant slot before making active room, so a swap is
+        // possible even when dormant storage is at its cap.
+        state.dormantFiles.delete(relativePath);
         if (!this.ensureActiveCapacity(state)) {
+          state.dormantFiles.set(relativePath, dormant);
           state.discovery.incomplete = true;
           this.warnThrottled(
             `file-limit:${jid}`,
@@ -489,18 +481,8 @@ export class NestedSessionTraceMonitor {
         // Resume from the retained byte offset. readFile revalidates identity
         // and continuity, so appends are emitted exactly once and rewrites are
         // treated like tail -F replacement rather than replayed as history.
-        state.dormantFiles.delete(relativePath);
         dormant.lastActivityMs = this.now();
         state.files.set(relativePath, dormant);
-        continue;
-      }
-      if (
-        state.evictedDormant &&
-        isUnchangedSinceCleanCycle(state, state.source, canonicalRoot, relativePath)
-      ) {
-        // An evicted transcript that has not changed since a complete cycle
-        // is known history. Skipping it avoids re-admitting and re-evicting
-        // the same finished files every cycle once dormant storage is full.
         continue;
       }
       if (!this.ensureActiveCapacity(state)) {
@@ -533,19 +515,13 @@ export class NestedSessionTraceMonitor {
     const opened = this.openVerifiedFile(state.source, canonicalRoot, relativePath);
     if (opened.kind !== 'opened') return opened.kind;
     try {
-      // A file is new only if no complete earlier discovery could have listed
-      // it. Before the first clean cycle that boundary is activation. Files
-      // admitted late (capacity, budget, or after dormant eviction) are
-      // therefore history and never replayed from offset zero.
-      const birthtimeMs = opened.stats.birthtimeMs;
-      // Same-millisecond births are ambiguous; prefer delivering a just-born
-      // child over dropping its first records.
+      // A transcript whose birthtime clearly predates activation is history
+      // even when it is admitted after the initial discovery completed.
+      const bornBeforeActivation =
+        opened.stats.birthtimeMs > 0 && opened.stats.birthtimeMs < state.activatedAtMs - 1;
       const createdAfterActivation =
-        birthtimeMs > 0
-          ? state.lastCleanCycleStartMs === undefined
-            ? state.initialDiscoveryComplete || birthtimeMs > state.activatedAtMs + 1
-            : birthtimeMs >= state.lastCleanCycleStartMs - 1
-          : state.initialDiscoveryComplete && !state.evictedDormant;
+        (state.initialDiscoveryComplete && !bornBeforeActivation) ||
+        (opened.stats.birthtimeMs > 0 && opened.stats.birthtimeMs > state.activatedAtMs + 1);
       // Existing transcripts can be copied into new forks long after monitoring
       // starts.  Use a per-file admission boundary, not the channel activation
       // time, or those copied historical records are replayed to webhooks.  For
@@ -846,15 +822,11 @@ export class NestedSessionTraceMonitor {
 
   private demoteFile(state: ChannelCursor, relativePath: string, cursor: FileCursor): boolean {
     if (!isDormantEligible(cursor)) return false;
-    if (state.dormantFiles.size >= this.limits.dormantFilesPerChannel) {
-      evictOldestDormant(state);
-    }
-    if (this.dormantTotal() >= this.limits.dormantFilesGlobal) {
-      const largest = [...this.channels.values()].reduce((left, right) =>
-        right.dormantFiles.size > left.dormantFiles.size ? right : left,
-      );
-      evictOldestDormant(largest);
-    }
+    // Dormant cursors are never evicted: a forgotten cursor could only be
+    // re-admitted without its offset, risking history replay. At the caps the
+    // monitor falls back to the original bounded behavior (no new admission).
+    if (state.dormantFiles.size >= this.limits.dormantFilesPerChannel) return false;
+    if (this.dormantTotal() >= this.limits.dormantFilesGlobal) return false;
     state.files.delete(relativePath);
     state.dormantFiles.set(relativePath, cursor);
     // The path may already have been listed earlier in this discovery cycle;
@@ -972,38 +944,21 @@ function newChannelCursor(source: NormalizedSource, activatedAtMs: number): Chan
     activatedAtMs,
     rootMissingAtActivation: pathIsMissing(source.root),
     initialDiscoveryComplete: false,
-    evictedDormant: false,
     files: new Map(),
     dormantFiles: new Map(),
     unavailableFiles: new Set(),
     nextFileIndex: 0,
-    discovery: newDiscoveryCursor(activatedAtMs),
+    discovery: newDiscoveryCursor(),
   };
 }
 
-function newDiscoveryCursor(startedAtMs: number): DiscoveryCursor {
+function newDiscoveryCursor(): DiscoveryCursor {
   return {
-    startedAtMs,
     queue: [{ relativePath: '', depth: 0 }],
     queued: new Set(['']),
     incomplete: false,
     seenDormant: new Set(),
   };
-}
-
-/**
- * Forget the least recently active dormant cursor (only beyond the dormant
- * caps). Unchanged evicted files are skipped by discovery. When one changes
- * it is re-admitted as history (cutoff = now): its earlier records are never
- * replayed, at the cost of records appended before that re-admission.
- */
-function evictOldestDormant(state: ChannelCursor): void {
-  state.evictedDormant = true;
-  let oldest: [string, FileCursor] | undefined;
-  for (const entry of state.dormantFiles) {
-    if (!oldest || entry[1].lastActivityMs < oldest[1].lastActivityMs) oldest = entry;
-  }
-  if (oldest) state.dormantFiles.delete(oldest[0]);
 }
 
 function disposeChannel(state: ChannelCursor): void {
@@ -1211,22 +1166,6 @@ function dormantFileChanged(
     stats.size !== cursor.offset ||
     stats.mtimeMs !== cursor.lastMtimeMs
   );
-}
-
-function isUnchangedSinceCleanCycle(
-  state: ChannelCursor,
-  source: NormalizedSource,
-  canonicalRoot: string,
-  relativePath: string,
-): boolean {
-  const boundary = state.lastCleanCycleStartMs;
-  if (boundary === undefined) return false;
-  const candidate = resolve(canonicalRoot, relativePath);
-  if (!isSafeRelativePath(canonicalRoot, candidate)) return false;
-  const verified = verifiedCanonicalStats(source, canonicalRoot, candidate, false);
-  if (!verified) return false;
-  const { birthtimeMs, mtimeMs } = verified.stats;
-  return birthtimeMs > 0 && birthtimeMs < boundary - 1 && mtimeMs < boundary - 1;
 }
 
 function finishBaseline(cursor: FileCursor): void {
