@@ -1105,10 +1105,12 @@ function resetCursor(descriptor: number, stats: Stats, cursor: FileCursor): void
   cursor.continuity = Buffer.alloc(0);
   cursor.pending = Buffer.alloc(0);
   cursor.droppingOversizedLine = false;
-  // Match tail -F behavior after a detected truncation or replacement: all
-  // content in the rewritten file is live, regardless of its record timestamps.
+  // Match tail -F behavior after a detected truncation or replacement: reread
+  // the rewritten file from the start, but keep the cursor's activation cutoff
+  // so records timestamped before it (e.g. copied fork history rewritten in
+  // place) are not replayed. Untimestamped records are treated as live.
   cursor.baselineComplete = true;
-  cursor.initialScan = false;
+  cursor.initialScan = true;
   cursor.sourceName = undefined;
   setContinuity(descriptor, cursor);
 }

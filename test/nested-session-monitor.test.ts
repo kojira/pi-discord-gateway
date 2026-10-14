@@ -2,8 +2,10 @@ import {
   appendFileSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   renameSync,
   rmSync,
+  statSync,
   symlinkSync,
   truncateSync,
   writeFileSync,
@@ -396,6 +398,47 @@ describe('nested session trace monitoring', () => {
     expect(output).toContain('rewritten-before-old-offset');
     expect(output).toContain('x'.repeat(100));
     expect(output).not.toContain('original');
+  });
+
+  it('does not replay copied fork history after a same-inode header rewrite during the initial scan', () => {
+    const root = temporaryRoot();
+    const { monitor, lines } = harness(root);
+    monitor.pollOnce();
+    monitor.pollOnce();
+
+    // A fork copies the parent history (old timestamps) into one new file;
+    // more records than a single poll reads so the initial scan is partial.
+    const fork = join(root, 'parent', 'forks', 'fork.jsonl');
+    const historyStartMs = Date.parse('2026-01-01T00:00:00Z');
+    const history = Array.from({ length: 1500 }, (_, index) => ({
+      ...assistant(`copied-history-${index}`),
+      timestamp: new Date(historyStartMs + index * 1000).toISOString(),
+    }));
+    writeJsonl(fork, [
+      { type: 'session', id: 'fork', timestamp: new Date().toISOString(), cwd: '/original' },
+      ...history,
+    ]);
+    const inode = statSync(fork).ino;
+    monitor.pollOnce();
+    monitor.pollOnce();
+
+    // Rewrite the whole file in place with only the header cwd changed.
+    const records = readFileSync(fork, 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    records[0] = { ...records[0], cwd: '/aligned' };
+    writeFileSync(fork, `${records.map((record) => JSON.stringify(record)).join('\n')}\n`);
+    expect(statSync(fork).ino).toBe(inode);
+
+    appendRecord(fork, {
+      ...assistant('live-fork-turn'),
+      timestamp: new Date(Date.now() + 1000).toISOString(),
+    });
+    for (let poll = 0; poll < 400; poll += 1) monitor.pollOnce();
+
+    expect(lines.filter((line) => line.includes('copied-history-'))).toEqual([]);
+    expect(lines.join('\n')).toContain('live-fork-turn');
   });
 
   it.runIf(process.platform !== 'win32')(
