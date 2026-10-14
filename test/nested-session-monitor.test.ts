@@ -610,45 +610,70 @@ describe('nested session trace monitoring', () => {
     monitor.stop();
   });
 
-  it('never replays post-activation children after dormant eviction', () => {
+  it('never replays post-activation children after dormant eviction', async () => {
     const root = temporaryRoot();
-    let now = Date.now();
     const lines: string[] = [];
     const monitor = new NestedSessionTraceMonitor({
       listSources: () => [{ jid: 'dc:evict', root }],
       emit: (_source, line) => lines.push(line),
-      now: () => now,
-      limits: { activeFilesPerChannel: 4, dormantFilesPerChannel: 3, dormantFilesGlobal: 100 },
+      limits: {
+        activeFilesPerChannel: 4,
+        dormantFilesPerChannel: 3,
+        dormantFilesGlobal: 100,
+        dormantAfterIdleMs: 0,
+      },
     });
+    const tick = () => new Promise((resolve) => setTimeout(resolve, 5));
     monitor.pollOnce();
     const children = Array.from({ length: 12 }, (_, index) =>
       join(root, 'parent', `child-${String(index).padStart(2, '0')}`, 'session.jsonl'),
     );
     for (const [index, child] of children.entries()) {
-      now += 10;
-      writeJsonl(child, [
-        assistant(`child output ${index}`),
-        { ...assistant(`child output ${index} timed`), timestamp: new Date(now).toISOString() },
-      ]);
+      await tick();
+      writeJsonl(child, [assistant(`child output ${index}`)]);
+      await tick();
+      appendRecord(child, {
+        ...assistant(`child output ${index} timed`),
+        timestamp: new Date().toISOString(),
+      });
       for (let poll = 0; poll < 3; poll += 1) monitor.pollOnce();
     }
-    for (let poll = 0; poll < 60; poll += 1) {
-      now += 61_000;
+    for (let poll = 0; poll < 40; poll += 1) {
+      await tick();
       monitor.pollOnce();
     }
-    const output = lines.join('\n');
-    for (let index = 0; index < children.length; index += 1) {
-      expect(output.split(`child output ${index} timed`).length - 1).toBeLessThanOrEqual(1);
-    }
+    const counts = () =>
+      children.map((_, index) => lines.join('\n').split(`child output ${index} timed`).length - 1);
+    expect(counts()).toEqual(Array(12).fill(1));
     expect(monitor.stats().dormantFiles).toBeLessThanOrEqual(3);
 
-    const before = lines.length;
-    for (let poll = 0; poll < 60; poll += 1) {
-      now += 61_000;
+    for (let poll = 0; poll < 40; poll += 1) {
+      await tick();
       monitor.pollOnce();
     }
-    expect(lines.slice(before)).toEqual([]);
+    // No replay and no admission thrash once finished files were evicted.
+    expect(counts()).toEqual(Array(12).fill(1));
 
+    await tick();
+    const fresh = join(root, 'parent', 'zz-fresh', 'session.jsonl');
+    writeJsonl(fresh, [assistant('fresh after eviction')]);
+    for (let poll = 0; poll < 10; poll += 1) monitor.pollOnce();
+    await tick();
+    appendRecord(fresh, assistant('fresh append'));
+    // An evicted transcript has no retained offset. Its first change only
+    // re-admits it as history (never replayed); later appends are delivered.
+    appendRecord(children[0], assistant('evicted readmission'));
+    for (let poll = 0; poll < 20; poll += 1) {
+      await tick();
+      monitor.pollOnce();
+    }
+    appendRecord(children[0], assistant('evicted append'));
+    for (let poll = 0; poll < 5; poll += 1) monitor.pollOnce();
+    const after = lines.join('\n');
+    expect(after.split('fresh after eviction').length - 1).toBe(1);
+    expect(after.split('fresh append').length - 1).toBe(1);
+    expect(after.split('evicted append').length - 1).toBe(1);
+    expect(counts()).toEqual(Array(12).fill(1));
     monitor.stop();
   });
 

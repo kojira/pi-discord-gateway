@@ -26,7 +26,8 @@ const MAX_FILES_PER_CHANNEL = 512;
 // Idle child transcripts at EOF keep a compact dormant cursor instead of an
 // active read slot. Discovery revives them by metadata change, so long-lived
 // channels do not exhaust active admission with finished child sessions.
-const MAX_DORMANT_FILES_PER_CHANNEL = 4096;
+// A dormant cursor is a few hundred bytes, so these bound memory to tens of MB.
+const MAX_DORMANT_FILES_PER_CHANNEL = 16_384;
 const MAX_DORMANT_FILES_GLOBAL = 65_536;
 const DORMANT_AFTER_IDLE_MS = 5 * 60_000;
 const MAX_CHANNELS_VISITED_PER_POLL = 16;
@@ -82,6 +83,7 @@ export interface NestedSessionMonitorLimits {
   activeFilesPerChannel: number;
   dormantFilesPerChannel: number;
   dormantFilesGlobal: number;
+  dormantAfterIdleMs: number;
 }
 
 interface NormalizedSource extends NestedSessionSource {
@@ -209,6 +211,7 @@ export class NestedSessionTraceMonitor {
       activeFilesPerChannel: MAX_FILES_PER_CHANNEL,
       dormantFilesPerChannel: MAX_DORMANT_FILES_PER_CHANNEL,
       dormantFilesGlobal: MAX_DORMANT_FILES_GLOBAL,
+      dormantAfterIdleMs: DORMANT_AFTER_IDLE_MS,
       ...dependencies.limits,
     };
   }
@@ -491,6 +494,15 @@ export class NestedSessionTraceMonitor {
         state.files.set(relativePath, dormant);
         continue;
       }
+      if (
+        state.evictedDormant &&
+        isUnchangedSinceCleanCycle(state, state.source, canonicalRoot, relativePath)
+      ) {
+        // An evicted transcript that has not changed since a complete cycle
+        // is known history. Skipping it avoids re-admitting and re-evicting
+        // the same finished files every cycle once dormant storage is full.
+        continue;
+      }
       if (!this.ensureActiveCapacity(state)) {
         state.discovery.incomplete = true;
         this.warnThrottled(
@@ -598,7 +610,10 @@ export class NestedSessionTraceMonitor {
         budget,
       );
       if (result.missing) state.files.delete(relativePath);
-      else if (result.bytes === 0 && this.now() - cursor.lastActivityMs >= DORMANT_AFTER_IDLE_MS) {
+      else if (
+        result.bytes === 0 &&
+        this.now() - cursor.lastActivityMs >= this.limits.dormantAfterIdleMs
+      ) {
         this.demoteFile(state, relativePath, cursor);
       }
       channelBytes -= result.bytes;
@@ -977,9 +992,10 @@ function newDiscoveryCursor(startedAtMs: number): DiscoveryCursor {
 }
 
 /**
- * Forget the least recently active dormant cursor. Discovery will list and
- * re-admit the file, but its birthtime predates a completed discovery cycle,
- * so it is admitted as history (cutoff = now) and only later appends emit.
+ * Forget the least recently active dormant cursor (only beyond the dormant
+ * caps). Unchanged evicted files are skipped by discovery. When one changes
+ * it is re-admitted as history (cutoff = now): its earlier records are never
+ * replayed, at the cost of records appended before that re-admission.
  */
 function evictOldestDormant(state: ChannelCursor): void {
   state.evictedDormant = true;
@@ -1195,6 +1211,22 @@ function dormantFileChanged(
     stats.size !== cursor.offset ||
     stats.mtimeMs !== cursor.lastMtimeMs
   );
+}
+
+function isUnchangedSinceCleanCycle(
+  state: ChannelCursor,
+  source: NormalizedSource,
+  canonicalRoot: string,
+  relativePath: string,
+): boolean {
+  const boundary = state.lastCleanCycleStartMs;
+  if (boundary === undefined) return false;
+  const candidate = resolve(canonicalRoot, relativePath);
+  if (!isSafeRelativePath(canonicalRoot, candidate)) return false;
+  const verified = verifiedCanonicalStats(source, canonicalRoot, candidate, false);
+  if (!verified) return false;
+  const { birthtimeMs, mtimeMs } = verified.stats;
+  return birthtimeMs > 0 && birthtimeMs < boundary - 1 && mtimeMs < boundary - 1;
 }
 
 function finishBaseline(cursor: FileCursor): void {
