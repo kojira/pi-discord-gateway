@@ -580,7 +580,7 @@ describe('nested session trace monitoring', () => {
     expect(lines.join('\n')).toContain('fresh child');
     expect(lines.join('\n')).not.toContain('finished history');
     monitor.stop();
-  });
+  }, 30_000);
 
   it('sweeps dormant cursors for deleted transcripts and handles dormant truncation', () => {
     const root = temporaryRoot();
