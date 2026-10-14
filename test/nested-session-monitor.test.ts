@@ -610,6 +610,48 @@ describe('nested session trace monitoring', () => {
     monitor.stop();
   });
 
+  it('never replays post-activation children after dormant eviction', () => {
+    const root = temporaryRoot();
+    let now = Date.now();
+    const lines: string[] = [];
+    const monitor = new NestedSessionTraceMonitor({
+      listSources: () => [{ jid: 'dc:evict', root }],
+      emit: (_source, line) => lines.push(line),
+      now: () => now,
+      limits: { activeFilesPerChannel: 4, dormantFilesPerChannel: 3, dormantFilesGlobal: 100 },
+    });
+    monitor.pollOnce();
+    const children = Array.from({ length: 12 }, (_, index) =>
+      join(root, 'parent', `child-${String(index).padStart(2, '0')}`, 'session.jsonl'),
+    );
+    for (const [index, child] of children.entries()) {
+      now += 10;
+      writeJsonl(child, [
+        assistant(`child output ${index}`),
+        { ...assistant(`child output ${index} timed`), timestamp: new Date(now).toISOString() },
+      ]);
+      for (let poll = 0; poll < 3; poll += 1) monitor.pollOnce();
+    }
+    for (let poll = 0; poll < 60; poll += 1) {
+      now += 61_000;
+      monitor.pollOnce();
+    }
+    const output = lines.join('\n');
+    for (let index = 0; index < children.length; index += 1) {
+      expect(output.split(`child output ${index} timed`).length - 1).toBeLessThanOrEqual(1);
+    }
+    expect(monitor.stats().dormantFiles).toBeLessThanOrEqual(3);
+
+    const before = lines.length;
+    for (let poll = 0; poll < 60; poll += 1) {
+      now += 61_000;
+      monitor.pollOnce();
+    }
+    expect(lines.slice(before)).toEqual([]);
+
+    monitor.stop();
+  });
+
   it('demotes idle child transcripts and revives them on append', () => {
     const root = temporaryRoot();
     let now = 1_000_000;

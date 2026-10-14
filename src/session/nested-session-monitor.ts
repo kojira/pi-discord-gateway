@@ -74,6 +74,14 @@ export interface NestedSessionMonitorDependencies {
   beforeRootOpen?(path: string): void;
   beforeFileOpen?(path: string): void;
   beforeDirectoryOpen?(path: string): void;
+  /** Test seam for cursor capacity limits; production uses the defaults. */
+  limits?: Partial<NestedSessionMonitorLimits>;
+}
+
+export interface NestedSessionMonitorLimits {
+  activeFilesPerChannel: number;
+  dormantFilesPerChannel: number;
+  dormantFilesGlobal: number;
 }
 
 interface NormalizedSource extends NestedSessionSource {
@@ -116,6 +124,7 @@ interface DiscoveryCursor {
   incomplete: boolean;
   /** Dormant transcripts listed during this cycle; unseen ones are swept. */
   seenDormant: Set<string>;
+  startedAtMs: number;
 }
 
 interface ChannelCursor {
@@ -124,6 +133,14 @@ interface ChannelCursor {
   rootIdentity?: string;
   rootMissingAtActivation: boolean;
   initialDiscoveryComplete: boolean;
+  /**
+   * Start time of the latest discovery cycle that listed every transcript.
+   * Any file born before it has already been seen, so a later admission of
+   * that file (e.g. after dormant eviction) is history, never new output.
+   */
+  lastCleanCycleStartMs?: number;
+  /** Set once a dormant cursor is forgotten; disables birthtime-less "new" admission. */
+  evictedDormant: boolean;
   files: Map<string, FileCursor>;
   dormantFiles: Map<string, FileCursor>;
   unavailableFiles: Set<string>;
@@ -185,8 +202,16 @@ export class NestedSessionTraceMonitor {
   private polling = false;
   private nextChannelIndex = 0;
   private lastUsage: NestedSessionPollUsage = emptyPollUsage();
+  private readonly limits: NestedSessionMonitorLimits;
 
-  constructor(private readonly dependencies: NestedSessionMonitorDependencies) {}
+  constructor(private readonly dependencies: NestedSessionMonitorDependencies) {
+    this.limits = {
+      activeFilesPerChannel: MAX_FILES_PER_CHANNEL,
+      dormantFilesPerChannel: MAX_DORMANT_FILES_PER_CHANNEL,
+      dormantFilesGlobal: MAX_DORMANT_FILES_GLOBAL,
+      ...dependencies.limits,
+    };
+  }
 
   start(): void {
     if (this.timer || this.stopped) return;
@@ -315,7 +340,9 @@ export class NestedSessionTraceMonitor {
     state.dormantFiles = new Map();
     state.unavailableFiles = new Set();
     state.nextFileIndex = 0;
-    state.discovery = newDiscoveryCursor();
+    state.lastCleanCycleStartMs = undefined;
+    state.evictedDormant = false;
+    state.discovery = newDiscoveryCursor(this.now());
   }
 
   private pollSource(jid: string, state: ChannelCursor, budget: PollBudget): void {
@@ -367,13 +394,14 @@ export class NestedSessionTraceMonitor {
           const clean = state.unavailableFiles.size === 0 && !state.discovery.incomplete;
           if (clean) {
             state.initialDiscoveryComplete = true;
+            state.lastCleanCycleStartMs = state.discovery.startedAtMs;
             // A complete cycle lists every surviving transcript, so dormant
             // cursors that were not seen were deleted or renamed.
             for (const path of [...state.dormantFiles.keys()]) {
               if (!state.discovery.seenDormant.has(path)) state.dormantFiles.delete(path);
             }
           }
-          state.discovery = newDiscoveryCursor();
+          state.discovery = newDiscoveryCursor(this.now());
           break;
         }
         state.discovery.queued.delete(work.relativePath);
@@ -493,14 +521,19 @@ export class NestedSessionTraceMonitor {
     const opened = this.openVerifiedFile(state.source, canonicalRoot, relativePath);
     if (opened.kind !== 'opened') return opened.kind;
     try {
-      // A transcript whose birthtime clearly predates activation is history
-      // even when admitted after the initial discovery (e.g. after a dormant
-      // cursor was evicted), so it must not be replayed from offset zero.
-      const bornBeforeActivation =
-        opened.stats.birthtimeMs > 0 && opened.stats.birthtimeMs < state.activatedAtMs - 1;
+      // A file is new only if no complete earlier discovery could have listed
+      // it. Before the first clean cycle that boundary is activation. Files
+      // admitted late (capacity, budget, or after dormant eviction) are
+      // therefore history and never replayed from offset zero.
+      const birthtimeMs = opened.stats.birthtimeMs;
+      // Same-millisecond births are ambiguous; prefer delivering a just-born
+      // child over dropping its first records.
       const createdAfterActivation =
-        (state.initialDiscoveryComplete && !bornBeforeActivation) ||
-        (opened.stats.birthtimeMs > 0 && opened.stats.birthtimeMs > state.activatedAtMs + 1);
+        birthtimeMs > 0
+          ? state.lastCleanCycleStartMs === undefined
+            ? state.initialDiscoveryComplete || birthtimeMs > state.activatedAtMs + 1
+            : birthtimeMs >= state.lastCleanCycleStartMs - 1
+          : state.initialDiscoveryComplete && !state.evictedDormant;
       // Existing transcripts can be copied into new forks long after monitoring
       // starts.  Use a per-file admission boundary, not the channel activation
       // time, or those copied historical records are replayed to webhooks.  For
@@ -784,7 +817,9 @@ export class NestedSessionTraceMonitor {
    * active cursor still has unread or pending data, or dormant storage is full.
    */
   private ensureActiveCapacity(state: ChannelCursor): boolean {
-    if (state.files.size + state.unavailableFiles.size < MAX_FILES_PER_CHANNEL) return true;
+    if (state.files.size + state.unavailableFiles.size < this.limits.activeFilesPerChannel) {
+      return true;
+    }
     let candidate: [string, FileCursor] | undefined;
     for (const entry of state.files) {
       if (!isDormantEligible(entry[1])) continue;
@@ -796,10 +831,10 @@ export class NestedSessionTraceMonitor {
 
   private demoteFile(state: ChannelCursor, relativePath: string, cursor: FileCursor): boolean {
     if (!isDormantEligible(cursor)) return false;
-    if (state.dormantFiles.size >= MAX_DORMANT_FILES_PER_CHANNEL) {
+    if (state.dormantFiles.size >= this.limits.dormantFilesPerChannel) {
       evictOldestDormant(state);
     }
-    if (this.dormantTotal() >= MAX_DORMANT_FILES_GLOBAL) {
+    if (this.dormantTotal() >= this.limits.dormantFilesGlobal) {
       const largest = [...this.channels.values()].reduce((left, right) =>
         right.dormantFiles.size > left.dormantFiles.size ? right : left,
       );
@@ -922,16 +957,18 @@ function newChannelCursor(source: NormalizedSource, activatedAtMs: number): Chan
     activatedAtMs,
     rootMissingAtActivation: pathIsMissing(source.root),
     initialDiscoveryComplete: false,
+    evictedDormant: false,
     files: new Map(),
     dormantFiles: new Map(),
     unavailableFiles: new Set(),
     nextFileIndex: 0,
-    discovery: newDiscoveryCursor(),
+    discovery: newDiscoveryCursor(activatedAtMs),
   };
 }
 
-function newDiscoveryCursor(): DiscoveryCursor {
+function newDiscoveryCursor(startedAtMs: number): DiscoveryCursor {
   return {
+    startedAtMs,
     queue: [{ relativePath: '', depth: 0 }],
     queued: new Set(['']),
     incomplete: false,
@@ -940,11 +977,12 @@ function newDiscoveryCursor(): DiscoveryCursor {
 }
 
 /**
- * Forget the least recently active dormant cursor. If that transcript is
- * appended later it is re-admitted; its pre-activation birthtime keeps old
- * records suppressed, so only bounded memory is traded, not replay safety.
+ * Forget the least recently active dormant cursor. Discovery will list and
+ * re-admit the file, but its birthtime predates a completed discovery cycle,
+ * so it is admitted as history (cutoff = now) and only later appends emit.
  */
 function evictOldestDormant(state: ChannelCursor): void {
+  state.evictedDormant = true;
   let oldest: [string, FileCursor] | undefined;
   for (const entry of state.dormantFiles) {
     if (!oldest || entry[1].lastActivityMs < oldest[1].lastActivityMs) oldest = entry;
