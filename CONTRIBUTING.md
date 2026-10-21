@@ -11,10 +11,12 @@ Thanks for your interest in contributing! This guide will help you get started.
    cd pi-discord-gateway
    ```
 
-2. **Install dependencies** (Node.js >= 20 required):
+2. **Install pinned tools and dependencies** (install [mise](https://mise.jdx.dev/) first):
 
    ```bash
-   pnpm install --frozen-lockfile
+   mise trust
+   mise install  # Node 22.23.4, pnpm 10.16.1
+   mise exec -- pnpm install --frozen-lockfile
    ```
 
 3. **Copy the environment file** and fill in your Discord bot token:
@@ -26,8 +28,8 @@ Thanks for your interest in contributing! This guide will help you get started.
 4. **Build and test**:
 
    ```bash
-   pnpm run build
-   pnpm test
+   mise exec -- pnpm run build
+   mise exec -- pnpm test
    ```
 
 ## Development Workflow
@@ -41,16 +43,16 @@ Thanks for your interest in contributing! This guide will help you get started.
 2. Make your changes. Run the dev server with:
 
    ```bash
-   pnpm run dev
+   mise exec -- pnpm run dev
    ```
 
 3. Ensure your code passes all checks:
 
    ```bash
-   pnpm run lint      # ESLint
-   pnpm run format    # Prettier (auto-fix)
-   pnpm test          # Vitest
-   pnpm run build     # TypeScript compilation
+   mise exec -- pnpm run lint      # ESLint
+   mise exec -- pnpm run format    # Prettier (auto-fix)
+   mise exec -- pnpm test          # Vitest
+   mise exec -- pnpm run build     # TypeScript compilation
    ```
 
 4. Commit your changes with a descriptive message following [Conventional Commits](https://www.conventionalcommits.org/):
