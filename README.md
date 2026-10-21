@@ -341,9 +341,34 @@ pnpm dlx piscord@latest setup
 ```bash
 git clone https://github.com/Crokily/pi-discord-gateway.git
 cd pi-discord-gateway
-pnpm install --frozen-lockfile && pnpm run build
-node dist/cli/index.js setup
+# Install mise first: https://mise.jdx.dev/
+mise trust
+mise install  # .mise.toml: Node 22.23.4, pnpm 10.16.1
+mise exec -- pnpm install --frozen-lockfile
+mise exec -- pnpm run build
+mise exec -- node --test scripts/node.integration.mjs
+./scripts/node.sh dist/cli/index.js setup
+mise exec -- pnpm start
 ```
+
+`mise exec -- pnpm start` uses the pinned Node for a foreground source start.
+For direct Node invocation, `scripts/node.sh` resolves Node from this checkout's
+`.mise.toml`, not nvm or the caller's directory, and prepends its bin directory
+to child `PATH`. `mise` must be on the explicit service PATH and the pinned
+runtime must already be installed. Other CLI actions can be run with
+`./scripts/node.sh dist/cli/index.js <action>`.
+
+For a new daemon, invoke `daemon install` through that launcher: the existing
+installer records the selected `process.execPath` (and PATH on macOS). Installing
+on macOS also starts the daemon. Do not reinstall or restart a live daemon merely
+to test this setup. Existing services do not switch when `.mise.toml` changes:
+back up selectors, preserve config/identity and reviewed JS artifacts, drain work,
+and update the executable and child PATH in a separately approved maintenance
+window. Replace any hardcoded Pi Node wrapper too; recreate persistent Pi/runner
+processes and verify each loaded executable. Keep previous selectors, runtime and
+artifacts for rollback. Returning to a vulnerable runtime is temporary recovery,
+not security completion. Check native addons under the selected Node before
+cutover; Node 22.23.2 and 22.23.4 share module ABI 127.
 
 ## Troubleshooting
 
