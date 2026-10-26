@@ -12,7 +12,8 @@ settings separately from the last acknowledged runtime state.
 
 - Pi advertises `get_state.capabilities.guardedSettings === 1` and a nonnegative
   integer `settingsRevision`. Gateway verifies the effective model/thinking and
-  uses `set_runtime_settings` with `expectedRevision` when they differ.
+  uses `set_runtime_settings` with `expectedRevision` when they differ. Revision
+  is process-wide and monotonic across session replacements.
 - The combined native transaction checks parent activity and revision after any
   asynchronous auth preparation, before mutating either setting. It replies with
   `applied: true`, the effective model/thinking and revision, or a non-mutating
@@ -22,7 +23,13 @@ settings separately from the last acknowledged runtime state.
   the latest desired selection after awaits, and writes the prompt without an
   await after its final desired-state check. A later selection is pending for
   the next request. `prompt.expectedSettingsRevision` guards native acceptance;
-  only `accepted: false` with `busy` / `settings_changed` proves non-acceptance.
+  only `success: true, accepted: false` with `busy` / `settings_changed` proves
+  non-acceptance, before any effectful extension hook/command. Pi reserves guarded
+  admission before hooks. A subsequent preflight failure or revision conflict
+  returns a single `success: false` response (no earlier successful ACK), never
+  `accepted: false`. Successful preflight returns `accepted: true`; this is
+  admission, not successful execution. Errors, missing/malformed ACKs and
+  post-admission failures are terminal/non-replayable in Gateway.
 - Definitively unsent/rejected input keeps its existing DB row pending. Sent
   input with an uncertain response is never automatically replayed. User log
   insertion occurs at input consumption, not on every pending admission attempt.

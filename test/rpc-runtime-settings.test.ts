@@ -82,6 +82,17 @@ async function handle(c) {
   if(c.expectedSettingsRevision!==settingsRevision) { ack(c,{accepted:false,reason:'settings_changed'}); return; }
   active=true; const runId='run-'+(++count);
   appendFileSync(file('accepted'),JSON.stringify({message:c.message,model,thinkingLevel,pid:process.pid})+'\\n');
+  // Admission is reserved before any effectful hook. A later failure cannot
+  // truthfully return accepted:false, even before a user message is appended.
+  appendFileSync(file('hook-effects'),JSON.stringify({message:c.message})+'\\n');
+  for(const failure of ['preflight-error','late-revision','missing-ack','invalid-ack']) {
+   if(!has(failure)) continue;
+   unlinkSync(file(failure));
+   if(failure==='missing-ack') { process.exit(9); }
+   if(failure==='invalid-ack') { ack(c,{}); return; }
+   if(failure==='late-revision') settingsRevision++;
+   send({type:'response',id:c.id,command:c.type,success:false,error:failure}); return;
+  }
   ack(c,{accepted:true});
   send({type:'agent_start',runId}); send({type:'message_start',message:{role:'user',content:c.message}});
   if(c.message==='hold') await wait('release-parent');
@@ -126,6 +137,13 @@ process.stdin.on('end',()=>process.exit(0));
     commands: () =>
       existsSync(join(root, 'commands'))
         ? readFileSync(join(root, 'commands'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line))
+        : [],
+    hookEffects: () =>
+      existsSync(join(root, 'hook-effects'))
+        ? readFileSync(join(root, 'hook-effects'), 'utf8')
             .trim()
             .split('\n')
             .map((line) => JSON.parse(line))
@@ -257,6 +275,71 @@ it('does not let an exiting settings transaction unregister a later connection',
   expect(f.accepted().filter((row) => row.message === 'next')).toHaveLength(1);
 });
 
+it.each(['preflight-error', 'late-revision', 'missing-ack', 'invalid-ack'])(
+  'never requeues or repeats an effectful hook after admitted %s',
+  async (failure) => {
+    const f = fixture();
+    db.initDb();
+    const reader = new Database(config.dbPath, { readonly: true });
+    db.registerChannel({
+      jid: 'dc:hook',
+      name: 'hook',
+      folder: 'channel',
+      requiresTrigger: false,
+      isMain: false,
+      modelOverride: 'test/a',
+      thinkingOverride: '',
+      cwdOverride: f.root,
+    });
+    const enqueue = (content: string) =>
+      db.enqueueMessage({
+        channelJid: 'dc:hook',
+        sender: 'user',
+        senderName: 'User',
+        content,
+        timestamp: new Date().toISOString(),
+      });
+    try {
+      f.touch(failure);
+      enqueue('effectful request');
+      startProcessingLoop();
+      await vi.waitFor(() =>
+        expect(reader.prepare('select status from message_queue where rowid=1').get()).toEqual({
+          status: 'failed',
+        }),
+      );
+      // A later ordinary input succeeds; the failed intent is never replayed
+      // into that fresh connection, even though its user message was not seen.
+      enqueue('control');
+      await vi.waitFor(() =>
+        expect(reader.prepare('select status from message_queue where rowid=2').get()).toEqual({
+          status: 'done',
+        }),
+      );
+      expect(reader.prepare('select status from message_queue order by rowid').all()).toEqual([
+        { status: 'failed' },
+        { status: 'done' },
+      ]);
+      expect(
+        f
+          .commands()
+          .filter((c) => c.type === 'prompt')
+          .map((c) => c.message),
+      ).toEqual(['[Discord user: User]\neffectful request', '[Discord user: User]\ncontrol']);
+      expect(f.hookEffects()).toEqual([
+        { message: '[Discord user: User]\neffectful request' },
+        { message: '[Discord user: User]\ncontrol' },
+      ]);
+      expect(
+        reader.prepare("select content from message_log where role='user' order by rowid").all(),
+      ).toEqual([{ content: 'control' }]);
+    } finally {
+      await stopProcessingLoop({ timeoutMs: 100 });
+      reader.close();
+    }
+  },
+);
+
 it('preserves the real queue across settings busy and guarded prompt refusal, without replay', async () => {
   const f = fixture();
   db.initDb();
@@ -326,6 +409,8 @@ it('preserves the real queue across settings busy and guarded prompt refusal, wi
     expect(
       reader.prepare("select content from message_log where role='user' order by rowid").all(),
     ).toEqual([{ content: 'first' }, { content: 'second' }, { content: 'third' }]);
+    // Definite pre-hook refusals above cannot have executed the hook.
+    expect(f.hookEffects()).toEqual(f.accepted().map(({ message }) => ({ message })));
     // A DB-only setter is reconciled even with no new user message.
     db.setChannelModelOverride('dc:settings', 'test/c');
     await vi.waitFor(() =>
