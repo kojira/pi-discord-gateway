@@ -81,6 +81,16 @@ function channel(id: string, modelOverride: string, thinkingOverride: string) {
 }
 
 describe('model mutations after a shared early ACK', () => {
+  it('reports a saved desired model separately from an absent retained runtime', async () => {
+    channel('saved', 'test/plain', '');
+    const { interaction, editReply } = command('model', 'saved', 'test/reason');
+    await handleInteraction(interaction as any);
+    expect(getChannel('dc:saved')?.modelOverride).toBe('test/reason');
+    expect(editReply.mock.calls[0]?.[0]?.content).toContain('Desired model saved as test/reason');
+    expect(editReply.mock.calls[0]?.[0]?.content).toContain('No retained runtime');
+    expect(editReply.mock.calls[0]?.[0]?.content).not.toContain('Applied:');
+  });
+
   it('waits asynchronously for cold model metadata before clamping thinking', async () => {
     channel('thinking', 'test/plain', '');
     const { interaction, editReply } = command('thinking', 'thinking');

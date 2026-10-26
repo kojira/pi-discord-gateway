@@ -15,6 +15,7 @@ vi.mock('../src/agent/invoke.js', () => ({
   invokeAgent: mocks.invoke,
   steerActiveAgent: vi.fn(),
   hasResidentAgent: () => true,
+  refreshResidentSettings: vi.fn(),
   stopResidentAgent: mocks.stop,
   shutdownResidentAgents: mocks.shutdown,
 }));
