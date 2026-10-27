@@ -29,10 +29,16 @@ settings separately from the last acknowledged runtime state.
   returns a single `success: false` response (no earlier successful ACK), never
   `accepted: false`. Successful preflight returns `accepted: true`; this is
   admission, not successful execution. Errors, missing/malformed ACKs and
-  post-admission failures are terminal/non-replayable in Gateway.
+  post-admission failures are terminal/non-replayable in Gateway. A well-formed
+  prompt error before user consumption fails only that request and detaches its
+  callbacks/abort signal; the connection and independent children stay alive.
+  Malformed/uncertain protocol responses retain the separate connection-failure
+  cleanup path, never a replay path.
 - Definitively unsent/rejected input keeps its existing DB row pending. Sent
-  input with an uncertain response is never automatically replayed. User log
-  insertion occurs at input consumption, not on every pending admission attempt.
+  input with an uncertain response is never automatically replayed. Persistent
+  user-log insertion occurs at input consumption, not on every pending admission
+  attempt. Nonpersistent requests retain their original dispatch-time logging,
+  including when Pi input hooks transform the prompt.
 - A changed selection also prevents new steering into the old selected run;
   already accepted steering retains its existing consumption/uncertainty rules.
 - No settings failure invokes stop, clears queues, rotates sessions or kills
@@ -50,7 +56,9 @@ Executable, working-directory and extra-argument changes remain explicitly
 pending: full child/background idleness is not available, so Gateway does not
 retire the retained process automatically. Resetting to an unknown implicit Pi
 default also remains pending; choose an explicit model/thinking selection to
-reconcile it. Omitted native transaction fields mean retain, not reset.
+reconcile it. Omitted native transaction fields mean retain, not reset. Explicit
+selections become managed even when the runtime already matches and no settings
+mutation is needed; a later implicit reset still requires default resolution.
 
 ## Compatibility and compaction
 

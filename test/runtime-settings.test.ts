@@ -17,14 +17,14 @@ const state = {
   thinkingLevel: 'off',
 };
 
-function setup() {
-  let desired = { ...initial };
+function setup(launched: RuntimeSettings = initial) {
+  let desired = { ...launched };
   let current = true;
   const send = vi
     .fn<(command: Record<string, unknown>) => Promise<SettingsRpcResponse>>()
     .mockResolvedValue({ success: true, data: state });
   const reconciler = new RuntimeSettingsReconciler(
-    initial,
+    launched,
     () => desired,
     send,
     () => current,
@@ -42,6 +42,27 @@ function setup() {
 }
 
 describe('guarded runtime settings admission', () => {
+  it.each(['model', 'thinking'] as const)(
+    'keeps an implicit %s reset pending after a matching explicit selection',
+    async (field) => {
+      const f = setup({ processIdentity: initial.processIdentity });
+      expect(await f.reconciler.reconcile()).toEqual({ ready: true, revision: 0 });
+      f.change({ [field]: initial[field] });
+      expect(await f.reconciler.reconcile()).toEqual({ ready: true, revision: 0 });
+      expect(f.reconciler.describe()).toContain('Applied:');
+      f.change({ [field]: undefined });
+      expect(await f.reconciler.reconcile()).toMatchObject({
+        ready: false,
+        reason: expect.stringContaining('Implicit Pi defaults'),
+      });
+      expect(f.reconciler.describe()).not.toContain('Applied:');
+      expect(f.send.mock.calls.map(([command]) => command.type)).toEqual([
+        'get_state',
+        'get_state',
+      ]);
+    },
+  );
+
   it('preserves legacy unchanged behavior, blocks changed settings, then allows reversion', async () => {
     const f = setup();
     f.send.mockResolvedValue({ success: true, data: { capabilities: { guardedSteer: 1 } } });

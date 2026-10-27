@@ -481,6 +481,10 @@ async function processMessage(
 
   try {
     const prompt = `[Discord user: ${senderName}]\n${content}`;
+    // Legacy requests are not retried for settings admission. Preserve their
+    // original logging policy even when Pi input hooks transform the prompt.
+    const logOnConsumption = config.piRpcPersistent;
+    if (!logOnConsumption) logMessage(jid, 'user', content);
 
     const cwd = channel.cwdOverride || config.piCwd;
     // Startup warms catalogs without blocking Discord. A queued turn needing
@@ -564,9 +568,11 @@ async function processMessage(
             },
           }
         : undefined,
-      onInputConsumed: () => {
-        if (taskResourcesAvailable && !signal.aborted) logMessage(jid, 'user', content);
-      },
+      onInputConsumed: logOnConsumption
+        ? () => {
+            if (taskResourcesAvailable && !signal.aborted) logMessage(jid, 'user', content);
+          }
+        : undefined,
       onAssistantMessage: async (text) => {
         lastAttemptedText = text;
         lastDeliverySucceeded = await sendResponse(jid, text, signal);

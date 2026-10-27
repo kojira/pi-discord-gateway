@@ -63,6 +63,12 @@ const finish = (runId, text) => {
  send({type:'message_end',message:{role:'assistant',content:[{type:'text',text}],stopReason:'stop'}});
  active=false; send({type:'agent_settled',runId});
 };
+const launchHeldChild = () => {
+ const code = 'const fs=require("node:fs"); const timer=setInterval(()=>{if(fs.existsSync('+JSON.stringify(file('release-child'))+')) clearInterval(timer);},10);';
+ const child=spawn(process.execPath,['-e',code]);
+ writeFileSync(file('child-pid'),String(child.pid));
+ child.on('exit',code=>{writeFileSync(file('child-exit'),String(code)); send({type:'agent_start',runId:'child-result'}); finish('child-result','child complete');});
+};
 async function handle(c) {
  appendFileSync(file('commands'),JSON.stringify(c)+'\\n');
  if(c.type==='get_state') { ack(c,state()); return; }
@@ -79,22 +85,25 @@ async function handle(c) {
  if(c.type==='prompt') {
   if(has('reject-prompt')) { unlinkSync(file('reject-prompt')); settingsRevision++; ack(c,{accepted:false,reason:'settings_changed'}); return; }
   if(active || has('compact')) { ack(c,{accepted:false,reason:'busy'}); return; }
-  if(c.expectedSettingsRevision!==settingsRevision) { ack(c,{accepted:false,reason:'settings_changed'}); return; }
+  if(c.expectedSettingsRevision!==undefined && c.expectedSettingsRevision!==settingsRevision) { ack(c,{accepted:false,reason:'settings_changed'}); return; }
   active=true; const runId='run-'+(++count);
   appendFileSync(file('accepted'),JSON.stringify({message:c.message,model,thinkingLevel,pid:process.pid})+'\\n');
   // Admission is reserved before any effectful hook. A later failure cannot
   // truthfully return accepted:false, even before a user message is appended.
   appendFileSync(file('hook-effects'),JSON.stringify({message:c.message})+'\\n');
+  if(has('hook-child')) { unlinkSync(file('hook-child')); launchHeldChild(); }
   for(const failure of ['preflight-error','late-revision','missing-ack','invalid-ack']) {
    if(!has(failure)) continue;
    unlinkSync(file(failure));
    if(failure==='missing-ack') { process.exit(9); }
    if(failure==='invalid-ack') { ack(c,{}); return; }
-   if(failure==='late-revision') settingsRevision++;
+   if(failure==='late-revision') { settingsRevision++; thinkingLevel='low'; }
+   active=false;
    send({type:'response',id:c.id,command:c.type,success:false,error:failure}); return;
   }
   ack(c,{accepted:true});
-  send({type:'agent_start',runId}); send({type:'message_start',message:{role:'user',content:c.message}});
+  send({type:'agent_start',runId}); send({type:'message_start',message:{role:'user',content:has('transform-input') ? 'transformed input' : c.message}});
+  if(c.message==='child-held') launchHeldChild();
   if(c.message==='hold') await wait('release-parent');
   if(c.message==='child') {
    const child=spawn(process.execPath,['-e', 'setTimeout(()=>{},250)']);
@@ -219,6 +228,97 @@ it('preserves independent child work and delayed delivery during an idle parent 
   expect(new Set(f.accepted().map((row) => row.pid)).size).toBe(1);
 });
 
+it.each([
+  ['initial', 'preflight-error'],
+  ['initial', 'late-revision'],
+  ['retained', 'preflight-error'],
+  ['retained', 'late-revision'],
+])('retains child work after a %s prompt %s without replay', async (connection, failure) => {
+  const f = fixture();
+  const controller = new AbortController();
+  try {
+    if (connection === 'retained') await invokeAgent('channel', 'child-held', f.options);
+    else f.touch('hook-child');
+    f.touch(failure);
+    const result = await invokeAgent('channel', 'effectful failure', {
+      ...f.options,
+      signal: controller.signal,
+    });
+    expect(result).toEqual({ ok: false, text: '', error: failure });
+    expect(hasResidentAgent('channel')).toBe(true);
+    expect(f.commands().some((c) => ['abort', 'clear_queue'].includes(c.type))).toBe(false);
+    expect(existsSync(join(f.root, 'child-exit'))).toBe(false);
+    expect(() =>
+      process.kill(Number(readFileSync(join(f.root, 'child-pid'), 'utf8')), 0),
+    ).not.toThrow();
+    controller.abort(); // A completed failed request cannot stop its retained connection.
+    expect((await invokeAgent('channel', 'control', f.options)).text).toBe('a/off');
+    expect(new Set(f.accepted().map((row) => row.pid)).size).toBe(1);
+    expect(
+      f.commands().filter((c) => c.type === 'prompt' && c.message === 'effectful failure'),
+    ).toHaveLength(1);
+    expect(f.hookEffects().filter((row) => row.message === 'effectful failure')).toHaveLength(1);
+    f.touch('release-child');
+    await vi.waitFor(() =>
+      expect(f.delivery.onAssistantMessage).toHaveBeenCalledWith(
+        'child complete',
+        expect.any(AbortSignal),
+      ),
+    );
+    expect(readFileSync(join(f.root, 'child-exit'), 'utf8')).toBe('0');
+    expect(
+      f.delivery.onAssistantMessage.mock.calls.filter(([text]) => text === 'child complete'),
+    ).toHaveLength(1);
+    expect(f.commands().some((c) => ['abort', 'clear_queue'].includes(c.type))).toBe(false);
+    expect(f.delivery.onError).not.toHaveBeenCalled();
+  } finally {
+    f.touch('release-child');
+  }
+});
+
+it.each([false, true])(
+  'logs nonpersistent input once with transformation=%s',
+  async (transformed) => {
+    const f = fixture();
+    Object.assign(config, { piRpcPersistent: false });
+    if (transformed) f.touch('transform-input');
+    db.initDb();
+    const reader = new Database(config.dbPath, { readonly: true });
+    db.registerChannel({
+      jid: 'dc:legacy-log',
+      name: 'legacy-log',
+      folder: 'channel',
+      requiresTrigger: false,
+      isMain: false,
+      modelOverride: '',
+      thinkingOverride: '',
+      cwdOverride: f.root,
+    });
+    db.enqueueMessage({
+      channelJid: 'dc:legacy-log',
+      sender: 'user',
+      senderName: 'User',
+      content: 'original Discord input',
+      timestamp: new Date().toISOString(),
+    });
+    try {
+      startProcessingLoop();
+      await vi.waitFor(() =>
+        expect(reader.prepare('select status from message_queue').get()).toEqual({
+          status: 'done',
+        }),
+      );
+      expect(reader.prepare("select content from message_log where role='user'").all()).toEqual([
+        { content: 'original Discord input' },
+      ]);
+      expect(f.commands().filter((c) => c.type === 'prompt')).toHaveLength(1);
+    } finally {
+      await stopProcessingLoop({ timeoutMs: 100 });
+      reader.close();
+    }
+  },
+);
+
 it('defers settings and input during compaction without aborting it', async () => {
   const f = fixture();
   await invokeAgent('channel', 'first', f.options);
@@ -308,8 +408,9 @@ it.each(['preflight-error', 'late-revision', 'missing-ack', 'invalid-ack'])(
           status: 'failed',
         }),
       );
-      // A later ordinary input succeeds; the failed intent is never replayed
-      // into that fresh connection, even though its user message was not seen.
+      // A later ordinary input succeeds; the failed intent is never replayed,
+      // even though its user message was not seen. Semantic failures retain Pi;
+      // uncertain protocol/transport failures still use the disconnect path.
       enqueue('control');
       await vi.waitFor(() =>
         expect(reader.prepare('select status from message_queue where rowid=2').get()).toEqual({
@@ -330,6 +431,10 @@ it.each(['preflight-error', 'late-revision', 'missing-ack', 'invalid-ack'])(
         { message: '[Discord user: User]\neffectful request' },
         { message: '[Discord user: User]\ncontrol' },
       ]);
+      if (failure === 'preflight-error' || failure === 'late-revision') {
+        expect(new Set(f.accepted().map((row) => row.pid)).size).toBe(1);
+        expect(f.commands().some((c) => ['abort', 'clear_queue'].includes(c.type))).toBe(false);
+      }
       expect(
         reader.prepare("select content from message_log where role='user' order by rowid").all(),
       ).toEqual([{ content: 'control' }]);

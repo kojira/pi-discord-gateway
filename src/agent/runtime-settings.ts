@@ -107,6 +107,9 @@ export class RuntimeSettingsReconciler {
       (!desired.model || desired.model === model) &&
       (!desired.thinking || desired.thinking === thinking);
     if (agrees(actualModel, state.thinkingLevel)) {
+      // An explicit selection becomes managed even when no mutation is needed.
+      this.managedModel ||= Boolean(desired.model);
+      this.managedThinking ||= Boolean(desired.thinking);
       this.lastManaged = desired;
       this.status = `Applied: ${actualModel || '(none)'} / ${state.thinkingLevel || '(unknown)'}`;
       return { ready: true, revision: state.settingsRevision };

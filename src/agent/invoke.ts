@@ -554,6 +554,25 @@ export async function invokeAgent(
         streamingBehavior: 'followUp',
         ...(settingsRevision === undefined ? {} : { expectedSettingsRevision: settingsRevision }),
       });
+      if (
+        persistent &&
+        response.success === false &&
+        response.command === 'prompt' &&
+        typeof response.error === 'string' &&
+        !initialPromptObserved
+      ) {
+        // A semantic preflight failure can follow effectful hooks. It fails this
+        // request without replay, not the connection or independent child work.
+        // Malformed/uncertain transport responses still take failRpcOutput.
+        const done = requestResolve;
+        requestResolve = undefined;
+        promptSubmitted = false;
+        steeringClosed = true;
+        opts = undefined;
+        removeRequestAbort();
+        done?.({ ok: false, text: '', error: response.error || 'Pi rejected the prompt' });
+        return undefined;
+      }
       if (settingsRevision !== undefined && response.success) {
         const data = response.data as { accepted?: boolean; reason?: string } | undefined;
         if (
