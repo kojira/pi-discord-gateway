@@ -15,6 +15,7 @@ import {
 import type { AgentResult } from '../types.js';
 import { resolvePiSpawn } from './pi-spawn.js';
 import { formatAgentTraceEvent } from './trace.js';
+import { RuntimeSettingsReconciler, type RuntimeSettings } from './runtime-settings.js';
 
 export interface SessionTokenUsage {
   input: number;
@@ -59,19 +60,29 @@ export interface ConnectionDelivery {
   onError: (error: string, signal: AbortSignal) => void | Promise<void>;
 }
 
+export interface DesiredAgentSettings {
+  model?: string;
+  thinking?: string;
+  cwd?: string;
+}
+
 interface InvokeOptions {
+  /** Re-read persisted selection at admission, not before attachment/catalog awaits. */
+  resolveSettings?: () => DesiredAgentSettings;
   model?: string;
   thinking?: string;
   cwd?: string;
   signal?: AbortSignal;
   attachments?: string | null;
   onAssistantMessage?: (text: string) => void | Promise<void>;
+  onInputConsumed?: () => void;
   onTraceEvent?: (text: string) => void;
   connectionDelivery?: ConnectionDelivery;
 }
 
 interface ActiveRpcInvocation {
-  identity?: string;
+  refreshSettings?: () => void;
+  settingsStatus?: () => string;
   request?: (prompt: string, opts?: InvokeOptions) => Promise<AgentResult>;
   stop?: () => Promise<void>;
   closing?: boolean;
@@ -81,6 +92,33 @@ interface ActiveRpcInvocation {
 }
 
 const activeRpcInvocations = new Map<string, ActiveRpcInvocation>();
+
+/** Polling also covers persisted changes made without a Discord slash command. */
+export function refreshResidentSettings(channelFolder?: string): void {
+  for (const [folder, connection] of activeRpcInvocations) {
+    if (!channelFolder || folder === channelFolder) connection.refreshSettings?.();
+  }
+}
+
+export function getResidentSettingsStatus(channelFolder: string): string {
+  return (
+    activeRpcInvocations.get(channelFolder)?.settingsStatus?.() ||
+    'No retained runtime; saved settings apply on next request'
+  );
+}
+
+function runtimeSettings(channelFolder: string, settings?: DesiredAgentSettings): RuntimeSettings {
+  return {
+    model: settings?.model || config.piModel || undefined,
+    thinking: settings?.thinking || config.piThinking || undefined,
+    processIdentity: JSON.stringify([
+      config.piBin,
+      resolveChannelSessionDir(channelFolder),
+      settings?.cwd || config.piCwd,
+      config.piExtraFlags.split(/\s+/).filter(Boolean),
+    ]),
+  };
+}
 export function hasResidentAgent(channelFolder: string): boolean {
   return Boolean(activeRpcInvocations.get(channelFolder)?.request);
 }
@@ -157,8 +195,10 @@ export async function invokeAgent(
 ): Promise<AgentResult> {
   const sessionDir = resolveChannelSessionDir(channelFolder);
   mkdirSync(sessionDir, { recursive: true });
-  const effectiveCwd = opts?.cwd || config.piCwd;
   let prompt = await buildPromptWithAttachments(channelFolder, userText, opts);
+  const selected = opts?.resolveSettings?.() || opts;
+  const effectiveCwd = selected?.cwd || config.piCwd;
+  const launchedSettings = runtimeSettings(channelFolder, selected);
 
   if (opts?.signal?.aborted) {
     return { ok: false, text: '', error: 'Agent invocation aborted during shutdown' };
@@ -167,22 +207,21 @@ export async function invokeAgent(
   // `--session` expects a session file. A dedicated session directory plus
   // `--continue` reuses the newest session for this Discord channel.
   const args: string[] = ['--mode', 'rpc', '--session-dir', sessionDir, '--continue'];
-  const model = opts?.model || config.piModel;
+  const model = launchedSettings.model;
   if (model) args.push('--model', model);
-  const thinking = opts?.thinking || config.piThinking;
+  const thinking = launchedSettings.thinking;
   if (thinking) args.push('--thinking', thinking);
   if (config.piExtraFlags) args.push(...config.piExtraFlags.split(/\s+/).filter(Boolean));
 
   const persistent = config.piRpcPersistent;
-  const identity = JSON.stringify([config.piBin, args, effectiveCwd]);
   const existing = activeRpcInvocations.get(channelFolder);
   if (existing?.request) {
-    if (existing.closing || existing.identity !== identity) {
+    if (existing.closing) {
       return {
         ok: false,
         text: '',
-        error:
-          'Pi connection is stopping or its settings changed. Use /stop and wait before retrying.',
+        pending: true,
+        error: 'Pi connection is stopping; input not sent',
       };
     }
     return existing.request(prompt, opts);
@@ -333,7 +372,11 @@ export async function invokeAgent(
       if (
         activeInvocation.closing ||
         (persistent &&
-          (!requestResolve || !initialPromptObserved || steeringClosed || !requestRunId))
+          (!requestResolve ||
+            !initialPromptObserved ||
+            steeringClosed ||
+            !requestRunId ||
+            !settings.matchesDesired()))
       )
         return false;
       const request: PendingSteeringMessage = { message, consumed: false, onConsumed };
@@ -380,6 +423,22 @@ export async function invokeAgent(
       }
     };
     const activeInvocation: ActiveRpcInvocation = { sendCommand, sendSteer };
+    // Retain only the settings source, never completed request callbacks/signals.
+    let desiredOptions: DesiredAgentSettings = {
+      model: opts?.model,
+      thinking: opts?.thinking,
+      cwd: opts?.cwd,
+    };
+    let resolveDesiredSettings = opts?.resolveSettings;
+    const readDesired = () =>
+      runtimeSettings(channelFolder, resolveDesiredSettings?.() || desiredOptions);
+    const settings = new RuntimeSettingsReconciler(
+      launchedSettings,
+      readDesired,
+      sendCommand,
+      () =>
+        !activeInvocation.closing && activeRpcInvocations.get(channelFolder) === activeInvocation,
+    );
 
     const stop = (): Promise<void> => {
       if (stopPromise) return stopPromise;
@@ -431,8 +490,28 @@ export async function invokeAgent(
       parked = false;
     };
 
+    const deferUnsentRequest = (reason: string) => {
+      const done = requestResolve;
+      requestResolve = undefined;
+      opts = undefined;
+      removeRequestAbort();
+      done?.({ ok: false, text: '', pending: true, error: reason });
+    };
+
     const submitPrompt = async (): Promise<RpcResponse | undefined> => {
+      let settingsRevision: number | undefined;
+      let admittedSettings: string | undefined;
       if (persistent) {
+        const admission = await settings.reconcile();
+        if (activeInvocation.closing || finished) return undefined;
+        if (!admission.ready || !settings.matchesDesired()) {
+          deferUnsentRequest(
+            admission.ready ? 'Desired settings changed during admission' : admission.reason,
+          );
+          return undefined;
+        }
+        settingsRevision = admission.revision;
+        admittedSettings = JSON.stringify(readDesired());
         const state = await sendCommand({ type: 'get_state' });
         const data = state.data as
           | {
@@ -461,8 +540,54 @@ export async function invokeAgent(
           return undefined;
         }
       }
+      if (persistent && (activeInvocation.closing || finished)) return undefined;
+      if (persistent && admittedSettings !== JSON.stringify(readDesired())) {
+        deferUnsentRequest('Desired settings changed before prompt admission');
+        return undefined;
+      }
+      // This last desired-state check and the wire write are synchronous: a
+      // later saved selection belongs to the next admission, not this request.
       promptSubmitted = true;
-      return sendCommand({ type: 'prompt', message: prompt, streamingBehavior: 'followUp' });
+      const response = await sendCommand({
+        type: 'prompt',
+        message: prompt,
+        streamingBehavior: 'followUp',
+        ...(settingsRevision === undefined ? {} : { expectedSettingsRevision: settingsRevision }),
+      });
+      if (
+        persistent &&
+        response.success === false &&
+        response.command === 'prompt' &&
+        typeof response.error === 'string' &&
+        !initialPromptObserved
+      ) {
+        // A semantic preflight failure can follow effectful hooks. It fails this
+        // request without replay, not the connection or independent child work.
+        // Malformed/uncertain transport responses still take failRpcOutput.
+        const done = requestResolve;
+        requestResolve = undefined;
+        promptSubmitted = false;
+        steeringClosed = true;
+        opts = undefined;
+        removeRequestAbort();
+        done?.({ ok: false, text: '', error: response.error || 'Pi rejected the prompt' });
+        return undefined;
+      }
+      if (settingsRevision !== undefined && response.success) {
+        const data = response.data as { accepted?: boolean; reason?: string } | undefined;
+        if (
+          data?.accepted === false &&
+          ['busy', 'settings_changed'].includes(data.reason || '') &&
+          !initialPromptObserved
+        ) {
+          promptSubmitted = false;
+          deferUnsentRequest(`Pi ${data.reason}; input not accepted, retrying automatically`);
+          return undefined;
+        }
+        if (data?.accepted !== true)
+          throw new Error('Invalid guarded prompt acknowledgement; delivery uncertain');
+      }
+      return response;
     };
 
     if (persistent) {
@@ -471,7 +596,10 @@ export async function invokeAgent(
         steeringProcessing.add(processing);
         void processing.finally(() => steeringProcessing.delete(processing)).catch(() => {});
       };
-      activeInvocation.identity = identity;
+      activeInvocation.settingsStatus = () => settings.describe();
+      activeInvocation.refreshSettings = () => {
+        if (!requestResolve && !activeInvocation.closing) void settings.reconcile();
+      };
       activeInvocation.stop = stop;
       activeInvocation.request = (nextPrompt, nextOpts) => {
         if (requestResolve || activeInvocation.closing) {
@@ -483,6 +611,12 @@ export async function invokeAgent(
         }
         prompt = nextPrompt;
         opts = nextOpts;
+        desiredOptions = {
+          model: nextOpts?.model,
+          thinking: nextOpts?.thinking,
+          cwd: nextOpts?.cwd,
+        };
+        resolveDesiredSettings = nextOpts?.resolveSettings;
         settled = false;
         steeringClosed = false;
         requestRunId = undefined;
@@ -619,6 +753,7 @@ export async function invokeAgent(
         // queue; concurrent extension sendUserMessage is outside this contract.
         if (!initialPromptObserved && (persistent ? promptSubmitted : userText === prompt)) {
           initialPromptObserved = true;
+          opts?.onInputConsumed?.();
           requestRunId = currentRunId;
           if (persistent) resetOutput();
           return;

@@ -32,6 +32,8 @@ export interface AgentResult {
   ok: boolean;
   text: string;
   error?: string;
+  /** Definitively not accepted by Pi; preserve the existing queue row for later admission. */
+  pending?: boolean;
   workOutcome?: 'completed' | 'cancelled' | 'waiting' | 'blocked';
   /** Parent parked after an async launch; completion arrives as a later native notice. */
   parked?: boolean;

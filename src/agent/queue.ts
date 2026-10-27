@@ -25,6 +25,7 @@ import {
 } from '../db.js';
 import {
   hasResidentAgent,
+  refreshResidentSettings,
   invokeAgent,
   shutdownResidentAgents,
   stopResidentAgent,
@@ -134,6 +135,7 @@ function poll(): void {
   if (!running) return;
 
   try {
+    if (config.piRpcPersistent) refreshResidentSettings();
     dispatch();
   } catch (err: any) {
     logger.error({ err: err.message }, 'Poll error');
@@ -479,8 +481,10 @@ async function processMessage(
 
   try {
     const prompt = `[Discord user: ${senderName}]\n${content}`;
-
-    logMessage(jid, 'user', content);
+    // Legacy requests are not retried for settings admission. Preserve their
+    // original logging policy even when Pi input hooks transform the prompt.
+    const logOnConsumption = config.piRpcPersistent;
+    if (!logOnConsumption) logMessage(jid, 'user', content);
 
     const cwd = channel.cwdOverride || config.piCwd;
     // Startup warms catalogs without blocking Discord. A queued turn needing
@@ -520,6 +524,16 @@ async function processMessage(
       model: effective.rawModelRef || undefined,
       thinking: effective.hasManagedThinking ? effective.effectiveThinking : undefined,
       cwd: effective.effectiveCwd,
+      resolveSettings: () => {
+        const latest = getChannel(jid);
+        if (!latest) throw new Error('Channel disappeared before admission');
+        const desired = computeEffectiveChannelSettings(latest);
+        return {
+          model: desired.modelInfo?.ref || desired.rawModelRef || undefined,
+          thinking: desired.hasManagedThinking ? desired.effectiveThinking : undefined,
+          cwd: desired.effectiveCwd,
+        };
+      },
       signal,
       attachments,
       connectionDelivery: config.piRpcPersistent
@@ -554,6 +568,11 @@ async function processMessage(
             },
           }
         : undefined,
+      onInputConsumed: logOnConsumption
+        ? () => {
+            if (taskResourcesAvailable && !signal.aborted) logMessage(jid, 'user', content);
+          }
+        : undefined,
       onAssistantMessage: async (text) => {
         lastAttemptedText = text;
         lastDeliverySucceeded = await sendResponse(jid, text, signal);
@@ -577,6 +596,12 @@ async function processMessage(
       return;
     }
 
+    if (result.pending) {
+      // Only a proven pre-accept rejection can restore this exact row. No
+      // accepted/uncertain prompt or steering is ever replayed here.
+      requeueMessages([rowid]);
+      return;
+    }
     if (result.ok) {
       enqueueWebhookTerminal(
         jid,

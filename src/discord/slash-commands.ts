@@ -12,6 +12,8 @@ import {
 } from 'discord.js';
 import {
   getChannelSessionStatus,
+  getResidentSettingsStatus,
+  refreshResidentSettings,
   type ChannelSessionStatus,
   type SessionContextUsage,
   type SessionTokenUsage,
@@ -1012,7 +1014,11 @@ async function handleModelSet(interaction: ChatInputCommandInteraction): Promise
     setChannelThinkingOverride(updated.jid, thinkingResolution.effective);
   }
 
-  const notes = [`Model set to ${selectedModel.ref} for this channel.`];
+  refreshResidentSettings(channel.folder);
+  const notes = [
+    `Desired model saved as ${selectedModel.ref} for this channel.`,
+    getResidentSettingsStatus(channel.folder),
+  ];
   if (thinkingResolution.adjusted) {
     notes.push(
       buildThinkingAdjustmentMessage(
@@ -1064,6 +1070,8 @@ async function handleModelReset(interaction: ChatInputCommandInteraction): Promi
     );
   }
 
+  refreshResidentSettings(channel.folder);
+  notes.push(getResidentSettingsStatus(channel.folder));
   await interaction.editReply({ content: notes.join('\n') });
 }
 
@@ -1097,7 +1105,11 @@ async function handleThinkingSet(interaction: ChatInputCommandInteraction): Prom
 
   setChannelThinkingOverride(channel.jid, resolution.effective);
 
-  const notes = [`Thinking level set to ${resolution.effective} for this channel.`];
+  refreshResidentSettings(channel.folder);
+  const notes = [
+    `Desired thinking level saved as ${resolution.effective} for this channel.`,
+    getResidentSettingsStatus(channel.folder),
+  ];
   if (resolution.adjusted) {
     notes.push(
       buildThinkingAdjustmentMessage(
@@ -1139,8 +1151,9 @@ function buildStatusMessage(
 ): string {
   const webhook = getChannelWebhook(channelJid);
   const rows: Array<[string, string]> = [
-    ['Model', formatModelValue(effective)],
-    ['Thinking', formatThinkingValue(effective)],
+    ['Desired model', formatModelValue(effective)],
+    ['Desired thinking', formatThinkingValue(effective)],
+    ['Runtime', getResidentSettingsStatus(getChannel(channelJid)?.folder || '')],
     ['Working dir', formatWorkingDirValue(effective)],
     [
       'Webhook',

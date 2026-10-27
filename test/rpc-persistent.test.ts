@@ -324,7 +324,8 @@ describe('persistent RPC connection', () => {
     await invokeAgent('channel', 'disconnect', { cwd: root, connectionDelivery });
     const changed = await invokeAgent('channel', 'not sent', { cwd: root, model: 'changed' });
     expect(changed.ok).toBe(false);
-    expect(changed.error).toContain('/stop');
+    expect(changed.pending).toBe(true);
+    expect(changed.error).toContain('Pi update required');
     await vi.waitFor(() => expect(connectionDelivery.onError).toHaveBeenCalledTimes(1));
     expect(hasResidentAgent('channel')).toBe(false);
     expect(readFileSync(join(root, 'commands'), 'utf8')).not.toContain('not sent');
