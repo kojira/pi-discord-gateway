@@ -1,0 +1,131 @@
+name: better-sqlite3 SQLite watch
+
+# Weekly check for a published better-sqlite3 release that bundles a SQLite
+# version with the fixes we are waiting for. The check only downloads the npm
+# tarball and reads the bundled amalgamation header; no package code runs.
+
+on:
+  schedule:
+    - cron: '23 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      threshold:
+        description: 'Minimum bundled SQLite version that counts as available (X.Y.Z)'
+        required: false
+        default: '3.54.0'
+      notify_test:
+        description: 'Send a Discord test notice for this run regardless of outcome'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Check bundled SQLite version
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DEFAULT_THRESHOLD: '3.54.0'
+          THRESHOLD: ${{ inputs.threshold || '3.54.0' }}
+          CVES: 'CVE-2026-119371, CVE-2026-119372, CVE-2026-119373, CVE-2026-119374, CVE-2026-119375, CVE-2026-119376, CVE-2026-119377, CVE-2026-119378, CVE-2026-119379, CVE-2026-119591'
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$THRESHOLD" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::threshold must be X.Y.Z, got '$THRESHOLD'"
+            exit 1
+          fi
+          threshold_number=$(( BASH_REMATCH[1] * 1000000 + BASH_REMATCH[2] * 1000 + BASH_REMATCH[3] ))
+
+          metadata=$(curl -fsSL https://registry.npmjs.org/better-sqlite3/latest)
+          version=$(jq -r '.version' <<<"$metadata")
+          tarball=$(jq -r '.dist.tarball' <<<"$metadata")
+          integrity=$(jq -r '.dist.integrity' <<<"$metadata")
+
+          workdir=$(mktemp -d)
+          curl -fsSL "$tarball" -o "$workdir/package.tgz"
+          actual_integrity="sha512-$(openssl dgst -sha512 -binary "$workdir/package.tgz" | base64 -w0)"
+          if [ "$actual_integrity" != "$integrity" ]; then
+            echo "::error::Tarball integrity mismatch for better-sqlite3 $version"
+            exit 1
+          fi
+
+          # deps/sqlite3/sqlite3.h is the header of the amalgamation that
+          # better-sqlite3 compiles, so it is the authoritative bundled version.
+          header=package/deps/sqlite3/sqlite3.h
+          tar -xzf "$workdir/package.tgz" -C "$workdir" "$header"
+          sqlite_number=$(sed -nE 's/^#define SQLITE_VERSION_NUMBER[[:space:]]+([0-9]+).*/\1/p' "$workdir/$header")
+          sqlite_version=$(sed -nE 's/^#define SQLITE_VERSION[[:space:]]+"([0-9.]+)".*/\1/p' "$workdir/$header")
+          if [ -z "$sqlite_number" ] || [ -z "$sqlite_version" ]; then
+            echo "::error::Could not read SQLITE_VERSION from $header in better-sqlite3 $version"
+            exit 1
+          fi
+
+          echo "better-sqlite3 $version bundles SQLite $sqlite_version; threshold $THRESHOLD"
+          if [ "$sqlite_number" -lt "$threshold_number" ]; then
+            echo "SQLite $THRESHOLD is not bundled yet."
+            exit 0
+          fi
+
+          title="better-sqlite3 bundles SQLite >= $THRESHOLD"
+          if [ "$THRESHOLD" != "$DEFAULT_THRESHOLD" ]; then
+            title="[CI test] $title"
+          fi
+
+          issue_url=$(gh issue list --state open --search "\"$title\" in:title" --json title,url \
+            | jq -r --arg title "$title" 'map(select(.title == $title)) | first | .url // empty')
+          if [ -n "$issue_url" ]; then
+            echo "Open issue already exists: $issue_url"
+          else
+            body_file="$workdir/issue.md"
+            {
+              echo "The latest published better-sqlite3 bundles a SQLite version at or above the watch threshold."
+              echo
+              echo "- better-sqlite3: $version"
+              echo "- Bundled SQLite: $sqlite_version (from \`deps/sqlite3/sqlite3.h\`)"
+              echo "- Threshold: $THRESHOLD"
+              echo "- Fixes: $CVES"
+              echo
+              echo "Next step: upgrade better-sqlite3 and verify the gateway."
+              echo
+              echo "Detected by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            } >"$body_file"
+            issue_url=$(gh issue create --title "$title" --body-file "$body_file")
+            echo "Opened issue: $issue_url"
+          fi
+          echo "issue_url=$issue_url" >>"$GITHUB_OUTPUT"
+          echo "::error::better-sqlite3 $version bundles SQLite $sqlite_version (>= $THRESHOLD): $issue_url"
+          exit 1
+
+      - name: Notify Discord
+        if: ${{ !cancelled() && ((failure() && github.event_name == 'schedule') || (github.event_name == 'workflow_dispatch' && inputs.notify_test)) }}
+        env:
+          DISCORD_CI_WEBHOOK_URL: ${{ secrets.DISCORD_CI_WEBHOOK_URL }}
+          JOB_STATUS: ${{ job.status }}
+          ISSUE_URL: ${{ steps.check.outputs.issue_url }}
+          TEST_PREFIX: ${{ github.event_name == 'workflow_dispatch' && '[test] ' || '' }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DISCORD_CI_WEBHOOK_URL" ]; then
+            echo "DISCORD_CI_WEBHOOK_URL is not set; skipping Discord notification."
+            exit 0
+          fi
+          content="${TEST_PREFIX}CI ${JOB_STATUS}: $GITHUB_REPOSITORY / $GITHUB_WORKFLOW ($GITHUB_EVENT_NAME)
+          Ref: $GITHUB_REF_NAME @ ${GITHUB_SHA:0:12}
+          Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          if [ -n "$ISSUE_URL" ]; then
+            content="$content
+          Issue: $ISSUE_URL"
+          fi
+          jq -n --arg content "$content" '{content: $content, allowed_mentions: {parse: []}}' \
+            | curl -fsS -X POST -H 'Content-Type: application/json' --data-binary @- "$DISCORD_CI_WEBHOOK_URL" >/dev/null
+          echo "Discord notification sent."
