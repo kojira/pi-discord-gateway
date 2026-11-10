@@ -318,17 +318,19 @@ describe('persistent RPC connection', () => {
     }
   });
 
-  it('rejects changed launch settings without closing unknown background work, and reports idle crashes without replay', async () => {
+  it('sends input on the launch settings when a changed selection needs a Pi update, and reports idle crashes without replay', async () => {
     const root = fixture();
     const connectionDelivery = sinks();
+    const onNotice = vi.fn();
     await invokeAgent('channel', 'disconnect', { cwd: root, connectionDelivery });
-    const changed = await invokeAgent('channel', 'not sent', { cwd: root, model: 'changed' });
-    expect(changed.ok).toBe(false);
-    expect(changed.pending).toBe(true);
-    expect(changed.error).toContain('Pi update required');
+    const changed = await invokeAgent('channel', 'sent', { cwd: root, model: 'changed', onNotice });
+    expect(changed.ok).toBe(true);
+    expect(changed.text).toMatch(/^sent:/);
+    await vi.waitFor(() => expect(onNotice).toHaveBeenCalledTimes(1));
+    expect(onNotice.mock.calls[0][0]).toContain('Pi update required');
     await vi.waitFor(() => expect(connectionDelivery.onError).toHaveBeenCalledTimes(1));
     expect(hasResidentAgent('channel')).toBe(false);
-    expect(readFileSync(join(root, 'commands'), 'utf8')).not.toContain('not sent');
+    expect(readFileSync(join(root, 'commands'), 'utf8').match(/"message":"sent"/g)).toHaveLength(1);
     const crashed = await invokeAgent('channel', 'crash', { cwd: root, connectionDelivery });
     expect(crashed.ok).toBe(false);
     expect(crashed.error).toContain('unexpectedly');

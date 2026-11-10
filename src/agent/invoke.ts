@@ -75,6 +75,8 @@ interface InvokeOptions {
   signal?: AbortSignal;
   attachments?: string | null;
   onAssistantMessage?: (text: string) => void | Promise<void>;
+  /** Gateway-authored line for the channel; not part of the assistant transcript. */
+  onNotice?: (text: string) => void | Promise<void>;
   onInputConsumed?: () => void;
   onTraceEvent?: (text: string) => void;
   connectionDelivery?: ConnectionDelivery;
@@ -306,6 +308,7 @@ export async function invokeAgent(
     let legacyAgentEndPending = false;
     let deliveryChain = Promise.resolve();
     let consumptionChain = Promise.resolve();
+    let settingsNotice: string | undefined;
 
     const sendCommand = (command: Record<string, unknown>): Promise<RpcResponse> => {
       if (!proc.stdin.writable || proc.stdin.destroyed) {
@@ -372,11 +375,7 @@ export async function invokeAgent(
       if (
         activeInvocation.closing ||
         (persistent &&
-          (!requestResolve ||
-            !initialPromptObserved ||
-            steeringClosed ||
-            !requestRunId ||
-            !settings.matchesDesired()))
+          (!requestResolve || !initialPromptObserved || steeringClosed || !requestRunId))
       )
         return false;
       const request: PendingSteeringMessage = { message, consumed: false, onConsumed };
@@ -405,6 +404,7 @@ export async function invokeAgent(
           }
           if (data?.accepted !== true)
             throw new Error('Pi returned an invalid guarded steering acknowledgement');
+          noticeUnappliedSettings();
         }
         // Consumption is authoritative even if settlement raced the response.
         if (request.consumed) return true;
@@ -490,6 +490,16 @@ export async function invokeAgent(
       parked = false;
     };
 
+    /** Tell the user once per distinct reason, only alongside input Pi accepted. */
+    const noticeUnappliedSettings = () => {
+      const notice = settings.unappliedNotice();
+      if (!notice) settingsNotice = undefined;
+      else if (notice !== settingsNotice && opts?.onNotice) {
+        enqueueRpcDelivery(notice, opts.onNotice, 'error');
+        settingsNotice = notice;
+      }
+    };
+
     const deferUnsentRequest = (reason: string) => {
       const done = requestResolve;
       requestResolve = undefined;
@@ -500,23 +510,16 @@ export async function invokeAgent(
 
     const submitPrompt = async (): Promise<RpcResponse | undefined> => {
       let settingsRevision: number | undefined;
-      let admittedSettings: string | undefined;
       if (persistent) {
+        // Unapplied settings never hold input back: it runs on the applied selection.
         const admission = await settings.reconcile();
         if (activeInvocation.closing || finished) return undefined;
-        if (!admission.ready || !settings.matchesDesired()) {
-          deferUnsentRequest(
-            admission.ready ? 'Desired settings changed during admission' : admission.reason,
-          );
-          return undefined;
-        }
-        settingsRevision = admission.revision;
-        admittedSettings = JSON.stringify(readDesired());
         const state = await sendCommand({ type: 'get_state' });
         const data = state.data as
           | {
               sessionId?: string;
               pendingMessageCount?: number;
+              settingsRevision?: number;
               capabilities?: { guardedSteer?: number };
             }
           | undefined;
@@ -539,14 +542,11 @@ export async function invokeAgent(
           });
           return undefined;
         }
+        settingsRevision = admission.ready ? admission.revision : data.settingsRevision;
       }
       if (persistent && (activeInvocation.closing || finished)) return undefined;
-      if (persistent && admittedSettings !== JSON.stringify(readDesired())) {
-        deferUnsentRequest('Desired settings changed before prompt admission');
-        return undefined;
-      }
-      // This last desired-state check and the wire write are synchronous: a
-      // later saved selection belongs to the next admission, not this request.
+      // A selection saved from here on is reconciled in the background and
+      // takes effect at Pi's next turn boundary.
       promptSubmitted = true;
       const response = await sendCommand({
         type: 'prompt',
@@ -587,6 +587,7 @@ export async function invokeAgent(
         if (data?.accepted !== true)
           throw new Error('Invalid guarded prompt acknowledgement; delivery uncertain');
       }
+      if (persistent && response.success) noticeUnappliedSettings();
       return response;
     };
 
@@ -598,7 +599,7 @@ export async function invokeAgent(
       };
       activeInvocation.settingsStatus = () => settings.describe();
       activeInvocation.refreshSettings = () => {
-        if (!requestResolve && !activeInvocation.closing) void settings.reconcile();
+        if (!activeInvocation.closing) settings.refresh();
       };
       activeInvocation.stop = stop;
       activeInvocation.request = (nextPrompt, nextOpts) => {

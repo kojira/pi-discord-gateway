@@ -10,11 +10,11 @@ import {
   invokeAgent,
   refreshResidentSettings,
   shutdownResidentAgents,
-  steerActiveAgent,
   type DesiredAgentSettings,
 } from '../src/agent/invoke.js';
 import * as db from '../src/db.js';
 import { startProcessingLoop, stopProcessingLoop } from '../src/agent/queue.js';
+import { sendResponse } from '../src/discord/client.js';
 
 vi.mock('../src/discord/client.js', () => ({
   sendResponse: vi.fn().mockResolvedValue(true),
@@ -75,7 +75,8 @@ async function handle(c) {
  if(c.type==='set_runtime_settings') {
   if(has('delay-settings')) { writeFileSync(file('settings-waiting'),'1'); await wait('release-settings'); }
   if(has('exit-settings')) { process.exit(9); }
-  if(active || has('compact')) { ack(c,{applied:false,reason:'busy'}); return; }
+  if(has('compact')) { ack(c,{applied:false,reason:'busy'}); return; }
+  if(c.modelId==='missing') { send({type:'response',id:c.id,command:c.type,success:false,error:'Model not found'}); return; }
   if(c.expectedRevision!==settingsRevision) { ack(c,{applied:false,reason:'revision_changed'}); return; }
   if(c.provider) model={provider:c.provider,id:c.modelId};
   if(c.thinkingLevel) thinkingLevel=c.thinkingLevel;
@@ -132,10 +133,16 @@ process.stdin.on('end',()=>process.exit(0));
   });
   let desired: DesiredAgentSettings = { model: 'test/a', thinking: 'off', cwd: root };
   const delivery = { onAssistantMessage: vi.fn(), onError: vi.fn() };
-  const options = { resolveSettings: () => desired, connectionDelivery: delivery };
+  const notice = vi.fn();
+  const options = {
+    resolveSettings: () => desired,
+    connectionDelivery: delivery,
+    onNotice: notice,
+  };
   return {
     root,
     delivery,
+    notice,
     options,
     set: (value: Partial<DesiredAgentSettings>) => {
       desired = { ...desired, ...value };
@@ -185,17 +192,19 @@ it('reconciles idle model/thinking without replacing the retained process', asyn
   expect(f.commands().some((c) => ['abort', 'clear_queue'].includes(c.type))).toBe(false);
 });
 
-it('keeps changes and steering pending during an accepted parent request', async () => {
+it('reconciles a change saved during an accepted parent request', async () => {
   const f = fixture();
   const first = invokeAgent('channel', 'hold', f.options);
   await vi.waitFor(() => expect(f.accepted()).toHaveLength(1));
   f.set({ model: 'test/b' });
-  expect(await steerActiveAgent('channel', 'queued correction')).toBe(false);
-  expect(f.commands().filter((c) => c.type === 'set_runtime_settings')).toHaveLength(0);
+  await vi.waitFor(() =>
+    expect(getResidentSettingsStatus('channel')).toContain('Applied: test/b / off'),
+  );
   f.touch('release-parent');
-  expect((await first).text).toBe('a/off');
-  expect((await invokeAgent('channel', 'queued correction', f.options)).text).toBe('b/off');
-  expect(f.accepted().map((row) => row.message)).toEqual(['hold', 'queued correction']);
+  // The fixture reads its model when it answers, like Pi's next model request.
+  expect((await first).text).toBe('b/off');
+  expect(f.accepted().map((row) => row.message)).toEqual(['hold']);
+  expect(f.notice).not.toHaveBeenCalled();
 });
 
 it('supersedes a delayed settings ACK before admitting new input', async () => {
@@ -207,10 +216,9 @@ it('supersedes a delayed settings ACK before admitting new input', async () => {
   f.set({ model: 'test/c', thinking: 'high' });
   const pending = invokeAgent('channel', 'next', f.options);
   f.touch('release-settings');
-  expect((await pending).pending).toBe(true);
-  expect(f.accepted()).toHaveLength(1);
-  expect((await invokeAgent('channel', 'next', f.options)).text).toBe('c/high');
+  expect((await pending).text).toBe('c/high');
   expect(f.accepted().filter((row) => row.message === 'next')).toHaveLength(1);
+  expect(f.notice).not.toHaveBeenCalled();
 });
 
 it('preserves independent child work and delayed delivery during an idle parent update', async () => {
@@ -332,17 +340,31 @@ it('defers settings and input during compaction without aborting it', async () =
   expect(f.commands().some((c) => c.type === 'abort')).toBe(false);
 });
 
-it.each(['cwd', 'executable', 'arguments', 'implicit default'])(
-  'keeps %s changes explicitly pending without retiring unknown children',
-  async (kind) => {
+it.each([
+  ['cwd', 'Executable, working directory or arguments changed'],
+  ['executable', 'Executable, working directory or arguments changed'],
+  ['arguments', 'Executable, working directory or arguments changed'],
+  ['implicit default', 'Implicit Pi defaults'],
+  ['unknown model', 'Model not found'],
+])(
+  'delivers input on the applied settings and explains unapplied %s once',
+  async (kind, reason) => {
     const f = fixture();
     await invokeAgent('channel', 'first', f.options);
     if (kind === 'cwd') f.set({ cwd: join(f.root, 'other') });
     if (kind === 'executable') Object.assign(config, { piBin: join(f.root, 'other') });
     if (kind === 'arguments') Object.assign(config, { piExtraFlags: '--no-tools' });
     if (kind === 'implicit default') f.set({ model: undefined });
-    expect((await invokeAgent('channel', 'next', f.options)).pending).toBe(true);
-    expect(f.accepted()).toHaveLength(1);
+    if (kind === 'unknown model') f.set({ model: 'test/missing' });
+    expect((await invokeAgent('channel', 'next', f.options)).text).toBe('a/off');
+    expect((await invokeAgent('channel', 'again', f.options)).text).toBe('a/off');
+    expect(f.accepted().map((row) => row.message)).toEqual(['first', 'next', 'again']);
+    expect(new Set(f.accepted().map((row) => row.pid)).size).toBe(1);
+    await vi.waitFor(() => expect(f.notice).toHaveBeenCalledTimes(1));
+    expect(f.notice.mock.calls[0][0]).toContain(`切り替えられませんでした（${reason}`);
+    expect(f.notice.mock.calls[0][0]).toContain('test/a / off のまま処理します。');
+    expect(getResidentSettingsStatus('channel')).toContain(`Desired settings pending (${reason}`);
+    expect(getResidentSettingsStatus('channel')).toContain('Applied: test/a / off');
     expect(hasResidentAgent('channel')).toBe(true);
     expect(f.commands().some((c) => c.type === 'abort')).toBe(false);
   },
@@ -521,6 +543,30 @@ it('preserves the real queue across settings busy and guarded prompt refusal, wi
     await vi.waitFor(() =>
       expect(getResidentSettingsStatus('channel')).toContain('Applied: test/c'),
     );
+    // An unapplicable selection neither blocks the queue nor repeats its notice.
+    db.setChannelModelOverride('dc:settings', 'test/missing');
+    enqueue('fourth');
+    enqueue('fifth');
+    await vi.waitFor(() =>
+      expect(
+        reader.prepare("select count(*) as n from message_queue where status='done'").get(),
+      ).toEqual({ n: 5 }),
+    );
+    expect(
+      f
+        .accepted()
+        .slice(3)
+        .map((row) => [row.message, row.model.id]),
+    ).toEqual([
+      ['[Discord user: User]\nfourth', 'c'],
+      ['[Discord user: User]\nfifth', 'c'],
+    ]);
+    const notices = vi
+      .mocked(sendResponse)
+      .mock.calls.filter(([, text]) => text.includes('切り替えられませんでした'));
+    expect(notices).toHaveLength(1);
+    expect(notices[0][1]).toContain('test/missing');
+    expect(notices[0][1]).toContain('Model not found');
   } finally {
     await stopProcessingLoop({ timeoutMs: 100 });
     reader.close();

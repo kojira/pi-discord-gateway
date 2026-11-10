@@ -19,10 +19,16 @@ settings separately from the last acknowledged runtime state.
   `applied: true`, the effective model/thinking and revision, or a non-mutating
   `applied: false` with `busy` / `revision_changed`. Gateway never substitutes a
   `get_state` idle snapshot followed by unguarded setters.
-- Gateway serializes background reconciliation with request admission, checks
-  the latest desired selection after awaits, and writes the prompt without an
-  await after its final desired-state check. A later selection is pending for
-  the next request. `prompt.expectedSettingsRevision` guards native acceptance;
+- Gateway serializes background reconciliation with request admission.
+  Reconciliation also runs while a request is active: Pi applies the pair at its
+  next model request and never switches a request that is already streaming.
+  Settings that cannot be applied never hold input back. The request is sent on
+  the applied selection, guarded by the revision Pi currently reports, and the
+  channel gets one line per distinct reason naming the desired selection, the
+  reason and the applied selection. The status keeps showing applied versus
+  pending with that reason. A selection Pi definitely rejected (for example an
+  unknown model) is not resent by background polling; the next request or a new
+  selection tries again. `prompt.expectedSettingsRevision` guards native acceptance;
   only `success: true, accepted: false` with `busy` / `settings_changed` proves
   non-acceptance, before any effectful extension hook/command. Pi reserves guarded
   admission before hooks. A subsequent preflight failure or revision conflict
@@ -39,15 +45,17 @@ settings separately from the last acknowledged runtime state.
   user-log insertion occurs at input consumption, not on every pending admission
   attempt. Nonpersistent requests retain their original dispatch-time logging,
   including when Pi input hooks transform the prompt.
-- A changed selection also prevents new steering into the old selected run;
-  already accepted steering retains its existing consumption/uncertainty rules.
+- A changed selection does not prevent steering into the active run; accepted
+  steering retains its existing consumption/uncertainty rules.
 - No settings failure invokes stop, clears queues, rotates sessions or kills
   processes. Explicit stop/shutdown retains its separate existing behavior.
 
 ## Parent versus child work
 
-Parent activity includes prompt preflight, runs, retries, compaction and native
-continuations; the Pi capability owns this proof. An independent child can keep
+For guarded prompt admission, parent activity includes prompt preflight, runs,
+retries, compaction and native continuations; the Pi capability owns this proof.
+A settings update is refused as busy only during prompt preflight, compaction and
+navigation/replacement/reload. An independent child can keep
 running while the idle parent's model changes in place. This does not change the
 child's model/runtime or destroy its process or delayed result delivery. Parent
 idle is **not** evidence permitting process retirement.
@@ -56,7 +64,8 @@ Executable, working-directory and extra-argument changes remain explicitly
 pending: full child/background idleness is not available, so Gateway does not
 retire the retained process automatically. Resetting to an unknown implicit Pi
 default also remains pending; choose an explicit model/thinking selection to
-reconcile it. Omitted native transaction fields mean retain, not reset. Explicit
+reconcile it. Input keeps flowing to the retained process in both cases, with
+the one-line notice above. Omitted native transaction fields mean retain, not reset. Explicit
 selections become managed even when the runtime already matches and no settings
 mutation is needed; a later implicit reset still requires default resolution.
 
@@ -64,7 +73,8 @@ mutation is needed; a later implicit reset still requires default resolution.
 
 An older Pi without `guardedSettings` retains the prior prompt behavior only
 while desired launch identity is unchanged. A changed identity stays pending
-with an upgrade-needed status, with no unsafe mutation or restart fallback.
+with an upgrade-needed status and notice, with no unsafe mutation or restart
+fallback; input is sent on the launch settings.
 Reverting to the original identity permits legacy admission again. This does
 not claim effective-model/revision verification on legacy Pi.
 
