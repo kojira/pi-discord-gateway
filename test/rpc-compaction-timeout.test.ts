@@ -210,7 +210,9 @@ describe('RPC prompt preflight compaction deadlines', () => {
     send({ type: 'compaction_start' });
     replyToState = false;
     const next = invokeAgent('channel', 'next', { cwd: root });
-    await vi.advanceTimersByTimeAsync(120_000);
+    // Unverified settings no longer defer input; the admission state query then
+    // fails on its own two-minute deadline instead of being retried silently.
+    await vi.advanceTimersByTimeAsync(240_000);
     expect((await next).error).toBe('Pi RPC command timed out: get_state');
     expect(commands.filter((c) => c.type === 'prompt')).toHaveLength(1);
   });

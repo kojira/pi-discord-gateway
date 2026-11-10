@@ -55,7 +55,7 @@ describe('guarded runtime settings admission', () => {
         ready: false,
         reason: expect.stringContaining('Implicit Pi defaults'),
       });
-      expect(f.reconciler.describe()).not.toContain('Applied:');
+      expect(f.reconciler.describe()).toContain('Desired settings pending (Implicit Pi defaults');
       expect(f.send.mock.calls.map(([command]) => command.type)).toEqual([
         'get_state',
         'get_state',
@@ -186,6 +186,28 @@ describe('guarded runtime settings admission', () => {
       ready: false,
       reason: expect.stringContaining('connection closed'),
     });
+  });
+
+  it('reports the reason and applied selection, and does not resend a rejected selection in the background', async () => {
+    const f = setup();
+    f.change({ model: 'test/missing' });
+    f.send
+      .mockResolvedValueOnce({ success: true, data: state })
+      .mockResolvedValueOnce({ success: false, error: 'Model not found' });
+    expect(await f.reconciler.reconcile()).toEqual({ ready: false, reason: 'Model not found' });
+    expect(f.reconciler.describe()).toBe(
+      'Desired settings pending (Model not found). Applied: test/a / off',
+    );
+    expect(f.reconciler.unappliedNotice()).toBe(
+      '設定を test/missing / off に切り替えられませんでした（Model not found）。test/a / off のまま処理します。',
+    );
+    f.reconciler.refresh();
+    expect(f.send).toHaveBeenCalledTimes(2);
+    // A new selection is attempted again and clears the notice once applied.
+    f.change({ model: 'test/a' });
+    f.reconciler.refresh();
+    await vi.waitFor(() => expect(f.reconciler.describe()).toBe('Applied: test/a / off'));
+    expect(f.reconciler.unappliedNotice()).toBeUndefined();
   });
 
   it('preserves an independent legacy state error', async () => {

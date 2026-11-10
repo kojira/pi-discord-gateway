@@ -585,6 +585,9 @@ async function processMessage(
         }
         logMessage(jid, 'assistant', text);
       },
+      onNotice: async (text) => {
+        await sendResponse(jid, text, signal);
+      },
       onTraceEvent: (text) => enqueueWebhookTrace(jid, text),
     });
 

@@ -30,6 +30,11 @@ export class RuntimeSettingsReconciler {
   private inFlight?: Promise<SettingsAdmission>;
   private lastManaged: RuntimeSettings;
   private status = 'Runtime settings not yet verified';
+  /** Effective model / thinking last reported by Pi; requests run on this while pending. */
+  private applied: string;
+  /** Why a desired selection is not applied. `rejected` means Pi definitely refused it. */
+  private unapplied?: { desired: string; reason: string; rejected: boolean };
+  private inFlightDesired?: string;
   private managedModel: boolean;
   private managedThinking: boolean;
 
@@ -40,20 +45,49 @@ export class RuntimeSettingsReconciler {
     private readonly isCurrent: () => boolean,
   ) {
     this.lastManaged = launched;
+    this.applied = `${launched.model || '(default)'} / ${launched.thinking || '(default)'}`;
     this.managedModel = Boolean(launched.model);
     this.managedThinking = Boolean(launched.thinking);
   }
 
   describe(): string {
-    return this.matchesDesired() ? this.status : `Desired settings pending. ${this.status}`;
+    if (this.matchesDesired()) return this.status;
+    const reason = this.currentUnapplied()?.reason;
+    return `Desired settings pending${reason ? ` (${reason})` : ''}. Applied: ${this.applied}`;
+  }
+
+  /** One line for the user while requests must run on the applied selection. */
+  unappliedNotice(): string | undefined {
+    const reason = this.currentUnapplied()?.reason;
+    if (!reason || this.matchesDesired()) return undefined;
+    const { model, thinking } = this.desired();
+    const desired = [model, thinking].filter(Boolean).join(' / ') || '(default)';
+    return `設定を ${desired} に切り替えられませんでした（${reason}）。${this.applied} のまま処理します。`;
+  }
+
+  /** A reason recorded for an older selection says nothing about the current one. */
+  private currentUnapplied() {
+    return this.unapplied?.desired === JSON.stringify(this.desired()) ? this.unapplied : undefined;
   }
 
   matchesDesired(): boolean {
     return JSON.stringify(this.desired()) === JSON.stringify(this.lastManaged);
   }
 
+  /** Background trigger. A definite Pi rejection waits for the next request or selection. */
+  refresh(): void {
+    if (!this.currentUnapplied()?.rejected) void this.reconcile();
+  }
+
   reconcile(): Promise<SettingsAdmission> {
-    if (this.inFlight) return this.inFlight;
+    const desired = JSON.stringify(this.desired());
+    if (this.inFlight) {
+      // A transaction started for an older selection cannot answer for this one.
+      return this.inFlightDesired === desired
+        ? this.inFlight
+        : this.inFlight.then(() => this.reconcile());
+    }
+    this.inFlightDesired = desired;
     const operation = this.apply().catch((error: unknown) =>
       this.pending(error instanceof Error ? error.message : String(error)),
     );
@@ -64,13 +98,23 @@ export class RuntimeSettingsReconciler {
     return operation;
   }
 
-  private pending(reason: string): SettingsAdmission {
+  private pending(reason: string, rejected = false): SettingsAdmission {
     this.status = `Pending: ${reason}`;
+    this.unapplied = { desired: this.inFlightDesired ?? '', reason, rejected };
     return { ready: false, reason };
+  }
+
+  private ready(desired: RuntimeSettings, revision: number): SettingsAdmission {
+    this.lastManaged = desired;
+    this.status = `Applied: ${this.applied}`;
+    this.unapplied = undefined;
+    return { ready: true, revision };
   }
 
   private async apply(): Promise<SettingsAdmission> {
     const desired = this.desired();
+    const label = (model: string | undefined, thinking: string | undefined) =>
+      `${model || '(none)'} / ${thinking || '(unknown)'}`;
     const unchanged = () =>
       this.isCurrent() && JSON.stringify(this.desired()) === JSON.stringify(desired);
     if (desired.processIdentity !== this.launched.processIdentity) {
@@ -96,6 +140,7 @@ export class RuntimeSettingsReconciler {
         return this.pending('Pi update required for guarded runtime settings');
       }
       this.status = 'Launch settings unchanged (runtime verification requires Pi update)';
+      this.unapplied = undefined;
       return { ready: true };
     }
     if (!revision(state.settingsRevision)) return this.pending('Invalid Pi settings revision');
@@ -106,13 +151,12 @@ export class RuntimeSettingsReconciler {
     const agrees = (model: string | undefined, thinking: string | undefined) =>
       (!desired.model || desired.model === model) &&
       (!desired.thinking || desired.thinking === thinking);
+    this.applied = label(actualModel, state.thinkingLevel);
     if (agrees(actualModel, state.thinkingLevel)) {
       // An explicit selection becomes managed even when no mutation is needed.
       this.managedModel ||= Boolean(desired.model);
       this.managedThinking ||= Boolean(desired.thinking);
-      this.lastManaged = desired;
-      this.status = `Applied: ${actualModel || '(none)'} / ${state.thinkingLevel || '(unknown)'}`;
-      return { ready: true, revision: state.settingsRevision };
+      return this.ready(desired, state.settingsRevision);
     }
     let provider: string | undefined;
     let modelId: string | undefined;
@@ -138,7 +182,8 @@ export class RuntimeSettingsReconciler {
     });
     if (!unchanged())
       return this.pending('Desired settings changed or connection closed during reconciliation');
-    if (!applied.success) return this.pending(applied.error || 'Pi rejected runtime settings');
+    if (!applied.success)
+      return this.pending(applied.error || 'Pi rejected runtime settings', true);
     const data = applied.data as
       (RuntimeState & { applied?: boolean; reason?: string }) | undefined;
     if (data?.applied === false && ['busy', 'revision_changed'].includes(data.reason || '')) {
@@ -148,6 +193,7 @@ export class RuntimeSettingsReconciler {
       data?.model?.provider && data.model.id
         ? `${data.model.provider}/${data.model.id}`
         : undefined;
+    if (data?.applied === true) this.applied = label(appliedModel, data.thinkingLevel);
     if (
       data?.applied !== true ||
       !revision(data.settingsRevision) ||
@@ -155,8 +201,6 @@ export class RuntimeSettingsReconciler {
     ) {
       return this.pending('Pi did not acknowledge the desired effective model and thinking level');
     }
-    this.lastManaged = desired;
-    this.status = `Applied: ${appliedModel || '(none)'} / ${data.thinkingLevel || '(unknown)'}`;
-    return { ready: true, revision: data.settingsRevision };
+    return this.ready(desired, data.settingsRevision);
   }
 }
