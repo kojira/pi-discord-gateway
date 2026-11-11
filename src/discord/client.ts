@@ -10,6 +10,7 @@ import {
   Client,
   Events,
   GatewayIntentBits,
+  MessageType,
   Partials,
   type ButtonInteraction,
   type Interaction,
@@ -141,6 +142,8 @@ export async function handleInteraction(interaction: Interaction): Promise<void>
 async function handleMessage(message: Message): Promise<void> {
   // Ignore bot messages
   if (message.author.bot) return;
+  // A pin notice is posted as the pinning user; it is not a message to the agent.
+  if (message.type === MessageType.ChannelPinnedMessage) return;
 
   const isDM = !message.guild;
   const channelId = message.channelId;
