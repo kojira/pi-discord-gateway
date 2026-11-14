@@ -4,6 +4,7 @@ import { initDb, closeDb, getAllChannels } from './db.js';
 import { startDiscord, stopDiscord, getBotTag } from './discord/client.js';
 import { stopWebhookLifecycle } from './discord/slash-commands.js';
 import { startArchiveCleanup } from './session/archive-cleanup.js';
+import { startLogCompression } from './session/log-compression.js';
 import { startMediaCleanup } from './session/media.js';
 import { refreshModelCatalog } from './agent/model-catalog.js';
 import { startProcessingLoop, stopProcessingLoop } from './agent/queue.js';
@@ -31,6 +32,7 @@ export async function startGateway(): Promise<void> {
   startNestedSessionMonitor();
 
   let stopArchiveCleanup = () => {};
+  let stopLogCompression = () => {};
   let stopMediaCleanup = () => {};
   let stopScheduler = () => {};
   let processingStarted = false;
@@ -64,6 +66,7 @@ export async function startGateway(): Promise<void> {
 
       stopScheduler();
       stopArchiveCleanup();
+      stopLogCompression();
       stopMediaCleanup();
 
       // Reject new webhook mutations as soon as shutdown starts. SQLite stays
@@ -99,6 +102,7 @@ export async function startGateway(): Promise<void> {
     processingStarted = true;
     stopScheduler = startScheduler();
     stopArchiveCleanup = startArchiveCleanup();
+    stopLogCompression = startLogCompression();
     stopMediaCleanup = startMediaCleanup();
 
     logger.info(
