@@ -13,11 +13,13 @@ import {
   truncateSync,
   utimesSync,
 } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { createGunzip, createGzip, gzipSync } from 'node:zlib';
 import { config } from '../config.js';
+import { getAllChannels } from '../db.js';
 import { logger } from '../logger.js';
+import { resolveChannelSessionDir } from './path.js';
 
 const COMPRESS_AFTER_DAYS = 30;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -87,8 +89,14 @@ async function gzipSessionFile(file: string): Promise<number> {
 
 export async function compressOldSessionFiles(
   sessionsDir: string,
-  options: { now?: number; isOpen?: (file: string) => boolean } = {},
+  options: {
+    now?: number;
+    isOpen?: (file: string) => boolean;
+    /** Session dirs Pi resumes with `--continue` (one per registered channel). */
+    resumedDirs?: ReadonlySet<string>;
+  } = {},
 ): Promise<SessionCompressionResult> {
+  const resumedDirs = options.resumedDirs ?? new Set<string>();
   const now = options.now ?? Date.now();
   const isOpen = options.isOpen ?? isFileOpenByAnyProcess;
   const cutoff = now - COMPRESS_AFTER_DAYS * DAY_MS;
@@ -128,10 +136,8 @@ export async function compressOldSessionFiles(
     }
     if (files.length === 0) continue;
 
-    // `--continue` resumes the newest file directly in a channel's session
-    // directory; nothing else is resumed implicitly.
-    const isChannelDir =
-      resolve(dirname(dir)) === resolve(sessionsDir) && /^ch_[^_]+$/.test(basename(dir));
+    // `--continue` resumes the newest file in a registered channel's session dir.
+    const isChannelDir = resumedDirs.has(resolve(dir));
     const newest = isChannelDir
       ? files.reduce((a, b) => (b.mtimeMs > a.mtimeMs ? b : a))
       : undefined;
@@ -242,7 +248,8 @@ export function splitDaemonLogsByMonth(
 
 async function runLogCompression(): Promise<void> {
   try {
-    const sessions = await compressOldSessionFiles(config.sessionsDir);
+    const resumedDirs = new Set(getAllChannels().map((c) => resolveChannelSessionDir(c.folder)));
+    const sessions = await compressOldSessionFiles(config.sessionsDir, { resumedDirs });
     // The launchers write daemon.*.log next to the database.
     const daemonLogs = splitDaemonLogsByMonth(dirname(config.dbPath));
     logger.info({ sessions, daemonLogs }, 'Log compression run');

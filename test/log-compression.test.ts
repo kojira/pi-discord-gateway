@@ -54,12 +54,20 @@ describe('compressOldSessionFiles', () => {
     writeAged(newestFile, 'newest\n', 40, now);
     const oldMtime = statSync(oldFile).mtimeMs;
 
+    // A DM channel folder is resumed too, even though it is not named ch_<id>.
+    const dmDir = join(sessionsDir, 'dm_456');
+    mkdirSync(dmDir);
+    const dmNewest = join(dmDir, 'only.jsonl');
+    writeAged(dmNewest, 'dm\n', 90, now);
+
     const result = await compressOldSessionFiles(sessionsDir, {
       now,
       isOpen: (file) => file === openFile,
+      resumedDirs: new Set([channelDir, dmDir]),
     });
 
-    expect(result).toMatchObject({ compressed: 2, skippedNewest: 1, skippedOpen: 1, failed: 0 });
+    expect(result).toMatchObject({ compressed: 2, skippedNewest: 2, skippedOpen: 1, failed: 0 });
+    expect(readFileSync(dmNewest, 'utf8')).toBe('dm\n');
     expect(existsSync(runFile)).toBe(false);
     expect(gunzipSync(readFileSync(`${runFile}.gz`)).toString()).toBe('run\n');
     expect(existsSync(oldFile)).toBe(false);
