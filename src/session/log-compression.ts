@@ -13,10 +13,10 @@ import {
   truncateSync,
   utimesSync,
 } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { createGunzip, createGzip, gzipSync } from 'node:zlib';
-import { config, defaultDataDir } from '../config.js';
+import { config } from '../config.js';
 import { logger } from '../logger.js';
 
 const COMPRESS_AFTER_DAYS = 30;
@@ -128,7 +128,13 @@ export async function compressOldSessionFiles(
     }
     if (files.length === 0) continue;
 
-    const newest = files.reduce((a, b) => (b.mtimeMs > a.mtimeMs ? b : a));
+    // `--continue` resumes the newest file directly in a channel's session
+    // directory; nothing else is resumed implicitly.
+    const isChannelDir =
+      resolve(dirname(dir)) === resolve(sessionsDir) && /^ch_[^_]+$/.test(basename(dir));
+    const newest = isChannelDir
+      ? files.reduce((a, b) => (b.mtimeMs > a.mtimeMs ? b : a))
+      : undefined;
     for (const file of files) {
       if (file.mtimeMs >= cutoff) continue;
       if (file === newest) {
@@ -237,7 +243,8 @@ export function splitDaemonLogsByMonth(
 async function runLogCompression(): Promise<void> {
   try {
     const sessions = await compressOldSessionFiles(config.sessionsDir);
-    const daemonLogs = splitDaemonLogsByMonth(defaultDataDir());
+    // The launchers write daemon.*.log next to the database.
+    const daemonLogs = splitDaemonLogsByMonth(dirname(config.dbPath));
     logger.info({ sessions, daemonLogs }, 'Log compression run');
   } catch (err: any) {
     logger.warn({ err: err.message }, 'Log compression error');
