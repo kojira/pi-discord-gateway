@@ -39,23 +39,37 @@ describe('compressOldSessionFiles', () => {
   it('gzips old session files except the newest in its directory and open files', async () => {
     const now = Date.now();
     const sessionsDir = makeTempDir();
-    const channelDir = join(sessionsDir, 'channel', 'forks');
-    mkdirSync(channelDir, { recursive: true });
+    const channelDir = join(sessionsDir, 'ch_123');
+    const runDir = join(channelDir, 'parent', 'run-0');
+    mkdirSync(runDir, { recursive: true });
     const oldFile = join(channelDir, 'a.jsonl');
     const openFile = join(channelDir, 'b.jsonl');
     const newestFile = join(channelDir, 'c.jsonl');
+    // A subagent run directory holds a single finished session file.
+    const runFile = join(runDir, 'session.jsonl');
+    writeAged(runFile, 'run\n', 45, now);
     const oldContent = '{"type":"message","n":1}\n'.repeat(100);
     writeAged(oldFile, oldContent, 60, now);
     writeAged(openFile, 'open\n', 50, now);
     writeAged(newestFile, 'newest\n', 40, now);
     const oldMtime = statSync(oldFile).mtimeMs;
 
+    // A DM channel folder is resumed too, even though it is not named ch_<id>.
+    const dmDir = join(sessionsDir, 'dm_456');
+    mkdirSync(dmDir);
+    const dmNewest = join(dmDir, 'only.jsonl');
+    writeAged(dmNewest, 'dm\n', 90, now);
+
     const result = await compressOldSessionFiles(sessionsDir, {
       now,
       isOpen: (file) => file === openFile,
+      resumedDirs: new Set([channelDir, dmDir]),
     });
 
-    expect(result).toMatchObject({ compressed: 1, skippedNewest: 1, skippedOpen: 1, failed: 0 });
+    expect(result).toMatchObject({ compressed: 2, skippedNewest: 2, skippedOpen: 1, failed: 0 });
+    expect(readFileSync(dmNewest, 'utf8')).toBe('dm\n');
+    expect(existsSync(runFile)).toBe(false);
+    expect(gunzipSync(readFileSync(`${runFile}.gz`)).toString()).toBe('run\n');
     expect(existsSync(oldFile)).toBe(false);
     expect(existsSync(`${oldFile}.gz.tmp`)).toBe(false);
     expect(gunzipSync(readFileSync(`${oldFile}.gz`)).toString()).toBe(oldContent);
