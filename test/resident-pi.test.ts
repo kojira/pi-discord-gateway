@@ -522,6 +522,41 @@ it('a prompt rejected after the hand-over fails its row once instead of replayin
   }
 }, 30_000);
 
+it("an idle reattach keeps the channel's model override", async () => {
+  const root = newRoot();
+  const piBin = writeFixturePi(root, 'pi-fixture');
+  setupEnv(root, piBin);
+  process.env.PI_MODEL = 'prov/global';
+  const first = await bootGateway();
+  first.db.registerChannel({ ...channel, modelOverride: 'prov/channel' });
+  first.db.enqueueMessage({
+    channelJid: channel.jid,
+    sender: 'user',
+    senderName: 'User',
+    content: 'hi',
+    timestamp: new Date().toISOString(),
+  });
+  first.queue.startProcessingLoop();
+  await vi.waitFor(() => expect(mocks.send).toHaveBeenCalledTimes(1), { timeout: 10_000 });
+  trackHost(channel.folder, join(root, 'sessions'));
+  await first.queue.stopProcessingLoop({ timeoutMs: 5000 });
+  first.db.closeDb();
+
+  const second = await bootGateway();
+  second.queue.startProcessingLoop();
+  try {
+    await vi.waitFor(() => expect(second.invoke.hasResidentAgent(channel.folder)).toBe(true));
+    // Polling reconciles the reattached Pi's settings against the channel's selection.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const types = readLines(join(root, 'commands')).map((line) => JSON.parse(line).type);
+    expect(types).not.toContain('set_runtime_settings');
+  } finally {
+    await second.invoke.shutdownResidentAgents();
+    await second.queue.stopProcessingLoop({ timeoutMs: 1000 });
+    second.db.closeDb();
+  }
+}, 30_000);
+
 it('labels deploy artifacts by component and commit for /pi status', async () => {
   const { buildLabelFromPath } = await import('../src/version.js');
   expect(

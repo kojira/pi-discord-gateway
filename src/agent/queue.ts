@@ -28,6 +28,7 @@ import {
 import {
   acceptResidentRequests,
   type ConnectionDelivery,
+  type DesiredAgentSettings,
   detachResidentAgents,
   type InvokeOptions,
   hasReloadingResidents,
@@ -158,6 +159,7 @@ function resumeResident(resident: ResumableResident): void {
   const row = request ? getQueuedMessage(request.rowid) : undefined;
   if (!request || !row) {
     void resumeResidentAgent(resident.folder, record, {
+      resolveSettings: channelSettingsResolver(jid),
       connectionDelivery: connectionDeliveryFor(jid),
       steeringConsumed: (rowids) => markSteeringRowsConsumed(jid, rowids),
     });
@@ -559,6 +561,20 @@ interface ResumeRequest {
   state: ResidentRequestState;
 }
 
+/** The channel's saved model/thinking/cwd, read when Pi needs them. */
+function channelSettingsResolver(jid: string): () => DesiredAgentSettings {
+  return () => {
+    const latest = getChannel(jid);
+    if (!latest) throw new Error('Channel disappeared before admission');
+    const desired = computeEffectiveChannelSettings(latest);
+    return {
+      model: desired.modelInfo?.ref || desired.rawModelRef || undefined,
+      thinking: desired.hasManagedThinking ? desired.effectiveThinking : undefined,
+      cwd: desired.effectiveCwd,
+    };
+  };
+}
+
 /** Connection-scoped delivery for a resident Pi; shared by new and reattached connections. */
 function connectionDeliveryFor(jid: string): ConnectionDelivery {
   return {
@@ -657,16 +673,7 @@ async function processMessage(
       model: effective.rawModelRef || undefined,
       thinking: effective.hasManagedThinking ? effective.effectiveThinking : undefined,
       cwd: effective.effectiveCwd,
-      resolveSettings: () => {
-        const latest = getChannel(jid);
-        if (!latest) throw new Error('Channel disappeared before admission');
-        const desired = computeEffectiveChannelSettings(latest);
-        return {
-          model: desired.modelInfo?.ref || desired.rawModelRef || undefined,
-          thinking: desired.hasManagedThinking ? desired.effectiveThinking : undefined,
-          cwd: desired.effectiveCwd,
-        };
-      },
+      resolveSettings: channelSettingsResolver(jid),
       signal,
       attachments,
       connectionDelivery: config.piRpcPersistent ? connectionDeliveryFor(jid) : undefined,
