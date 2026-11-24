@@ -425,6 +425,57 @@ it('Pi exits while the Gateway hands over: the next Gateway still delivers its r
   }
 }, 30_000);
 
+it('/pi reload waits for a running async continuation; new messages wait for the next Pi', async () => {
+  const root = newRoot();
+  const piBin = writeFixturePi(root, 'pi-fixture');
+  setupEnv(root, piBin);
+  const { db, queue, invoke } = await bootGateway();
+  db.registerChannel(channel);
+  queue.startProcessingLoop();
+  const enqueue = (content: string) =>
+    db.enqueueMessage({
+      channelJid: channel.jid,
+      sender: 'user',
+      senderName: 'User',
+      content,
+      timestamp: new Date().toISOString(),
+    });
+  try {
+    enqueue('park');
+    await vi.waitFor(() => expect(db.getQueuedMessage(1)?.status).toBe('done'), {
+      timeout: 10_000,
+    });
+    const hostPid = trackHost(channel.folder, join(root, 'sessions'));
+    // The native completion resumes Pi without a Gateway request.
+    writeFileSync(join(root, 'continue'), '1');
+    await vi.waitFor(() => expect(existsSync(join(root, 'continuing'))).toBe(true));
+
+    expect(invoke.reloadResidentAgent(channel.folder)).toBe(true);
+    enqueue('next');
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(alive(hostPid)).toBe(true);
+    expect(readLines(join(root, 'commands')).some((line) => line.includes('next'))).toBe(false);
+
+    writeFileSync(join(root, 'release'), '1');
+    await vi.waitFor(
+      () =>
+        expect(mocks.send.mock.calls.map(([, text]) => text)).toEqual([
+          'continued from pi-fixture',
+          'reply(next) from pi-fixture',
+        ]),
+      { timeout: 10_000 },
+    );
+    expect(alive(hostPid)).toBe(false);
+    expect(readLines(join(root, 'starts'))).toHaveLength(2);
+    trackHost(channel.folder, join(root, 'sessions'));
+  } finally {
+    queue.abortChannelTask(channel.jid);
+    await invoke.shutdownResidentAgents();
+    await queue.stopProcessingLoop({ timeoutMs: 1000 });
+    db.closeDb();
+  }
+}, 30_000);
+
 it('labels deploy artifacts by component and commit for /pi status', async () => {
   const { buildLabelFromPath } = await import('../src/version.js');
   expect(

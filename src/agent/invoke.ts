@@ -119,6 +119,8 @@ interface ActiveRpcInvocation {
   reload?: () => void;
   /** `/pi reload` is ending this Pi; new input waits for the next Pi. */
   reloading?: boolean;
+  /** `/pi reload` was requested and waits for Pi's current work to finish. */
+  reloadRequested?: () => boolean;
   piBin?: string;
 }
 
@@ -194,12 +196,14 @@ export function reloadResidentAgent(channelFolder: string): boolean {
 
 /** `/pi reload` is ending this channel's Pi; its queued messages wait for the next one. */
 export function isResidentReloading(channelFolder: string): boolean {
-  return Boolean(activeRpcInvocations.get(channelFolder)?.reloading);
+  const connection = activeRpcInvocations.get(channelFolder);
+  return Boolean(connection?.reloading || connection?.reloadRequested?.());
 }
 
 /** Cheap poll-loop guard: true only while some `/pi reload` is in progress. */
 export function hasReloadingResidents(): boolean {
-  for (const connection of activeRpcInvocations.values()) if (connection.reloading) return true;
+  for (const connection of activeRpcInvocations.values())
+    if (connection.reloading || connection.reloadRequested?.()) return true;
   return false;
 }
 
@@ -491,6 +495,8 @@ function runRpcConnection(setup: RpcConnectionSetup): void {
     // Pi parks the parent after a successful async launch; the native completion
     // notice resumes it later. A parked run is waiting, not a missing reply.
     let parked = false;
+    // A Pi run is in progress (agent_start..agent_settled), with or without a Gateway request.
+    let runActive = false;
     let settled = false;
     let currentRunId: string | undefined;
     let requestRunId: string | undefined;
@@ -806,7 +812,7 @@ function runRpcConnection(setup: RpcConnectionSetup): void {
       };
       activeInvocation.stop = stop;
       activeInvocation.request = (nextPrompt, nextOpts) => {
-        if (detaching || activeInvocation.reloading) {
+        if (detaching || activeInvocation.reloading || reloadRequested) {
           return Promise.resolve({
             ok: false,
             text: '',
@@ -853,6 +859,7 @@ function runRpcConnection(setup: RpcConnectionSetup): void {
         maybeReload();
         scheduleCheckpoint();
       };
+      activeInvocation.reloadRequested = () => reloadRequested;
       activeInvocation.detach = detach;
       activeRpcInvocations.set(channelFolder, activeInvocation);
       attachRequestAbort();
@@ -876,6 +883,7 @@ function runRpcConnection(setup: RpcConnectionSetup): void {
           lastProviderError,
           lastAssistantFailed,
           parked,
+          runActive,
           settled,
           currentRunId,
           requestRunId,
@@ -933,6 +941,7 @@ function runRpcConnection(setup: RpcConnectionSetup): void {
       lastProviderError = state.lastProviderError ?? '';
       lastAssistantFailed = state.lastAssistantFailed ?? false;
       parked = state.parked ?? false;
+      runActive = state.runActive ?? false;
       settled = state.settled ?? false;
       currentRunId = state.currentRunId;
       requestRunId = state.requestRunId;
@@ -967,9 +976,9 @@ function runRpcConnection(setup: RpcConnectionSetup): void {
       maybeReload();
     }
 
-    /** `/pi reload`: end Pi's input once no request or parked async work remains. */
+    /** `/pi reload`: end Pi's input once no request, running Pi run or parked async work remains. */
     function maybeReload(): void {
-      if (!reloadRequested || requestResolve || parked) return;
+      if (!reloadRequested || requestResolve || runActive || parked) return;
       if (activeInvocation.closing || detaching || finished || activeInvocation.reloading) return;
       activeInvocation.reloading = true;
       logger.info({ channelFolder }, 'Ending resident Pi for reload');
@@ -1264,6 +1273,7 @@ function runRpcConnection(setup: RpcConnectionSetup): void {
       }
 
       if (message?.type === 'agent_settled') {
+        runActive = false;
         // An older native run can settle while the next prompt is in preflight.
         if (
           persistent &&
@@ -1291,6 +1301,7 @@ function runRpcConnection(setup: RpcConnectionSetup): void {
         message?.type === 'compaction_start'
       ) {
         if (message.type === 'agent_start') {
+          runActive = true;
           currentRunId = typeof message.runId === 'string' ? message.runId : undefined;
           legacyAgentEndPending = false;
           // Native completion and a fresh prompt start a new physical run. Automatic
