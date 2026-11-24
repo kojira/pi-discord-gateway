@@ -3,6 +3,7 @@ const MAX_LABEL = 120;
 const MAX_TOOL_ARGUMENTS = 180;
 const MAX_TOOL_RESULT = 1000;
 export const MAX_NESTED_TRACE_LINES_PER_RECORD = 5;
+const AGY_TRACE_MARKER = '[agy] ';
 
 export interface NestedSessionTraceContext {
   sourceName?: string;
@@ -46,6 +47,16 @@ export function formatAgentTraceEvent(event: any): string | undefined {
         String(event.error || event.errorMessage || 'unknown error'),
         MAX_TEXT,
       )}`;
+    case 'extension_ui_request':
+      // The agy ACP provider reports agy's own tool/plan activity as marked notifications.
+      if (
+        event.method !== 'notify' ||
+        typeof event.message !== 'string' ||
+        !event.message.startsWith(AGY_TRACE_MARKER)
+      ) {
+        return undefined;
+      }
+      return sanitizeTraceText(event.message.slice(AGY_TRACE_MARKER.length), MAX_TEXT) || undefined;
     default:
       return undefined;
   }
