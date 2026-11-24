@@ -17,6 +17,9 @@ import { resolvePiSpawn } from './pi-spawn.js';
 import { formatAgentTraceEvent } from './trace.js';
 import { RuntimeSettingsReconciler, type RuntimeSettings } from './runtime-settings.js';
 
+/** Notification marker the agy ACP provider uses for agy text written before a tool call. */
+const AGY_PROGRESS_MARKER = '[agy-progress] ';
+
 export interface SessionTokenUsage {
   input: number;
   output: number;
@@ -286,6 +289,9 @@ export async function invokeAgent(
     // assistant message per user/native-input boundary. Explicit work-control output remains
     // separately deliverable through the work_contract event.
     let intermediateTextDelivered = false;
+    // Latest agy progress text posted to the channel. The agy provider repeats it as the
+    // finish_work summary when nothing new remains, and that summary is not posted again.
+    let lastAgyProgressText = '';
     let workOutcome: AgentResult['workOutcome'];
     let lastAssistantError = '';
     // Error text of the latest assistant turn only, used as the cause of a later suspension.
@@ -483,6 +489,7 @@ export async function invokeAgent(
       lastAssistantText = '';
       lastDeliveredText = '';
       intermediateTextDelivered = false;
+      lastAgyProgressText = '';
       workOutcome = undefined;
       lastAssistantError = '';
       lastProviderError = '';
@@ -713,6 +720,12 @@ export async function invokeAgent(
         });
     };
 
+    const assistantDelivery = () =>
+      (!persistent || initialPromptObserved ? opts?.onAssistantMessage : undefined) ||
+      (connectionDelivery
+        ? (text: string) => connectionDelivery.onAssistantMessage(text, connectionController.signal)
+        : undefined);
+
     const handleRpcMessage = (message: any) => {
       if (message?.type === 'response' && typeof message.id === 'string') {
         const pending = pendingCommands.get(message.id);
@@ -729,6 +742,21 @@ export async function invokeAgent(
       }
 
       emitTrace(formatAgentTraceEvent(message));
+
+      if (
+        message?.type === 'extension_ui_request' &&
+        message.method === 'notify' &&
+        typeof message.message === 'string' &&
+        message.message.startsWith(AGY_PROGRESS_MARKER)
+      ) {
+        const text = message.message.slice(AGY_PROGRESS_MARKER.length).trim();
+        const deliver = assistantDelivery();
+        if (text && deliver) {
+          lastAgyProgressText = text;
+          enqueueRpcDelivery(text, deliver);
+        }
+        return;
+      }
 
       const markSteeringConsumed = (userText: string) => {
         const request = pendingSteeringMessages.find((candidate) => candidate.message === userText);
@@ -800,12 +828,7 @@ export async function invokeAgent(
         if (text && (!persistent || !intermediateTextDelivered)) {
           lastAssistantText = text;
           intermediateTextDelivered = true;
-          const deliver =
-            (!persistent || initialPromptObserved ? opts?.onAssistantMessage : undefined) ||
-            (connectionDelivery
-              ? (text: string) =>
-                  connectionDelivery.onAssistantMessage(text, connectionController.signal)
-              : undefined);
+          const deliver = assistantDelivery();
           if (deliver) enqueueRpcDelivery(text, deliver);
         }
         return;
@@ -840,13 +863,11 @@ export async function invokeAgent(
           (record?.status === 'resolved' && typeof record.decision?.summary === 'string') ||
           (record?.status === 'awaiting_input' && typeof record.question === 'string')
         ) {
-          const deliver =
-            (!persistent || initialPromptObserved ? opts?.onAssistantMessage : undefined) ||
-            (connectionDelivery
-              ? (text: string) =>
-                  connectionDelivery.onAssistantMessage(text, connectionController.signal)
-              : undefined);
-          if (deliver) enqueueRpcDelivery(lastAssistantText, deliver);
+          const deliver = assistantDelivery();
+          if (deliver && lastAssistantText.trim() !== lastAgyProgressText) {
+            enqueueRpcDelivery(lastAssistantText, deliver);
+          }
+          lastAgyProgressText = '';
         }
         return;
       }

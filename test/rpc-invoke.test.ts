@@ -359,6 +359,33 @@ process.stdin.on('data', (chunk) => {
     },
   );
 
+  it('posts agy progress notifications in order and does not repeat them as the summary', async () => {
+    const root = makeFakePi(`
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+const notify = (message) => send({ type: 'extension_ui_request', id: message, method: 'notify', message, notifyType: 'info' });
+process.stdin.on('data', (chunk) => {
+  const command = JSON.parse(chunk.toString('utf8').trim());
+  send({ type: 'response', id: command.id, command: 'prompt', success: true });
+  notify('[agy-progress] step 1: listing files');
+  notify('[agy] 🛠️ agy tool ls');
+  notify('[agy-progress] step 2: reading a.txt');
+  send({ type: 'work_contract', record: { status: 'resolved', decision: { outcome: 'completed', summary: 'step 2: reading a.txt' } } });
+  send({ type: 'agent_settled' });
+});
+`);
+    const delivered: string[] = [];
+    const traces: string[] = [];
+    const result = await invokeAgent('ch_agy_progress', 'go', {
+      cwd: root,
+      onAssistantMessage: (text) => void delivered.push(text),
+      onTraceEvent: (text) => traces.push(text),
+    });
+    expect(delivered).toEqual(['step 1: listing files', 'step 2: reading a.txt']);
+    expect(traces).toContain('🛠️ agy tool ls');
+    expect(traces.some((line) => line.includes('step 1'))).toBe(false);
+    expect(result).toEqual({ ok: true, text: 'step 2: reading a.txt', workOutcome: 'completed' });
+  });
+
   it('reports the provider error that caused a work suspension', async () => {
     const root = makeFakePi(`
 const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
