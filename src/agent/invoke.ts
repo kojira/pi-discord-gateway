@@ -1488,6 +1488,12 @@ function runRpcConnection(setup: RpcConnectionSetup): void {
               : resident && !resident.piExited
                 ? 'Lost the connection to the resident Pi; background work may be interrupted'
                 : `Pi RPC connection exited unexpectedly (code ${code ?? 'unknown'}); background work may be interrupted`);
+        if (!reloaded && !activeInvocation.closing) {
+          logger.warn(
+            { code, stderr: stderr.trim().slice(0, 500), channelFolder },
+            'Pi RPC connection closed',
+          );
+        }
         if (
           !requestResolve &&
           !reloaded &&
