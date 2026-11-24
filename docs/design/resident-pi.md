@@ -34,9 +34,10 @@ Client → host, one JSON object per line:
 - `{"host":"attach","after":N}` first. A new attach replaces (closes) the previous client. The host replies `0 {"host":"attached",hostPid,piPid,bin,startedAt}` and replays buffered Pi lines with seq > N.
 - `{"host":"ack","seq":N}` drops buffered lines ≤ N.
 - `{"host":"end-stdin"}` ends Pi's stdin; `{"host":"signal","signal":"SIGTERM"}` signals Pi.
+- `{"host":"exit-ack"}` after Pi's exit: the Gateway has delivered everything and settled the row; the host may exit.
 - Any other line is written verbatim to Pi's stdin (normal RPC commands).
 
-Host → client: `<seq> <raw Pi stdout line>\n`, seq from 1, increasing. Host messages use seq 0. When Pi exits the host sends all remaining lines, then `0 {"host":"exit",code,signal}`, removes the socket and exits. If no client is attached when Pi exits, it waits (up to 1 hour) for an attach to deliver the tail first.
+Host → client: `<seq> <raw Pi stdout line>\n`, seq from 1, increasing. Host messages use seq 0. When Pi exits the host sends all remaining lines, then `0 {"host":"exit",code,signal}`, and keeps them until the attached Gateway sends `exit-ack`; then it removes the socket and exits. If the Gateway goes away first (hand-over), the next attach gets the tail and the exit again. With no client it waits up to 1 hour. While paused for a hand-over, a socket close does not count as Pi's exit.
 
 The host buffers every line until acknowledged, so nothing Pi emits while no Gateway is attached is lost.
 

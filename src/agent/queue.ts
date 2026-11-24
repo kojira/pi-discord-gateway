@@ -606,6 +606,10 @@ async function processMessage(
   logger.info({ jid, senderName, len: content.length }, 'Processing message');
 
   const typingLoop = createTypingLoop(jid, signal);
+  let settleRow = () => {};
+  const rowSettled = new Promise<void>((done) => {
+    settleRow = done;
+  });
 
   try {
     const prompt = `[Discord user: ${senderName}]\n${content}`;
@@ -666,6 +670,7 @@ async function processMessage(
       signal,
       attachments,
       connectionDelivery: config.piRpcPersistent ? connectionDeliveryFor(jid) : undefined,
+      rowSettled,
       snapshotRequest: (): ResidentRequestState => ({
         rowid,
         lastAttemptedText,
@@ -816,6 +821,7 @@ async function processMessage(
       // Nothing else to do here.
     }
   } finally {
+    settleRow();
     try {
       await flushWebhookTrace(jid);
     } catch (err: any) {

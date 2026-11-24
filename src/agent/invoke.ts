@@ -97,6 +97,8 @@ export interface InvokeOptions {
   connectionDelivery?: ConnectionDelivery;
   /** Queue state for this request, persisted with the resident Pi resume snapshot. */
   snapshotRequest?: () => unknown;
+  /** Resolves once the queue has settled this request's row (resident Pi exit ACK). */
+  rowSettled?: Promise<void>;
 }
 
 interface ActiveRpcInvocation {
@@ -454,6 +456,8 @@ function runRpcConnection(setup: RpcConnectionSetup): void {
     let orphanPromptId: string | undefined;
     let promptCommandId: string | undefined;
     let consumptionsInFlight = 0;
+    // Queue row of the latest request; a resident Pi's exit is acknowledged after it settles.
+    let requestRowSettled = opts?.rowSettled;
     let removeRequestAbort = () => {};
     let closeResolve!: () => void;
     const closed = new Promise<void>((done) => {
@@ -819,6 +823,7 @@ function runRpcConnection(setup: RpcConnectionSetup): void {
         }
         prompt = nextPrompt;
         opts = nextOpts;
+        requestRowSettled = nextOpts?.rowSettled;
         desiredOptions = {
           model: nextOpts?.model,
           thinking: nextOpts?.thinking,
@@ -1024,7 +1029,13 @@ function runRpcConnection(setup: RpcConnectionSetup): void {
       if (legacySettleTimer) clearTimeout(legacySettleTimer);
       if (checkpointTimer) clearTimeout(checkpointTimer);
       unregister();
-      if (resident) removeResidentRecord(channelFolder, resident.hostPid);
+      if (resident?.piExited) {
+        // Keep the host (and its record) reattachable until this exit is fully handled.
+        void Promise.all([deliveryChain, consumptionChain, requestRowSettled]).then(() => {
+          removeResidentRecord(channelFolder, resident.hostPid);
+          resident.ackExit();
+        });
+      } else if (resident) removeResidentRecord(channelFolder, resident.hostPid);
       rmSync(supervisorTempRoot, { recursive: true, force: true });
       for (const pending of pendingCommands.values()) {
         pending.reject(new Error('Pi RPC process exited before responding'));

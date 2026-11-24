@@ -5,10 +5,11 @@
  * exposes them on a Unix socket. Every Pi stdout line gets a sequence number and
  * stays buffered until the attached Gateway acknowledges it, so a Gateway restart
  * loses nothing: the next Gateway attaches with the last sequence it processed.
+ * After Pi exits the host keeps its tail until a Gateway acknowledges the exit.
  * See docs/design/resident-pi.md for the protocol.
  */
 import { spawn } from 'node:child_process';
-import { chmodSync, rmSync } from 'node:fs';
+import { chmodSync, rmSync, statSync } from 'node:fs';
 import { createServer, type Socket } from 'node:net';
 import { pathToFileURL } from 'node:url';
 
@@ -39,16 +40,25 @@ export function runPiHost(launch: PiHostLaunch): void {
   });
   pi.stdin.on('error', () => {});
 
+  // A later host for the same channel may already listen on this path; leave its socket.
+  let socketIno: number | undefined;
   const cleanupAndExit = () => {
-    rmSync(launch.socketPath, { force: true });
+    try {
+      if (statSync(launch.socketPath).ino === socketIno) rmSync(launch.socketPath, { force: true });
+    } catch {
+      // Already gone.
+    }
     process.exit(0);
   };
 
   const exitMessage = () =>
     `0 ${JSON.stringify({ host: 'exit', code: exited?.code ?? null, signal: exited?.signal ?? null, stderr })}\n`;
 
+  // The attached Gateway sends exit-ack once it has handled everything; until then
+  // a Gateway hand-over can still collect the tail and the exit.
   const finishWithClient = (socket: Socket) => {
-    socket.end(exitMessage(), cleanupAndExit);
+    if (terminating) socket.end(exitMessage(), cleanupAndExit);
+    else socket.write(exitMessage());
   };
 
   let pending: Buffer[] = [];
@@ -131,7 +141,9 @@ export function runPiHost(launch: PiHostLaunch): void {
         }
         if (client !== socket) continue;
         if (control?.host === 'ack' && typeof control.seq === 'number') dropThrough(control.seq);
-        else if (control?.host === 'end-stdin') pi.stdin.end();
+        else if (control?.host === 'exit-ack') {
+          if (exited) socket.end(cleanupAndExit);
+        } else if (control?.host === 'end-stdin') pi.stdin.end();
         else if (control?.host === 'signal') {
           if (exited === undefined) pi.kill((control.signal as NodeJS.Signals) || 'SIGTERM');
         } else if (pi.stdin.writable) pi.stdin.write(`${line}\n`);
@@ -144,12 +156,15 @@ export function runPiHost(launch: PiHostLaunch): void {
   };
 
   rmSync(launch.socketPath, { force: true });
-  server.listen(launch.socketPath, () => chmodSync(launch.socketPath, 0o600));
+  server.listen(launch.socketPath, () => {
+    chmodSync(launch.socketPath, 0o600);
+    socketIno = statSync(launch.socketPath).ino;
+  });
   process.on('SIGHUP', () => {});
   process.on('SIGTERM', () => {
     terminating = true;
     if (exited === undefined) pi.kill('SIGTERM');
-    else if (!client) cleanupAndExit();
+    else cleanupAndExit();
   });
 }
 

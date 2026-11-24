@@ -223,7 +223,8 @@ export class ResidentPiProcess extends EventEmitter {
     socket.on('close', () => {
       if (this.socket !== socket) return;
       this.socket = undefined;
-      if (!this.detached) this.emitClose(null);
+      // Paused for a hand-over: the next Gateway reattaches; this one must not clean up.
+      if (!this.detached && !this.paused) this.emitClose(null);
     });
   }
 
@@ -279,7 +280,8 @@ export class ResidentPiProcess extends EventEmitter {
         this.piExited = true;
         if (message.stderr) this.stderr.emit('data', Buffer.from(message.stderr));
         this.stdout.emit('end');
-        this.emitClose(message.code ?? null);
+        // The socket stays open until ackExit(): the host keeps the tail until then.
+        this.emitClose(message.code ?? null, true);
       }
       return;
     }
@@ -289,12 +291,19 @@ export class ResidentPiProcess extends EventEmitter {
     this.stdout.emit('data', Buffer.from(`${payload}\n`));
   }
 
-  private emitClose(code: number | null): void {
+  private emitClose(code: number | null, keepSocket = false): void {
     if (this.closed) return;
     this.closed = true;
     this.stdin.writable = false;
-    this.socket?.destroy();
+    if (!keepSocket) this.socket?.destroy();
     this.emit('close', code);
+  }
+
+  /** Pi's exit is fully handled (deliveries drained, request settled): let the host exit. */
+  ackExit(): void {
+    if (this.piExited && this.socket && !this.detached) {
+      this.socket.end(`${JSON.stringify({ host: 'exit-ack' })}\n`);
+    }
   }
 
   /** Allow the host to drop buffered lines up to the persisted position. */

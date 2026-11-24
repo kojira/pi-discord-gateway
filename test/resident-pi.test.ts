@@ -38,7 +38,12 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-/** Pi RPC fixture: a prompt containing "slow" waits for <root>/release before replying. */
+/**
+ * Pi RPC fixture: a prompt containing "slow" waits for <root>/release before replying;
+ * "progress" first posts an agy progress notice; "exit" exits after replying; "reject"
+ * answers the prompt with success:false after <root>/release; "park" parks the run and
+ * continues natively after <root>/continue, finishing after <root>/release.
+ */
 function writeFixturePi(root: string, name: string): string {
   const bin = join(root, name);
   writeFileSync(
@@ -52,24 +57,51 @@ if (!process.argv.includes('rpc')) process.exit(0);
 appendFileSync(join(root, 'starts'), me + ':' + process.pid + '\\n');
 const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
 let run = 0;
+const modelAt = process.argv.indexOf('--model');
+const ref = modelAt === -1 ? '' : process.argv[modelAt + 1];
+let model = ref ? { provider: ref.split('/')[0], id: ref.split('/').slice(1).join('/') } : undefined;
+let revision = 0;
+const waitFor = (file, then) => {
+  const timer = setInterval(() => {
+    if (!existsSync(join(root, file))) return;
+    clearInterval(timer);
+    rmSync(join(root, file));
+    then();
+  }, 20);
+};
+const assistant = (text) =>
+  send({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text }], stopReason: 'stop' } });
 const reply = (message) => {
   const runId = 'run-' + ++run;
   send({ type: 'agent_start', runId });
   send({ type: 'message_start', message: { role: 'user', content: message } });
-  const finish = () => {
-    const text = 'reply(' + message.split('\\n').at(-1) + ') from ' + me;
-    send({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text }], stopReason: 'stop' } });
+  if (message.includes('park')) {
+    send({ type: 'tool_execution_end', isError: false, result: { terminate: true, park: true } });
     send({ type: 'agent_settled', runId });
+    return waitFor('continue', () => {
+      const next = 'run-' + ++run;
+      send({ type: 'agent_start', runId: next });
+      send({ type: 'message_start', message: { role: 'assistant', content: [] } });
+      appendFileSync(join(root, 'continuing'), '1');
+      waitFor('release', () => {
+        assistant('continued from ' + me);
+        send({ type: 'agent_settled', runId: next });
+      });
+    });
+  }
+  if (message.includes('progress')) {
+    send({ type: 'extension_ui_request', method: 'notify', message: '[agy-progress] working' });
+  }
+  const finish = () => {
+    assistant('reply(' + message.split('\\n').at(-1) + ') from ' + me);
+    send({ type: 'agent_settled', runId });
+    if (message.includes('exit')) setTimeout(() => process.exit(0), 20);
   };
   if (!message.includes('slow')) return finish();
-  const timer = setInterval(() => {
-    if (!existsSync(join(root, 'release'))) return;
-    clearInterval(timer);
-    rmSync(join(root, 'release'));
-    finish();
-  }, 20);
+  waitFor('release', finish);
 };
 let buffer = '';
+process.stdin.setEncoding('utf8');
 process.stdin.on('data', (chunk) => {
   buffer += chunk;
   let i;
@@ -77,12 +109,30 @@ process.stdin.on('data', (chunk) => {
     const command = JSON.parse(buffer.slice(0, i));
     buffer = buffer.slice(i + 1);
     appendFileSync(join(root, 'commands'), JSON.stringify(command) + '\\n');
+    if (command.type === 'prompt' && command.message.includes('reject')) {
+      waitFor('release', () =>
+        send({ type: 'response', id: command.id, command: 'prompt', success: false, error: 'hook failed' }),
+      );
+      continue;
+    }
+    if (command.type === 'set_runtime_settings') {
+      model = { provider: command.provider, id: command.modelId };
+      revision++;
+    }
     send({
       type: 'response',
       id: command.id,
       command: command.type,
       success: true,
-      data: { accepted: true, sessionId: 'fixture', pendingMessageCount: 0, capabilities: { guardedSteer: 1 } },
+      data: {
+        accepted: true,
+        applied: true,
+        sessionId: 'fixture',
+        pendingMessageCount: 0,
+        capabilities: { guardedSteer: 1, guardedSettings: 1 },
+        settingsRevision: revision,
+        model,
+      },
     });
     if (command.type === 'prompt') reply(command.message);
   }
@@ -307,6 +357,69 @@ it('reads PI_BIN at every Pi start; /pi reload ends the Pi after its current wor
     await invoke.shutdownResidentAgents();
     await queue.stopProcessingLoop({ timeoutMs: 1000 });
     db.closeDb();
+  }
+}, 30_000);
+
+it('Pi exits while the Gateway hands over: the next Gateway still delivers its reply once', async () => {
+  const root = newRoot();
+  const piBin = writeFixturePi(root, 'pi-fixture');
+  setupEnv(root, piBin);
+  const sessionsDir = join(root, 'sessions');
+  let releaseDelivery!: (sent: boolean) => void;
+  mocks.send.mockImplementationOnce(
+    () => new Promise<boolean>((resolve) => (releaseDelivery = resolve)),
+  );
+
+  const first = await bootGateway();
+  first.db.registerChannel(channel);
+  first.db.enqueueMessage({
+    channelJid: channel.jid,
+    sender: 'user',
+    senderName: 'User',
+    content: 'slow progress exit',
+    timestamp: new Date().toISOString(),
+  });
+  first.queue.startProcessingLoop();
+  // The progress notice is being delivered when the Gateway starts shutting down.
+  await vi.waitFor(() => expect(mocks.send).toHaveBeenCalledTimes(1), { timeout: 10_000 });
+  const hostPid = trackHost(channel.folder, sessionsDir);
+  const piPid = Number(readLines(join(root, 'starts'))[0].split(':')[1]);
+  const stopping = first.queue.stopProcessingLoop({ timeoutMs: 5000 });
+
+  // Pi finishes and exits while the hand-over waits for that delivery.
+  writeFileSync(join(root, 'release'), '1');
+  await vi.waitFor(() => expect(alive(piPid)).toBe(false), { timeout: 5000 });
+  releaseDelivery(true);
+  await stopping;
+  first.db.closeDb();
+  expect(alive(hostPid)).toBe(true); // keeps Pi's tail and exit for the next Gateway
+
+  const reader = new Database(join(root, 'gateway.db'), { readonly: true });
+  try {
+    expect(reader.prepare('select status from message_queue').get()).toEqual({
+      status: 'processing',
+    });
+    const second = await bootGateway();
+    second.queue.startProcessingLoop();
+    await vi.waitFor(
+      () =>
+        expect(reader.prepare('select status from message_queue').get()).toEqual({
+          status: 'done',
+        }),
+      { timeout: 10_000 },
+    );
+    await vi.waitFor(() => expect(alive(hostPid)).toBe(false), { timeout: 5000 });
+    // Pi's own exit is still reported as a connection error, as before.
+    const texts = mocks.send.mock.calls.map(([, text]) => text as string);
+    expect(texts.filter((text) => !text.startsWith('⚠️ Agent connection error'))).toEqual([
+      'working',
+      'reply(slow progress exit) from pi-fixture',
+    ]);
+    expect(existsSync(join(sessionsDir, channel.folder, 'pi-host.json'))).toBe(false);
+    await second.queue.stopProcessingLoop({ timeoutMs: 1000 });
+    second.db.closeDb();
+  } finally {
+    reader.close();
   }
 }, 30_000);
 
