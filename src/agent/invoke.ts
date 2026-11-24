@@ -459,6 +459,8 @@ function runRpcConnection(setup: RpcConnectionSetup): void {
     // Prompt command whose response the previous Gateway did not see (resume only).
     let orphanPromptId: string | undefined;
     let promptCommandId: string | undefined;
+    // The prompt carried expectedSettingsRevision (guarded admission).
+    let promptGuarded = false;
     let consumptionsInFlight = 0;
     // Queue row of the latest request; a resident Pi's exit is acknowledged after it settles.
     let requestRowSettled = opts?.rowSettled;
@@ -757,12 +759,22 @@ function runRpcConnection(setup: RpcConnectionSetup): void {
       // A selection saved from here on is reconciled in the background and
       // takes effect at Pi's next turn boundary.
       promptSubmitted = true;
+      promptGuarded = settingsRevision !== undefined;
       const response = await sendCommand({
         type: 'prompt',
         message: prompt,
         streamingBehavior: 'followUp',
         ...(settingsRevision === undefined ? {} : { expectedSettingsRevision: settingsRevision }),
       });
+      return handlePromptResponse(response);
+    };
+
+    /**
+     * Prompt response handling shared by the live request and a reattached one whose
+     * response the previous Gateway did not see. Only guarded busy/settings_changed
+     * refusals requeue; undefined means the request was already resolved.
+     */
+    const handlePromptResponse = (response: RpcResponse): RpcResponse | undefined => {
       if (
         persistent &&
         response.success === false &&
@@ -782,7 +794,7 @@ function runRpcConnection(setup: RpcConnectionSetup): void {
         done?.({ ok: false, text: '', error: response.error || 'Pi rejected the prompt' });
         return undefined;
       }
-      if (settingsRevision !== undefined && response.success) {
+      if (promptGuarded && response.success) {
         const data = response.data as { accepted?: boolean; reason?: string } | undefined;
         if (
           data?.accepted === false &&
@@ -890,6 +902,7 @@ function runRpcConnection(setup: RpcConnectionSetup): void {
           steeringClosed,
           initialPromptObserved,
           promptSubmitted,
+          promptGuarded,
           legacyAgentEndPending,
           settingsNotice,
           reloadRequested,
@@ -948,6 +961,7 @@ function runRpcConnection(setup: RpcConnectionSetup): void {
       steeringClosed = state.steeringClosed ?? false;
       initialPromptObserved = state.initialPromptObserved ?? false;
       promptSubmitted = state.promptSubmitted ?? false;
+      promptGuarded = state.promptGuarded ?? false;
       legacyAgentEndPending = state.legacyAgentEndPending ?? false;
       settingsNotice = state.settingsNotice;
       reloadRequested = state.reloadRequested ?? false;
@@ -1122,11 +1136,12 @@ function runRpcConnection(setup: RpcConnectionSetup): void {
           pending.resolve(message as RpcResponse);
         } else if (message.id === orphanPromptId) {
           orphanPromptId = undefined;
-          const data = message.data as { accepted?: boolean } | undefined;
-          if (!initialPromptObserved && (!message.success || data?.accepted === false)) {
-            // The prompt the previous Gateway sent was not accepted: nothing ran.
-            promptSubmitted = false;
-            deferUnsentRequest(message.error || 'Pi did not accept the input; retrying');
+          try {
+            const response = handlePromptResponse(message as RpcResponse);
+            if (response && !response.success)
+              failRpcOutput(response.error || 'Pi rejected the prompt');
+          } catch (error: any) {
+            failRpcOutput(error.message);
           }
         }
         return;

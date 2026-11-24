@@ -476,6 +476,52 @@ it('/pi reload waits for a running async continuation; new messages wait for the
   }
 }, 30_000);
 
+it('a prompt rejected after the hand-over fails its row once instead of replaying it', async () => {
+  const root = newRoot();
+  const piBin = writeFixturePi(root, 'pi-fixture');
+  setupEnv(root, piBin);
+  const first = await bootGateway();
+  first.db.registerChannel(channel);
+  first.db.enqueueMessage({
+    channelJid: channel.jid,
+    sender: 'user',
+    senderName: 'User',
+    content: 'reject',
+    timestamp: new Date().toISOString(),
+  });
+  first.queue.startProcessingLoop();
+  const prompts = () =>
+    readLines(join(root, 'commands')).filter((line) => JSON.parse(line).type === 'prompt');
+  await vi.waitFor(() => expect(prompts()).toHaveLength(1), { timeout: 10_000 });
+  trackHost(channel.folder, join(root, 'sessions'));
+  // The prompt response is still outstanding when the Gateway stops.
+  await first.queue.stopProcessingLoop({ timeoutMs: 300 });
+  first.db.closeDb();
+  writeFileSync(join(root, 'release'), '1');
+
+  const reader = new Database(join(root, 'gateway.db'), { readonly: true });
+  try {
+    const second = await bootGateway();
+    second.queue.startProcessingLoop();
+    await vi.waitFor(
+      () =>
+        expect(reader.prepare('select status from message_queue').get()).toEqual({
+          status: 'failed',
+        }),
+      { timeout: 10_000 },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(prompts()).toHaveLength(1);
+    expect(mocks.send.mock.calls.map(([, text]) => text)).toEqual(['⚠️ Agent error: hook failed']);
+    second.queue.abortChannelTask(channel.jid);
+    await second.invoke.shutdownResidentAgents();
+    await second.queue.stopProcessingLoop({ timeoutMs: 1000 });
+    second.db.closeDb();
+  } finally {
+    reader.close();
+  }
+}, 30_000);
+
 it('labels deploy artifacts by component and commit for /pi status', async () => {
   const { buildLabelFromPath } = await import('../src/version.js');
   expect(
