@@ -12,13 +12,16 @@ import {
 } from 'discord.js';
 import {
   getChannelSessionStatus,
+  getResidentPiBin,
   getResidentSettingsStatus,
   refreshResidentSettings,
+  reloadResidentAgent,
   type ChannelSessionStatus,
   type SessionContextUsage,
   type SessionTokenUsage,
 } from '../agent/invoke.js';
-import { config } from '../config.js';
+import { config, currentPiBin } from '../config.js';
+import { buildLabelFromPath, gatewayVersionLabel } from '../version.js';
 import {
   activateChannelWebhookProvisioning,
   beginChannelWebhookClear,
@@ -132,6 +135,11 @@ const PI_COMMAND = new SlashCommandBuilder()
     sub
       .setName('stop')
       .setDescription('Abort the current task and clear the queue for this channel'),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName('reload')
+      .setDescription('Restart this channel’s Pi on the configured version after its current work'),
   )
   .addSubcommand((sub) =>
     sub
@@ -305,6 +313,9 @@ async function executeChatCommand(
       case 'stop':
         await handleStop(interaction);
         return;
+      case 'reload':
+        await handleReload(interaction);
+        return;
       case 'webhook':
         await handleWebhookSet(interaction);
         return;
@@ -417,6 +428,28 @@ async function handleStop(interaction: ChatInputCommandInteraction): Promise<voi
   }
 
   await interaction.editReply({ content: notes.join(' ') });
+}
+
+async function handleReload(interaction: ChatInputCommandInteraction): Promise<void> {
+  await awaitChatCommandAck(interaction);
+  const channel = ensureManagedChannel(interaction);
+  if (!channel) {
+    await interaction.editReply({ content: notRegisteredMessage() });
+    return;
+  }
+  const running = getResidentPiBin(channel.folder);
+  if (!running || !reloadResidentAgent(channel.folder)) {
+    await interaction.editReply({
+      content: `No running Pi in this channel. The next message starts ${buildLabelFromPath(currentPiBin(), 'pi')}.`,
+    });
+    return;
+  }
+  await interaction.editReply({
+    content: [
+      `Pi ${buildLabelFromPath(running, 'pi')} will end after its current work.`,
+      `The next message starts ${buildLabelFromPath(currentPiBin(), 'pi')}. Queued messages and the conversation are kept.`,
+    ].join('\n'),
+  });
 }
 
 async function handleWebhookSet(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -1154,6 +1187,8 @@ function buildStatusMessage(
     ['Desired model', formatModelValue(effective)],
     ['Desired thinking', formatThinkingValue(effective)],
     ['Runtime', getResidentSettingsStatus(getChannel(channelJid)?.folder || '')],
+    ['Pi version', formatPiVersion(getChannel(channelJid)?.folder || '')],
+    ['Gateway version', gatewayVersionLabel()],
     ['Working dir', formatWorkingDirValue(effective)],
     [
       'Webhook',
@@ -1178,6 +1213,16 @@ function buildStatusMessage(
   );
 
   return `\`\`\`text\n${formatTwoColumnRows(rows)}\n\`\`\``;
+}
+
+/** Running Pi build, and whether `/pi reload` would switch to the configured one. */
+export function formatPiVersion(channelFolder: string): string {
+  const configured = buildLabelFromPath(currentPiBin(), 'pi');
+  const runningBin = channelFolder ? getResidentPiBin(channelFolder) : undefined;
+  if (!runningBin) return `not running (next start: ${configured})`;
+  const running = buildLabelFromPath(runningBin, 'pi');
+  if (runningBin === currentPiBin()) return `${running} (configured)`;
+  return `${running} → configured ${configured} (/pi reload to update)`;
 }
 
 function formatModelValue(effective: EffectiveChannelSettings): string {
