@@ -7,6 +7,24 @@ import {
 import { splitWebhookLines } from '../src/discord/webhook-monitor.js';
 
 describe('Pi activity trace formatting', () => {
+  it('formats marked agy notify requests and ignores other notifications', () => {
+    expect(
+      formatAgentTraceEvent({
+        type: 'extension_ui_request',
+        id: 'n1',
+        method: 'notify',
+        message: '[agy] 🛠️ agy tool ls {"CommandLine":"ls","token":"abc123"}',
+        notifyType: 'info',
+      }),
+    ).toBe('🛠️ agy tool ls {"CommandLine":"ls","token":[REDACTED]}');
+    expect(
+      formatAgentTraceEvent({ type: 'extension_ui_request', method: 'notify', message: 'other' }),
+    ).toBeUndefined();
+    expect(
+      formatAgentTraceEvent({ type: 'extension_ui_request', method: 'select', message: '[agy] x' }),
+    ).toBeUndefined();
+  });
+
   it('formats user, assistant, thinking, and tool activity without streaming updates', () => {
     expect(
       formatAgentTraceEvent({
