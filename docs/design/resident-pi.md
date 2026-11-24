@@ -24,7 +24,7 @@ launchd ─ Gateway (node dist/cli/index.js start)
 
 - `pi-host` is a small Node script in this repo. Pi's RPC mode is not changed: Pi still sees pipes and exits on stdin EOF.
 - The Gateway spawns `pi-host` with `detached: true` and `unref()`; launchd only kills the Gateway's own process group, so `pi-host` and Pi survive a Gateway stop.
-- Socket: `<dir of DB_PATH>/pi-hosts/<sha256(sessionDir)[:16]>.sock` (directory 0700). If that path exceeds the 103-byte `sun_path` limit, `<tmpdir>/piscord-<hash>.sock` is used. The chosen path is stored in the record.
+- Socket: `<SESSIONS_DIR>/.pi-hosts/<sha256(sessionDir)[:16]>.sock` (directory 0700). If that path exceeds the 103-byte `sun_path` limit, `<tmpdir>/piscord-<hash>.sock` is used. The chosen path is stored in the record.
 - Record: `<channel session dir>/pi-host.json` (atomic write). It holds socket path, host/Pi pid, `PI_BIN`, launch settings, subagents temp root, and the resume snapshot below. Deleted when Pi exits.
 
 ## Socket protocol

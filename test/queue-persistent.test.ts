@@ -37,6 +37,7 @@ it('delivers independently after a queue row finishes and shuts down idle reside
     DB_PATH: join(root, 'db'),
     SESSIONS_DIR: join(root, 'sessions'),
     PI_RPC_PERSISTENT: 'true',
+    PI_RESIDENT: 'false',
     POLL_INTERVAL_MS: '1',
   });
   vi.resetModules();
@@ -105,6 +106,7 @@ it('marks a parent parked after an async launch done without an error message', 
     DB_PATH: join(root, 'db'),
     SESSIONS_DIR: join(root, 'sessions'),
     PI_RPC_PERSISTENT: 'true',
+    PI_RESIDENT: 'false',
     POLL_INTERVAL_MS: '1',
   });
   vi.resetModules();

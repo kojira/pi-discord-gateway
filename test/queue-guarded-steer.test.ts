@@ -67,6 +67,7 @@ function fixture(capability = true) {
     piThinking: '',
     piExtraFlags: '',
     piRpcPersistent: true,
+    piResident: false,
     pollInterval: 10,
     maxConcurrency: 1,
   });
