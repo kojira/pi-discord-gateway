@@ -557,6 +557,36 @@ it("an idle reattach keeps the channel's model override", async () => {
   }
 }, 30_000);
 
+it('PI_RESIDENT=false: /pi reload does not end a direct-child Pi', async () => {
+  const root = newRoot();
+  const piBin = writeFixturePi(root, 'pi-fixture');
+  setupEnv(root, piBin);
+  process.env.PI_RESIDENT = 'false';
+  const { db, queue, invoke } = await bootGateway();
+  db.registerChannel(channel);
+  db.enqueueMessage({
+    channelJid: channel.jid,
+    sender: 'user',
+    senderName: 'User',
+    content: 'hi',
+    timestamp: new Date().toISOString(),
+  });
+  queue.startProcessingLoop();
+  try {
+    await vi.waitFor(() => expect(mocks.send).toHaveBeenCalledTimes(1), { timeout: 10_000 });
+    expect(invoke.hasResidentAgent(channel.folder)).toBe(true);
+    expect(invoke.reloadResidentAgent(channel.folder)).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(invoke.hasResidentAgent(channel.folder)).toBe(true);
+    expect(mocks.send.mock.calls.map(([, text]) => text)).toEqual(['reply(hi) from pi-fixture']);
+  } finally {
+    queue.abortChannelTask(channel.jid);
+    await invoke.shutdownResidentAgents();
+    await queue.stopProcessingLoop({ timeoutMs: 1000 });
+    db.closeDb();
+  }
+}, 30_000);
+
 it('labels deploy artifacts by component and commit for /pi status', async () => {
   const { buildLabelFromPath } = await import('../src/version.js');
   expect(

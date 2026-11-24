@@ -866,13 +866,17 @@ function runRpcConnection(setup: RpcConnectionSetup): void {
             .catch((error: Error) => failRpcOutput(error.message));
         });
       };
-      activeInvocation.reload = () => {
-        reloadRequested = true;
-        maybeReload();
-        scheduleCheckpoint();
-      };
-      activeInvocation.reloadRequested = () => reloadRequested;
-      activeInvocation.detach = detach;
+      // Only a socket-backed resident Pi is handed over or reloaded; a direct child keeps
+      // its stop-with-the-Gateway behavior.
+      if (resident) {
+        activeInvocation.reload = () => {
+          reloadRequested = true;
+          maybeReload();
+          scheduleCheckpoint();
+        };
+        activeInvocation.reloadRequested = () => reloadRequested;
+        activeInvocation.detach = detach;
+      }
       activeRpcInvocations.set(channelFolder, activeInvocation);
       attachRequestAbort();
     }
