@@ -29,6 +29,8 @@ export function runPiHost(launch: PiHostLaunch): void {
   let client: Socket | undefined;
   let exited: { code: number | null; signal: NodeJS.Signals | null } | undefined;
   let stderr = '';
+  // SIGTERM to the host: end Pi and exit without waiting for a Gateway to collect output.
+  let terminating = false;
 
   const pi = spawn(launch.bin, launch.args, {
     cwd: launch.cwd,
@@ -83,6 +85,7 @@ export function runPiHost(launch: PiHostLaunch): void {
     }
     exited = { code, signal };
     if (client) finishWithClient(client);
+    else if (terminating) cleanupAndExit();
     else setTimeout(cleanupAndExit, EXIT_COLLECT_TIMEOUT_MS).unref();
   });
 
@@ -144,7 +147,9 @@ export function runPiHost(launch: PiHostLaunch): void {
   server.listen(launch.socketPath, () => chmodSync(launch.socketPath, 0o600));
   process.on('SIGHUP', () => {});
   process.on('SIGTERM', () => {
+    terminating = true;
     if (exited === undefined) pi.kill('SIGTERM');
+    else if (!client) cleanupAndExit();
   });
 }
 
