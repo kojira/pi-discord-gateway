@@ -108,8 +108,9 @@ export function runPiHost(launch: PiHostLaunch): void {
       client = undefined;
       if (exited) setTimeout(cleanupAndExit, EXIT_COLLECT_TIMEOUT_MS).unref();
     });
-    socket.on('data', (chunk: Buffer) => {
-      input += chunk.toString('utf8');
+    socket.setEncoding('utf8');
+    socket.on('data', (chunk: string) => {
+      input += chunk;
       let newline = input.indexOf('\n');
       while (newline !== -1) {
         const line = input.slice(0, newline);

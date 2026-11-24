@@ -211,7 +211,8 @@ export class ResidentPiProcess extends EventEmitter {
       socket.write(`${JSON.stringify({ host: 'attach', after: this.lastSeq })}\n`);
       for (const item of this.outbox.splice(0)) socket.write(item.data, item.callback);
     });
-    socket.on('data', (chunk: Buffer) => this.receive(chunk.toString('utf8')));
+    socket.setEncoding('utf8');
+    socket.on('data', (chunk: string) => this.receive(chunk));
     socket.on('error', (error: NodeJS.ErrnoException) => {
       if (this.socket !== socket && ['ENOENT', 'ECONNREFUSED'].includes(error.code || '')) {
         socket.destroy();

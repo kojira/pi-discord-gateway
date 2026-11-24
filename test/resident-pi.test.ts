@@ -266,18 +266,20 @@ it('Gateway restart mid-turn: Pi keeps running and the reply is delivered once a
     expect(readLines(join(root, 'starts'))).toHaveLength(1); // same Pi, not restarted
     expect(second.invoke.hasResidentAgent(channel.folder)).toBe(true);
 
-    // The reattached Pi serves the next message too.
+    // The reattached Pi serves the next message too. Its multi-byte text spans many
+    // socket reads in both directions and must arrive intact.
+    const japanese = `next ${'日本語のテキスト'.repeat(40_000)}`;
     second.db.enqueueMessage({
       channelJid: channel.jid,
       sender: 'user',
       senderName: 'User',
-      content: 'next',
+      content: japanese,
       timestamp: new Date().toISOString(),
     });
     await vi.waitFor(() =>
       expect(mocks.send).toHaveBeenLastCalledWith(
         channel.jid,
-        'reply(next) from pi-fixture',
+        `reply(${japanese}) from pi-fixture`,
         expect.any(AbortSignal),
       ),
     );
