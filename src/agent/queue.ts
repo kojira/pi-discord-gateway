@@ -30,6 +30,7 @@ import {
   type ConnectionDelivery,
   detachResidentAgents,
   type InvokeOptions,
+  hasReloadingResidents,
   hasResidentAgent,
   isResidentReloading,
   refreshResidentSettings,
@@ -228,8 +229,10 @@ function dispatch(): void {
       continue;
     }
     if (activeTaskPromises.size >= config.maxConcurrency) continue;
-    const folder = getChannel(jid)?.folder;
-    if (folder && isResidentReloading(folder)) continue;
+    if (hasReloadingResidents()) {
+      const folder = getChannel(jid)?.folder;
+      if (folder && isResidentReloading(folder)) continue;
+    }
 
     const msg = claimNextMessage(jid);
     if (!msg) continue;

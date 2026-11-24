@@ -195,6 +195,12 @@ export function isResidentReloading(channelFolder: string): boolean {
   return Boolean(activeRpcInvocations.get(channelFolder)?.reloading);
 }
 
+/** Cheap poll-loop guard: true only while some `/pi reload` is in progress. */
+export function hasReloadingResidents(): boolean {
+  for (const connection of activeRpcInvocations.values()) if (connection.reloading) return true;
+  return false;
+}
+
 /** PI_BIN of the running resident Pi, if any. */
 export function getResidentPiBin(channelFolder: string): string | undefined {
   return activeRpcInvocations.get(channelFolder)?.piBin;

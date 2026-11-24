@@ -1,5 +1,5 @@
 import { parse } from 'dotenv';
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, resolve } from 'node:path';
 
@@ -71,9 +71,24 @@ function readEnvValue(key: string): string | undefined {
  * deploy can switch it without restarting the Gateway; running Pis keep theirs.
  */
 export function currentPiBin(): string {
-  const fresh = buildConfigSource().PI_BIN?.trim();
-  return fresh || config.piBin;
+  const configPath = resolveConfigPath();
+  let stamp: string;
+  try {
+    const stat = statSync(configPath);
+    stamp = `${configPath}:${stat.mtimeMs}:${stat.size}`;
+  } catch {
+    stamp = `${configPath}:missing`;
+  }
+  // The environment wins over the file; re-read the sources only when the file changed.
+  const fromEnv = process.env.PI_BIN?.trim();
+  if (stamp !== piBinStamp) {
+    piBinStamp = stamp;
+    piBinFromSources = buildConfigSource().PI_BIN?.trim() || '';
+  }
+  return fromEnv || piBinFromSources || config.piBin;
 }
+let piBinStamp = '';
+let piBinFromSources = '';
 
 function buildConfigSource(): Record<string, string> {
   return {

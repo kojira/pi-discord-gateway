@@ -20,6 +20,7 @@ const {
 
 vi.mock('../src/agent/invoke.js', () => ({
   isResidentReloading: () => false,
+  hasReloadingResidents: () => false,
   hasResidentAgent: vi.fn().mockReturnValue(false),
   refreshResidentSettings: vi.fn(),
   stopResidentAgent: vi.fn().mockReturnValue(false),
