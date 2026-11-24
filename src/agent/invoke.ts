@@ -190,6 +190,11 @@ export function reloadResidentAgent(channelFolder: string): boolean {
   return true;
 }
 
+/** `/pi reload` is ending this channel's Pi; its queued messages wait for the next one. */
+export function isResidentReloading(channelFolder: string): boolean {
+  return Boolean(activeRpcInvocations.get(channelFolder)?.reloading);
+}
+
 /** PI_BIN of the running resident Pi, if any. */
 export function getResidentPiBin(channelFolder: string): string | undefined {
   return activeRpcInvocations.get(channelFolder)?.piBin;
@@ -559,6 +564,8 @@ function runRpcConnection(setup: RpcConnectionSetup): void {
       if (
         activeInvocation.closing ||
         detaching ||
+        // `/pi reload`: later messages wait for the next Pi instead of joining this one.
+        reloadRequested ||
         (persistent &&
           (!requestResolve || !initialPromptObserved || steeringClosed || !requestRunId))
       )

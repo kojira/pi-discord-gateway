@@ -31,6 +31,7 @@ import {
   detachResidentAgents,
   type InvokeOptions,
   hasResidentAgent,
+  isResidentReloading,
   refreshResidentSettings,
   invokeAgent,
   readResumableResident,
@@ -227,6 +228,8 @@ function dispatch(): void {
       continue;
     }
     if (activeTaskPromises.size >= config.maxConcurrency) continue;
+    const folder = getChannel(jid)?.folder;
+    if (folder && isResidentReloading(folder)) continue;
 
     const msg = claimNextMessage(jid);
     if (!msg) continue;
