@@ -66,6 +66,15 @@ function readEnvValue(key: string): string | undefined {
   return CONFIG_SOURCE[key];
 }
 
+/**
+ * PI_BIN as configured right now. Read from the sources at every Pi start so a
+ * deploy can switch it without restarting the Gateway; running Pis keep theirs.
+ */
+export function currentPiBin(): string {
+  const fresh = buildConfigSource().PI_BIN?.trim();
+  return fresh || config.piBin;
+}
+
 function buildConfigSource(): Record<string, string> {
   return {
     ...loadEnvFile(LEGACY_ENV_PATH),
@@ -142,6 +151,12 @@ export const config = {
   /** Keep one RPC process per visited channel; no idle eviction */
   piRpcPersistent: envBool('PI_RPC_PERSISTENT', false),
 
+  /**
+   * With PI_RPC_PERSISTENT: run each Pi behind a detached pi-host so it survives
+   * Gateway restarts (docs/design/resident-pi.md). Off keeps Pi as a direct child.
+   */
+  piResident: envBool('PI_RESIDENT', true),
+
   /** Default model for pi */
   piModel: env('PI_MODEL'),
 
@@ -213,3 +228,8 @@ export const config = {
 } as const;
 
 export type Config = typeof config;
+
+/** Persistent Pis run behind a detached pi-host and survive Gateway restarts. */
+export function isResidentMode(): boolean {
+  return config.piRpcPersistent && config.piResident;
+}
