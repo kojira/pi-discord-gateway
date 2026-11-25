@@ -12,6 +12,8 @@ vi.mock('../src/agent/model-catalog.js', () => ({
   refreshModelCatalog: refreshMock,
 }));
 vi.mock('../src/agent/invoke.js', () => ({
+  isResidentReloading: () => false,
+  hasReloadingResidents: () => false,
   hasResidentAgent: () => false,
   stopResidentAgent: () => false,
   shutdownResidentAgents: vi.fn().mockResolvedValue(undefined),

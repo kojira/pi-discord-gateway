@@ -61,6 +61,7 @@ beforeEach(() => {
   vi.mocked(spawn).mockReturnValue(proc as unknown as ReturnType<typeof spawn>);
   Object.assign(config, {
     piRpcPersistent: true,
+    piResident: false,
     piBin: 'pi-fixture',
     piModel: '',
     piThinking: '',

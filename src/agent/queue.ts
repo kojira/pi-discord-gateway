@@ -6,7 +6,7 @@
  * concurrency limit.
  */
 
-import { config } from '../config.js';
+import { config, isResidentMode } from '../config.js';
 import { logger } from '../logger.js';
 import {
   channelsWithPending,
@@ -21,16 +21,28 @@ import {
   recoverStuckMessages,
   requeueMessages,
   logMessage,
+  getAllChannels,
   getChannel,
+  getQueuedMessage,
 } from '../db.js';
 import {
+  acceptResidentRequests,
+  type ConnectionDelivery,
+  type DesiredAgentSettings,
+  detachResidentAgents,
+  type InvokeOptions,
+  hasReloadingResidents,
   hasResidentAgent,
+  isResidentReloading,
   refreshResidentSettings,
   invokeAgent,
+  readResumableResident,
+  resumeResidentAgent,
   shutdownResidentAgents,
   stopResidentAgent,
   steerActiveAgent,
 } from './invoke.js';
+import type { ResidentPiRecord } from './resident-pi.js';
 import { sendResponse, setTyping } from '../discord/client.js';
 import { computeEffectiveChannelSettings } from './channel-settings.js';
 import { hasCachedModelCatalog, refreshModelCatalog } from './model-catalog.js';
@@ -91,13 +103,74 @@ export function startProcessingLoop(): void {
   connectionDeliveryController = new AbortController();
   stopPromise = null;
 
-  // Recover any messages stuck in 'processing' from a previous crash.
-  const recovered = recoverStuckMessages();
+  const resident = isResidentMode();
+  const residents = resident ? findResumableResidents() : [];
+  // Recover any messages stuck in 'processing' from a previous crash. Rows a
+  // still-running resident Pi owns are continued instead.
+  const recovered = recoverStuckMessages(residents.flatMap((resident) => resident.ownedRows));
   if (recovered > 0) {
     logger.info({ count: recovered }, 'Recovered stuck messages');
   }
+  if (resident) acceptResidentRequests();
+  for (const found of residents) resumeResident(found);
 
   schedulePoll(0);
+}
+
+/** Queue state persisted with a resident Pi request (see snapshotRequest). */
+interface ResidentRequestState {
+  rowid: number;
+  lastAttemptedText: string;
+  lastDeliverySucceeded: boolean;
+  hadLiveDeliveryFailure: boolean;
+}
+
+interface ResumableResident {
+  jid: string;
+  folder: string;
+  record: ResidentPiRecord;
+  request?: ResidentRequestState;
+  ownedRows: number[];
+}
+
+function findResumableResidents(): ResumableResident[] {
+  const residents: ResumableResident[] = [];
+  for (const channel of getAllChannels()) {
+    const record = readResumableResident(channel.folder);
+    if (!record) continue;
+    const request = (record.snapshot?.request?.queue ?? undefined) as
+      ResidentRequestState | undefined;
+    const steeringRows = (record.snapshot?.steering ?? []).flatMap((steer) => steer.rowids);
+    residents.push({
+      jid: channel.jid,
+      folder: channel.folder,
+      record,
+      request,
+      ownedRows: [...(request ? [request.rowid] : []), ...steeringRows],
+    });
+  }
+  return residents;
+}
+
+function resumeResident(resident: ResumableResident): void {
+  const { jid, record, request } = resident;
+  const steeringRows = (record.snapshot?.steering ?? []).flatMap((steer) => steer.rowids);
+  if (steeringRows.length > 0) acceptedSteeringRows.set(jid, new Set(steeringRows));
+  const row = request ? getQueuedMessage(request.rowid) : undefined;
+  if (!request || !row) {
+    void resumeResidentAgent(resident.folder, record, {
+      resolveSettings: channelSettingsResolver(jid),
+      connectionDelivery: connectionDeliveryFor(jid),
+      steeringConsumed: (rowids) => markSteeringRowsConsumed(jid, rowids),
+    });
+    logger.info({ jid, hostPid: record.hostPid }, 'Resident Pi reattached (idle)');
+    return;
+  }
+  logger.info(
+    { jid, rowid: row.rowid, hostPid: record.hostPid },
+    'Resident Pi reattached with request in progress',
+  );
+  startChannelTask(jid, row, { record, state: request });
 }
 
 export function stopProcessingLoop(opts: { timeoutMs?: number } = {}): Promise<void> {
@@ -108,11 +181,18 @@ export function stopProcessingLoop(opts: { timeoutMs?: number } = {}): Promise<v
   running = false;
   clearPollTimer();
 
-  stopPromise = drainActiveTasks(opts.timeoutMs ?? config.shutdownTimeoutMs).finally(async () => {
-    connectionDeliveryController.abort();
-    await shutdownResidentAgents();
-    taskResourcesAvailable = false;
-  });
+  const timeoutMs = opts.timeoutMs ?? config.shutdownTimeoutMs;
+  // Resident Pis keep running across a Gateway restart: hand them over first so
+  // their requests resolve as detached, then drain what remains.
+  const resident = isResidentMode();
+  const handOver = resident ? detachResidentAgents(timeoutMs) : Promise.resolve();
+  stopPromise = handOver
+    .then(() => drainActiveTasks(timeoutMs))
+    .finally(async () => {
+      connectionDeliveryController.abort();
+      if (!resident) await shutdownResidentAgents();
+      taskResourcesAvailable = false;
+    });
   return stopPromise;
 }
 
@@ -151,10 +231,20 @@ function dispatch(): void {
       continue;
     }
     if (activeTaskPromises.size >= config.maxConcurrency) continue;
+    if (hasReloadingResidents()) {
+      const folder = getChannel(jid)?.folder;
+      if (folder && isResidentReloading(folder)) continue;
+    }
 
     const msg = claimNextMessage(jid);
     if (!msg) continue;
+    startChannelTask(jid, msg);
+  }
+}
 
+/** Run one queue row on this channel, holding the channel's serial lock. */
+function startChannelTask(jid: string, msg: QueuedMessage, resume?: ResumeRequest): void {
+  {
     const controller = new AbortController();
     const generation = Symbol(jid);
     activeChannels.add(jid);
@@ -169,6 +259,7 @@ function dispatch(): void {
       msg.content,
       controller.signal,
       msg.attachments,
+      resume,
     ).finally(async () => {
       const steeringTask = steeringTasksByChannel.get(jid);
       if (steeringTask?.generation === generation) {
@@ -270,13 +361,11 @@ async function processSteeringMessages(
       attachments: prepared.attachments,
       signal,
       processingComplete,
+      rowids,
       onConsumed: () => {
         if (!taskResourcesAvailable || signal.aborted) return;
-        markMessagesDone(rowids);
+        markSteeringRowsConsumed(jid, rowids);
         consumed = true;
-        const acceptedRows = acceptedSteeringRows.get(jid);
-        for (const rowid of rowids) acceptedRows?.delete(rowid);
-        logger.info({ jid, rowids, count: rowids.length }, 'Steering batch consumed by Pi');
       },
     });
     if (!accepted) {
@@ -310,6 +399,14 @@ async function processSteeringMessages(
   } finally {
     finishProcessing();
   }
+}
+
+function markSteeringRowsConsumed(jid: string, rowids: number[]): void {
+  if (!taskResourcesAvailable) return;
+  markMessagesDone(rowids);
+  const acceptedRows = acceptedSteeringRows.get(jid);
+  for (const rowid of rowids) acceptedRows?.delete(rowid);
+  logger.info({ jid, rowids, count: rowids.length }, 'Steering batch consumed by Pi');
 }
 
 function settleInactiveSteeringBatch(
@@ -459,6 +556,52 @@ async function waitForPromise(promise: Promise<unknown>, timeoutMs: number): Pro
   return activeTaskPromises.size === 0 && steeringTaskPromises.size === 0;
 }
 
+interface ResumeRequest {
+  record: ResidentPiRecord;
+  state: ResidentRequestState;
+}
+
+/** The channel's saved model/thinking/cwd, read when Pi needs them. */
+function channelSettingsResolver(jid: string): () => DesiredAgentSettings {
+  return () => {
+    const latest = getChannel(jid);
+    if (!latest) throw new Error('Channel disappeared before admission');
+    const desired = computeEffectiveChannelSettings(latest);
+    return {
+      model: desired.modelInfo?.ref || desired.rawModelRef || undefined,
+      thinking: desired.hasManagedThinking ? desired.effectiveThinking : undefined,
+      cwd: desired.effectiveCwd,
+    };
+  };
+}
+
+/** Connection-scoped delivery for a resident Pi; shared by new and reattached connections. */
+function connectionDeliveryFor(jid: string): ConnectionDelivery {
+  return {
+    onAssistantMessage: async (text, connectionSignal) => {
+      connectionSignal = AbortSignal.any([connectionSignal, connectionDeliveryController.signal]);
+      if (!taskResourcesAvailable || connectionSignal.aborted) return;
+      const sent = await sendResponse(jid, text, connectionSignal);
+      if (!taskResourcesAvailable || connectionSignal.aborted) return;
+      if (!sent) throw new Error('Could not deliver background assistant message to Discord');
+      logMessage(jid, 'assistant', text);
+    },
+    onTraceEvent: (text) => {
+      if (taskResourcesAvailable) enqueueWebhookTrace(jid, text);
+    },
+    onError: async (error, connectionSignal) => {
+      connectionSignal = AbortSignal.any([connectionSignal, connectionDeliveryController.signal]);
+      if (!taskResourcesAvailable || connectionSignal.aborted) return;
+      enqueueWebhookTerminal(jid, `RPC interrupted: ${sanitizeTraceText(error)}`);
+      await sendResponse(
+        jid,
+        `⚠️ Agent connection error: ${error.slice(0, 300)}`,
+        connectionSignal,
+      );
+    },
+  };
+}
+
 async function processMessage(
   jid: string,
   rowid: number,
@@ -466,6 +609,7 @@ async function processMessage(
   content: string,
   signal: AbortSignal,
   attachments?: string | null,
+  resume?: ResumeRequest,
 ): Promise<void> {
   if (!taskResourcesAvailable) return;
   const channel = getChannel(jid);
@@ -478,6 +622,10 @@ async function processMessage(
   logger.info({ jid, senderName, len: content.length }, 'Processing message');
 
   const typingLoop = createTypingLoop(jid, signal);
+  let settleRow = () => {};
+  const rowSettled = new Promise<void>((done) => {
+    settleRow = done;
+  });
 
   try {
     const prompt = `[Discord user: ${senderName}]\n${content}`;
@@ -490,6 +638,7 @@ async function processMessage(
     // Startup warms catalogs without blocking Discord. A queued turn needing
     // model-specific thinking must not run before that asynchronous warm-up.
     if (
+      !resume &&
       (channel.modelOverride || config.piModel) &&
       (channel.thinkingOverride || config.piThinking) &&
       !hasCachedModelCatalog(cwd)
@@ -517,63 +666,30 @@ async function processMessage(
     }
     const effective = computeEffectiveChannelSettings(channel);
 
-    let lastAttemptedText = '';
-    let lastDeliverySucceeded = false;
-    let hadLiveDeliveryFailure = false;
-    const result = await invokeAgent(channel.folder, prompt, {
+    let lastAttemptedText = resume?.state.lastAttemptedText ?? '';
+    let lastDeliverySucceeded = resume?.state.lastDeliverySucceeded ?? false;
+    let hadLiveDeliveryFailure = resume?.state.hadLiveDeliveryFailure ?? false;
+    const requestOptions: InvokeOptions = {
       model: effective.rawModelRef || undefined,
       thinking: effective.hasManagedThinking ? effective.effectiveThinking : undefined,
       cwd: effective.effectiveCwd,
-      resolveSettings: () => {
-        const latest = getChannel(jid);
-        if (!latest) throw new Error('Channel disappeared before admission');
-        const desired = computeEffectiveChannelSettings(latest);
-        return {
-          model: desired.modelInfo?.ref || desired.rawModelRef || undefined,
-          thinking: desired.hasManagedThinking ? desired.effectiveThinking : undefined,
-          cwd: desired.effectiveCwd,
-        };
-      },
+      resolveSettings: channelSettingsResolver(jid),
       signal,
       attachments,
-      connectionDelivery: config.piRpcPersistent
-        ? {
-            onAssistantMessage: async (text, connectionSignal) => {
-              connectionSignal = AbortSignal.any([
-                connectionSignal,
-                connectionDeliveryController.signal,
-              ]);
-              if (!taskResourcesAvailable || connectionSignal.aborted) return;
-              const sent = await sendResponse(jid, text, connectionSignal);
-              if (!taskResourcesAvailable || connectionSignal.aborted) return;
-              if (!sent)
-                throw new Error('Could not deliver background assistant message to Discord');
-              logMessage(jid, 'assistant', text);
-            },
-            onTraceEvent: (text) => {
-              if (taskResourcesAvailable) enqueueWebhookTrace(jid, text);
-            },
-            onError: async (error, connectionSignal) => {
-              connectionSignal = AbortSignal.any([
-                connectionSignal,
-                connectionDeliveryController.signal,
-              ]);
-              if (!taskResourcesAvailable || connectionSignal.aborted) return;
-              enqueueWebhookTerminal(jid, `RPC interrupted: ${sanitizeTraceText(error)}`);
-              await sendResponse(
-                jid,
-                `⚠️ Agent connection error: ${error.slice(0, 300)}`,
-                connectionSignal,
-              );
-            },
-          }
-        : undefined,
+      connectionDelivery: config.piRpcPersistent ? connectionDeliveryFor(jid) : undefined,
+      rowSettled,
+      snapshotRequest: (): ResidentRequestState => ({
+        rowid,
+        lastAttemptedText,
+        lastDeliverySucceeded,
+        hadLiveDeliveryFailure,
+      }),
       onInputConsumed: logOnConsumption
         ? () => {
             if (taskResourcesAvailable && !signal.aborted) logMessage(jid, 'user', content);
           }
         : undefined,
-      onAssistantMessage: async (text) => {
+      onAssistantMessage: async (text: string) => {
         lastAttemptedText = text;
         lastDeliverySucceeded = await sendResponse(jid, text, signal);
         if (!taskResourcesAvailable || signal.aborted) {
@@ -585,13 +701,25 @@ async function processMessage(
         }
         logMessage(jid, 'assistant', text);
       },
-      onNotice: async (text) => {
+      onNotice: async (text: string) => {
         await sendResponse(jid, text, signal);
       },
-      onTraceEvent: (text) => enqueueWebhookTrace(jid, text),
-    });
+      onTraceEvent: (text: string) => enqueueWebhookTrace(jid, text),
+    };
+    const result = resume
+      ? await resumeResidentAgent(channel.folder, resume.record, {
+          ...requestOptions,
+          connectionDelivery: connectionDeliveryFor(jid),
+          steeringConsumed: (rowids) => markSteeringRowsConsumed(jid, rowids),
+        })
+      : await invokeAgent(channel.folder, prompt, requestOptions);
 
     if (!taskResourcesAvailable) return;
+    if (result.detached) {
+      // Gateway restart: the resident Pi keeps this row; the next Gateway finishes it.
+      logger.info({ jid, rowid }, 'Request handed over to the next Gateway');
+      return;
+    }
     if (signal.aborted) {
       markMessageFailed(rowid);
       finalizeSteeringRows(jid, 'failed');
@@ -700,6 +828,7 @@ async function processMessage(
       // Nothing else to do here.
     }
   } finally {
+    settleRow();
     try {
       await flushWebhookTrace(jid);
     } catch (err: any) {

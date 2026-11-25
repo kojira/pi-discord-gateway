@@ -122,6 +122,7 @@ process.stdin.on('end',()=>process.exit(0));
   chmodSync(bin, 0o755);
   Object.assign(config, {
     piRpcPersistent: true,
+    piResident: false,
     piBin: bin,
     piCwd: root,
     piModel: '',
@@ -342,7 +343,6 @@ it('defers settings and input during compaction without aborting it', async () =
 
 it.each([
   ['cwd', 'Executable, working directory or arguments changed'],
-  ['executable', 'Executable, working directory or arguments changed'],
   ['arguments', 'Executable, working directory or arguments changed'],
   ['implicit default', 'Implicit Pi defaults'],
   ['unknown model', 'Model not found'],
@@ -352,7 +352,6 @@ it.each([
     const f = fixture();
     await invokeAgent('channel', 'first', f.options);
     if (kind === 'cwd') f.set({ cwd: join(f.root, 'other') });
-    if (kind === 'executable') Object.assign(config, { piBin: join(f.root, 'other') });
     if (kind === 'arguments') Object.assign(config, { piExtraFlags: '--no-tools' });
     if (kind === 'implicit default') f.set({ model: undefined });
     if (kind === 'unknown model') f.set({ model: 'test/missing' });

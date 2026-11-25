@@ -1,7 +1,7 @@
 import { execFile, spawnSync } from 'node:child_process';
 import { SettingsManager } from '@earendil-works/pi-coding-agent';
 import { minimatch } from 'minimatch';
-import { config } from '../config.js';
+import { config, currentPiBin } from '../config.js';
 import { THINKING_LEVELS, type ThinkingLevel } from '../types.js';
 import { resolvePiSpawn } from './pi-spawn.js';
 
@@ -327,7 +327,7 @@ function loadModelCatalog(forceRefresh: boolean, cwd: string, allowStale: boolea
   // model-list parser is synchronous and already mirrors the actual pi
   // invocation, so use it as the startup-safe source of selectable models.
   const sdkModels: AvailableModelInfo[] = [];
-  const cliModels = listModelsFromPiCli(config.piBin, cwd);
+  const cliModels = listModelsFromPiCli(currentPiBin(), cwd);
   const models = mergeModelMetadata(cliModels ?? sdkModels, sdkModels).sort((a, b) =>
     a.ref.localeCompare(b.ref),
   );
@@ -371,7 +371,7 @@ async function loadModelCatalogAsync(
   }
 
   const refresh = (async (): Promise<ModelCache> => {
-    const models = await listModelsFromPiCliAsync(config.piBin, cwd);
+    const models = await listModelsFromPiCliAsync(currentPiBin(), cwd);
     if (!models) {
       lastFailedRefreshByCwd.set(cwd, Date.now());
       return cacheByCwd.get(cwd) ?? { cwd, loadedAt: 0, models: [] };

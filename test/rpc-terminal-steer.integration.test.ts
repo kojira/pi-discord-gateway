@@ -65,6 +65,7 @@ export default function(pi) {
     chmodSync(wrapper, 0o755);
     Object.assign(config, {
       piRpcPersistent: true,
+      piResident: false,
       piBin: wrapper,
       piModel: 'fixture/local',
       piThinking: '',

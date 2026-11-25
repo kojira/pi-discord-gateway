@@ -143,6 +143,7 @@ ${ignoreStop ? "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000);" : "proc
   chmodSync(bin, 0o755);
   Object.assign(config, {
     piRpcPersistent: true,
+    piResident: false,
     piBin: bin,
     piModel: '',
     piThinking: '',

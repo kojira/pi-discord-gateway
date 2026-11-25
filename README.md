@@ -98,16 +98,17 @@ Re-running `piscord register` with `--cwd` updates that channel's working direct
 
 The gateway registers a global `/pi` command on Discord:
 
-| Subcommand          | Description                                                         |
-| ------------------- | ------------------------------------------------------------------- |
-| `/pi status`        | Show model, thinking, working directory, session info, token usage  |
-| `/pi model`         | Set the channel's model (autocomplete from pi's available models)   |
-| `/pi reset-model`   | Clear the channel's model override                                  |
-| `/pi thinking`      | Set thinking level: off / minimal / low / medium / high / xhigh     |
-| `/pi new`           | Start a fresh session for this channel                              |
-| `/pi stop`          | Abort the current task and clear queued messages                    |
-| `/pi webhook`       | Send this channel's Pi activity trace to a selected Discord channel |
-| `/pi webhook-clear` | Disable monitoring and delete this channel's managed webhook        |
+| Subcommand          | Description                                                                             |
+| ------------------- | --------------------------------------------------------------------------------------- |
+| `/pi status`        | Show model, thinking, working directory, session info, token usage                      |
+| `/pi model`         | Set the channel's model (autocomplete from pi's available models)                       |
+| `/pi reset-model`   | Clear the channel's model override                                                      |
+| `/pi thinking`      | Set thinking level: off / minimal / low / medium / high / xhigh                         |
+| `/pi new`           | Start a fresh session for this channel                                                  |
+| `/pi stop`          | Abort the current task and clear queued messages                                        |
+| `/pi reload`        | End this channel's Pi after its current work; next message uses the configured `PI_BIN` |
+| `/pi webhook`       | Send this channel's Pi activity trace to a selected Discord channel                     |
+| `/pi webhook-clear` | Disable monitoring and delete this channel's managed webhook                            |
 
 `/pi model` reads the catalog from the configured `PI_BIN`, so it stays in sync when pi adds or removes models. It also honors pi's `enabledModels` setting (configured through `/scoped-models`), including model order and glob patterns. If no scope is configured, it shows all available models.
 
@@ -223,6 +224,7 @@ Most users won't need to edit this file directly — `piscord setup` generates i
 | `PI_THINKING`                      | _(none)_                        | Default thinking level                                                     |
 | `PI_CWD`                           | `$HOME`                         | Default working directory for pi; can be overridden per registered channel |
 | `PI_RPC_PERSISTENT`                | `false`                         | Keep per-channel RPC connections after parent idle                         |
+| `PI_RESIDENT`                      | `true`                          | With persistent RPC: Pi runs detached and survives Gateway restarts        |
 | `PI_EXTRA_FLAGS`                   | _(none)_                        | Extra flags passed to pi                                                   |
 | `TRIGGER_NAME`                     | `pi`                            | Bot trigger name for @mentions                                             |
 | `CHANNEL_POLICY`                   | `allowlist`                     | Channel access: `open`, `open-trigger`, or `allowlist`                     |
@@ -267,6 +269,12 @@ subsequent user requests reuse the process. Internal supervisor requests remain
 between child and parent Pi; Piscord neither forwards them as human questions nor
 writes supervisor replies. Requires Pi RPC with `get_state` session
 identity, `pendingMessageCount` and normal prompt/settlement events; no new lifetime extension is required.
+
+With `PI_RESIDENT=true` (default) each channel's Pi runs behind a small detached
+`pi-host` process and a Unix socket, so stopping or restarting the Gateway leaves Pi
+running; the next Gateway reattaches and delivers what Pi produced meanwhile.
+`PI_BIN` is read at every Pi start, so changing it needs no Gateway restart;
+`/pi reload` moves a channel to the configured `PI_BIN`. See `docs/design/resident-pi.md`.
 
 RPC events have no request IDs: a request is sent only with an empty Pi user queue,
 and the first subsequent user message marks consumption (transformed input is supported).

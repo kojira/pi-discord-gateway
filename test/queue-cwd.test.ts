@@ -10,6 +10,8 @@ const { invokeAgentMock, sendResponseMock, setTypingMock } = vi.hoisted(() => ({
 }));
 
 vi.mock('../src/agent/invoke.js', () => ({
+  isResidentReloading: () => false,
+  hasReloadingResidents: () => false,
   hasResidentAgent: vi.fn().mockReturnValue(false),
   stopResidentAgent: vi.fn().mockReturnValue(false),
   shutdownResidentAgents: vi.fn().mockResolvedValue(undefined),

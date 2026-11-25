@@ -48,6 +48,7 @@ process.stdin.on('end',()=>process.exit(0));
     Object.assign(config, {
       piBin: bin,
       piRpcPersistent: persistent,
+      piResident: false,
       piModel: '',
       piThinking: '',
       piExtraFlags: '',

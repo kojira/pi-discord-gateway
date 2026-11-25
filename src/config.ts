@@ -1,5 +1,5 @@
 import { parse } from 'dotenv';
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, resolve } from 'node:path';
 
@@ -65,6 +65,30 @@ function expandHome(inputPath: string): string {
 function readEnvValue(key: string): string | undefined {
   return CONFIG_SOURCE[key];
 }
+
+/**
+ * PI_BIN as configured right now. Read from the sources at every Pi start so a
+ * deploy can switch it without restarting the Gateway; running Pis keep theirs.
+ */
+export function currentPiBin(): string {
+  const configPath = resolveConfigPath();
+  let stamp: string;
+  try {
+    const stat = statSync(configPath);
+    stamp = `${configPath}:${stat.mtimeMs}:${stat.size}`;
+  } catch {
+    stamp = `${configPath}:missing`;
+  }
+  // The environment wins over the file; re-read the sources only when the file changed.
+  const fromEnv = process.env.PI_BIN?.trim();
+  if (stamp !== piBinStamp) {
+    piBinStamp = stamp;
+    piBinFromSources = buildConfigSource().PI_BIN?.trim() || '';
+  }
+  return fromEnv || piBinFromSources || config.piBin;
+}
+let piBinStamp = '';
+let piBinFromSources = '';
 
 function buildConfigSource(): Record<string, string> {
   return {
@@ -142,6 +166,12 @@ export const config = {
   /** Keep one RPC process per visited channel; no idle eviction */
   piRpcPersistent: envBool('PI_RPC_PERSISTENT', false),
 
+  /**
+   * With PI_RPC_PERSISTENT: run each Pi behind a detached pi-host so it survives
+   * Gateway restarts (docs/design/resident-pi.md). Off keeps Pi as a direct child.
+   */
+  piResident: envBool('PI_RESIDENT', true),
+
   /** Default model for pi */
   piModel: env('PI_MODEL'),
 
@@ -213,3 +243,8 @@ export const config = {
 } as const;
 
 export type Config = typeof config;
+
+/** Persistent Pis run behind a detached pi-host and survive Gateway restarts. */
+export function isResidentMode(): boolean {
+  return config.piRpcPersistent && config.piResident;
+}

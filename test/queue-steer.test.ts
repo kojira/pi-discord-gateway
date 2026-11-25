@@ -19,6 +19,8 @@ const {
 }));
 
 vi.mock('../src/agent/invoke.js', () => ({
+  isResidentReloading: () => false,
+  hasReloadingResidents: () => false,
   hasResidentAgent: vi.fn().mockReturnValue(false),
   refreshResidentSettings: vi.fn(),
   stopResidentAgent: vi.fn().mockReturnValue(false),
@@ -179,6 +181,7 @@ describe('active-run steering', () => {
         DB_PATH: join(root, 'gateway.db'),
         SESSIONS_DIR: join(root, 'sessions'),
         PI_RPC_PERSISTENT: 'true',
+        PI_RESIDENT: 'false',
         POLL_INTERVAL_MS: '1',
         MAX_CONCURRENCY: '1',
       });

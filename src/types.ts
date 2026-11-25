@@ -37,4 +37,6 @@ export interface AgentResult {
   workOutcome?: 'completed' | 'cancelled' | 'waiting' | 'blocked';
   /** Parent parked after an async launch; completion arrives as a later native notice. */
   parked?: boolean;
+  /** Gateway is shutting down; the resident Pi keeps the request and the next Gateway resumes it. */
+  detached?: boolean;
 }

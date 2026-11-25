@@ -78,6 +78,7 @@ export default function(pi) {
     );
     Object.assign(config, {
       piRpcPersistent: true,
+      piResident: false,
       piBin: wrapper,
       piModel: 'fixture/local',
       piThinking: '',

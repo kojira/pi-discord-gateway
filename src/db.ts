@@ -938,11 +938,25 @@ export function clearPendingMessages(channelJid: string): number {
   return result.changes;
 }
 
-export function recoverStuckMessages(): number {
+/** Rows a reattached resident Pi still owns stay `processing`. */
+export function recoverStuckMessages(keepProcessing: readonly number[] = []): number {
+  const keep =
+    keepProcessing.length > 0
+      ? ` and rowid not in (${keepProcessing.map(() => '?').join(',')})`
+      : '';
   const result = db
-    .prepare("update message_queue set status = 'pending' where status = 'processing'")
-    .run();
+    .prepare(`update message_queue set status = 'pending' where status = 'processing'${keep}`)
+    .run(...keepProcessing);
   return result.changes;
+}
+
+export function getQueuedMessage(rowid: number): QueuedMessage | undefined {
+  return db
+    .prepare(
+      `select rowid, channel_jid, sender, sender_name, content, timestamp, status, attachments
+       from message_queue where rowid = ?`,
+    )
+    .get(rowid) as QueuedMessage | undefined;
 }
 
 export function pendingMessageSnapshot(channelJid: string): {
